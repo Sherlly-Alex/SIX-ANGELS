@@ -1,0 +1,92 @@
+<mujoco model="slam_room_mmk2">
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <include file="../../../models/mjcf/mobile_chassis/mmk2/mmk2_options.xml"/>
+  <include file="mmk2_dependencies_slim.xml"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="4096" offsamples="4"/>
+    <headlight diffuse='0.6 0.6 0.6' ambient='.3 .3 .3' specular='0 0 0'/>
+    <scale com="0.05" camera="0.06" framelength="0.5" framewidth="0.02" forcewidth="0.1" contactwidth="0.01" contactheight="0.05"/>
+  </visual>
+
+  <asset>
+    <texture type='2d' name='groundplane' builtin='checker' mark='edge' rgb1='0.2 0.3 0.4' rgb2='0.1 0.2 0.3' markrgb='0.8 0.8 0.8' width='300' height='300'/>
+    <material name='groundplane' texture='groundplane' texuniform='true' texrepeat='5 5' reflectance='0.2'/>
+  </asset>
+
+  <worldbody>
+    <light castshadow="false" directional='true' diffuse='.4 .4 .4' specular='0.3 0.3 0.3' pos='-2 -2 3' dir='1 1 -1'/>
+    <light directional='true' diffuse='.3 .3 .3' specular='0.3 0.3 0.3' pos='0 0 3' dir='0 0 -1'/>
+    <light castshadow="false" directional='true' diffuse='.3 .3 .3' specular='0.3 0.3 0.3' pos='2 2 3' dir='-1 -1 -1'/>
+
+    <camera name="overview" pos="0 -12 7" euler="1.0 0 0" fovy="45"/>
+    <camera name="top_down" pos="0 0 14" euler="0 0 0" fovy="45"/>
+
+    <geom name='floor' type='plane' size='14 10 0.01' material='groundplane' pos='0 0 0'/>
+
+    <body name="wall_n" pos="0 5.05 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='wall_n_geom' type='box' size='7.1 0.1 1' rgba='0.7 0.7 0.72 1'/>
+    </body>
+    <body name="wall_s" pos="0 -5.05 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='wall_s_geom' type='box' size='7.1 0.1 1' rgba='0.7 0.7 0.72 1'/>
+    </body>
+    <body name="wall_e" pos="7.05 0 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='wall_e_geom' type='box' size='0.1 5.05 1' rgba='0.72 0.7 0.7 1'/>
+    </body>
+    <body name="wall_w" pos="-7.05 0 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='wall_w_geom' type='box' size='0.1 5.05 1' rgba='0.72 0.7 0.7 1'/>
+    </body>
+
+    <body name="partition_h" pos="0.5 0.5 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='partition_h_geom' type='box' size='1.5 0.06 1' rgba='0.6 0.62 0.68 1'/>
+    </body>
+    <body name="partition_v" pos="2.0 1.5 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name='partition_v_geom' type='box' size='0.06 1.0 1' rgba='0.6 0.62 0.68 1'/>
+    </body>
+
+    <body name="box_a" pos="4.5 3.0 0.25">
+      <inertial pos="0 0 0" mass="3" diaginertia="1 1 1"/>
+      <geom name='box_a_geom' type='box' size='0.4 0.4 0.25' rgba='0.65 0.5 0.35 1'/>
+    </body>
+    <body name="box_b" pos="-4.5 2.5 0.2">
+      <inertial pos="0 0 0" mass="2" diaginertia="1 1 1"/>
+      <geom name='box_b_geom' type='box' size='0.35 0.35 0.2' rgba='0.55 0.45 0.4 1'/>
+    </body>
+    <body name="box_c" pos="1.0 -3.0 0.3">
+      <inertial pos="0 0 0" mass="4" diaginertia="1 1 1"/>
+      <geom name='box_c_geom' type='box' size='0.5 0.3 0.3' rgba='0.6 0.4 0.3 1'/>
+    </body>
+    <body name="box_d" pos="5.0 -1.5 0.2">
+      <inertial pos="0 0 0" mass="2" diaginertia="1 1 1"/>
+      <geom name='box_d_geom' type='box' size='0.3 0.3 0.2' rgba='0.5 0.5 0.45 1'/>
+    </body>
+
+    <body name='mmk2' pos="-3 -2 0">
+      <joint type="free" frictionloss="0.0001" />
+      <include file="mmk2_slim.xml"/>
+    </body>
+
+  </worldbody>
+
+  <actuator>
+    <include file="../../../models/mjcf/mobile_chassis/mmk2/mmk2_control.xml"/>
+  </actuator>
+
+  <sensor>
+    <include file="../../../models/mjcf/mobile_chassis/mmk2/mmk2_sensor.xml"/>
+  </sensor>
+
+  <keyframe>
+    <key name="pick" qpos='-3 -2 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'/>
+  </keyframe>
+
+</mujoco>

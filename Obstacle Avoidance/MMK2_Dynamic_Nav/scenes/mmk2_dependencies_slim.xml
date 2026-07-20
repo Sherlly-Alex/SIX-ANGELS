@@ -1,0 +1,57 @@
+<mujocoinclude>
+
+  <default>
+    <default class='visual'>
+      <geom contype="0" conaffinity="0" group="2"/>
+    </default>
+
+    <default class='slide_joint'>
+      <joint range='-0.04 0.87' type='slide' axis='0 0 -1' frictionloss="1000" damping="100" actuatorfrcrange="-1600 1000"/>
+      <position ctrlrange='-0.04 0.87' kp='50000'/>
+    </default>
+    <default class='head_yaw_joint'>
+      <joint axis='0 0 1' range='-0.5 0.5'/>
+      <position ctrlrange='-0.5 0.5' kp='1' kv='.1'/>
+    </default>
+    <default class='head_pitch_joint'>
+      <joint axis='0 0 -1' range="-1.18 0.16"/>
+      <position ctrlrange='-1.18 0.16' kp='100' kv='10'/>
+    </default>
+    <default class='wheel'>
+      <joint axis='0 0 -1' damping='0.5' frictionloss='0.1'/>
+      <motor ctrlrange='-35 35' forcerange='-35 35'/>
+    </default>
+
+    <default class='joint1'>
+      <joint axis='0 0 1' range="-3.151 2.089" actuatorfrcrange="-24 24" damping="0.2" frictionloss='15' />
+      <position ctrlrange="-3.151 2.089"/>
+    </default>
+    <default class='joint2'>
+      <joint axis='0 0 1' range="-2.963 0.181" actuatorfrcrange="-24 24" damping="0.2" frictionloss='15' />
+      <position ctrlrange="-2.963 0.181" />
+    </default>
+    <default class='joint3'>
+      <joint axis='0 0 1' range='-0.094 3.161' actuatorfrcrange="-24 24" damping="0.2" frictionloss='15' />
+      <position ctrlrange='-0.094 3.161'/>
+    </default>
+    <default class='joint4'>
+      <joint axis='0 0 1' range="-3.012 3.012" actuatorfrcrange="-8 8" damping="0.1" frictionloss='5' />
+      <position ctrlrange="-3.012 3.012"/>
+    </default>
+    <default class='joint5'>
+      <joint axis='0 0 1' range="-1.859 1.859" actuatorfrcrange="-8 8" damping="0.1" frictionloss='5' />
+      <position ctrlrange="-1.859 1.859"/>
+    </default>
+    <default class='joint6'>
+      <joint axis='0 0 1' range="-3.017 3.017" actuatorfrcrange="-8 8" damping="0.1" frictionloss='5' />
+      <position ctrlrange="-3.017 3.017"/>
+    </default>
+    <default class='finger1'>
+      <joint axis='0 1 0' range="-0.04 0" type='slide' damping="1"/>
+    </default>
+    <default class='finger2'>
+      <joint axis='0 1 0' range="0 0.04" type='slide' damping="1"/>
+    </default>
+  </default>
+
+</mujocoinclude>
