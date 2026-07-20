@@ -1,0 +1,59 @@
+<mujoco model="airbot_play_eye_side_qz_lab3">
+
+  <compiler angle="radian" meshdir="../../meshes/" texturedir="../../meshes/" autolimits="true"/>
+
+  <include file="../scene/qz_lab3.xml"/>
+  <include file="airbot_play/airbot_play_dependencies.xml"/>
+  <include file="airbot_play/airbot_play_appendix.xml"/>
+
+  <worldbody>
+    <body name="airbot_play_pose" pos="0.3 1. 0.71" euler="0 0 3.1416">
+      <include file="airbot_play/airbot_play.xml"/>
+      <geom
+        name="base_depth_marker_o"
+        type="sphere"
+        pos="-0.075 -0.075 0.115"
+        size="0.014"
+        rgba="1 0 1 1"
+        contype="0"
+        conaffinity="0"/>
+      <geom
+        name="base_depth_marker_x"
+        type="sphere"
+        pos="0.075 -0.075 0.115"
+        size="0.014"
+        rgba="1 1 0 1"
+        contype="0"
+        conaffinity="0"/>
+      <geom
+        name="base_depth_marker_y"
+        type="sphere"
+        pos="-0.075 0.075 0.115"
+        size="0.014"
+        rgba="0 1 0 1"
+        contype="0"
+        conaffinity="0"/>
+      <geom
+        name="base_depth_marker_diag"
+        type="sphere"
+        pos="0.075 0.075 0.115"
+        size="0.014"
+        rgba="0 0.25 1 1"
+        contype="0"
+        conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <include file="airbot_play/airbot_play_control.xml"/>
+  </actuator>
+
+  <sensor>
+    <include file="airbot_play/airbot_play_sensor.xml"/>
+  </sensor>
+
+  <keyframe>
+    <key name="home" qpos="0 -1 1.2 1.5708 -1.2 -1.5708 0 0 0 0" ctrl="0 -1 1.2 1.5708 -1.2 -1.5708 0"/>
+  </keyframe>
+
+</mujoco>
