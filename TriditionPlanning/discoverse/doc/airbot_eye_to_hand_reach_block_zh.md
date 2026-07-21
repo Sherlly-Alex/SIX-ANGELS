@@ -56,7 +56,12 @@ gripper_est_world          target_arm_base
         |                  |
         +--------+---------+
                  v
-            IK + 关节空间规划
+     Cartesian top-down 接近规划
+     (lift -> translate -> descend)
+     + 物块 AABB 穿模检查
+                 |
+                 v
+            IK + 执行轨迹
                  |
                  v
             MuJoCo 位置控制执行
@@ -69,12 +74,14 @@ gripper_est_world          target_arm_base
 | 相机配置 | `DOCUMENTED_EYE_SIDE_*` | 记录 qz_lab3 文档里的 `eye_side` 位姿和视场参数 |
 | 模型选择 | `make_cfg()` | 在需要 `eye_side` 或 `global_depth` 时加载带外部相机和 RGB-D 标记的 MJCF |
 | 物块目标 | `configure_target_block()` | 放置可见物块，并计算物块上方目标点 |
+| 接近规划 | `plan_cartesian_topdown_path()` | 自上而下笛卡尔接近，避免关节插值穿物块 |
+| 物块包围盒 | `target_block_aabb_arm_base()` | 由物块中心/半尺寸生成（可膨胀）AABB |
 | 深度反投影 | `depth_pixel_to_world_with_camera_pose()` | 把深度像素从相机坐标转成 world 坐标 |
 | 基座估计 | `estimate_arm_base_pose_from_rgbd_markers()` | 从 RGB-D 彩色标记估计 `arm_base` 位姿 |
 | 夹爪位置 | `endpoint_arm_base()` | 从 FK 传感器读取末端在 `arm_base` 下的位置 |
 | 实时坐标 | `update_live_coordinates()` | 组合基座估计和夹爪 FK，得到 `gripper_est_world` |
 | IK | `solve_position_only_ik()` | 只约束末端位置，枚举姿态候选并选误差小的解 |
-| 路径 | `plan_joint_path()` | 生成平滑关节空间点到点轨迹 |
+| 路径 | `plan_joint_path()` | 短段关节空间插值（仅作为笛卡尔采样点之间的桥接） |
 | 执行 | `execute_joint_path()` | 用位置控制执行路径，并记录诊断 trace |
 
 ## 3. 坐标系
@@ -316,6 +323,55 @@ block 0.32 0.05 0.05
 
 这会重新放置可见物块，并把目标更新为物块上方点。
 
+## 8.1 不穿物块的接近规划（Cartesian Top-Down）
+
+绿色 `target_box` 在 MJCF 里默认是纯可视化几何（`contype=0`），**不会**进入 MuJoCo 接触求解。如果只做「起点关节角 → 终点关节角」的长距离关节空间插值，末端笛卡尔轨迹可能从物块内部抄近路穿过，即使终点仍在物块上方。
+
+因此，当场景里存在目标物块时（例如 `--target-from-block`），默认 `--approach-mode auto` 会启用：
+
+```text
+cartesian_topdown
+```
+
+策略（操纵领域常用的自上而下接近）：
+
+```text
+1. lift      : 若当前高度不够，先抬到安全高度 z_safe
+2. translate : 在 z_safe 平面上水平移动到物块正上方
+3. descend   : 竖直落到最终「物块上方」目标点
+```
+
+其中：
+
+```text
+z_safe = max(start_z, target_z, block_top + approach_clearance)
+block AABB 会按 --block-inflate 膨胀后再做末端穿模检查
+```
+
+每一段都在**笛卡尔空间**按 `--cartesian-step` 采样，再对每个采样点连续 IK；相邻 IK 解之间只用很短的关节桥接，并在规划阶段用膨胀后的物块 AABB 拒绝穿模路径。执行后还会再次扫描 trace，若仍命中物块则 `success=false`。
+
+相关参数：
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `--approach-mode` | `auto` | `auto` / `cartesian_topdown` / `joint` |
+| `--approach-clearance` | `0.08` | 相对物块顶面的额外安全高度 |
+| `--cartesian-step` | `0.012` | 笛卡尔采样步长（米） |
+| `--block-inflate` | `0.015` | 物块 AABB 膨胀量（米） |
+| `--no-block-avoidance` | off | 关闭物块避让（回到旧的直接关节插值） |
+
+强制使用旧行为（不推荐）：
+
+```powershell
+D:\Anaconda\envs\discoverse\python.exe examples\planning\airbot_reach_point.py --target-from-block --approach-mode joint --no-block-avoidance
+```
+
+推荐命令：
+
+```powershell
+D:\Anaconda\envs\discoverse\python.exe examples\planning\airbot_reach_point.py --target-from-block --save-trace reports\reach_block_trace.json
+```
+
 ## 9. IK 和轨迹规划
 
 IK 入口是：
@@ -332,13 +388,10 @@ solve_position_only_ik()
 4. 如果启用桌面检查，则过滤最终姿态或插值路径中碰到桌子的候选。
 5. 在剩余候选中按 FK 误差和关节运动代价排序，取最优解。
 
-轨迹入口是：
+得到终点姿态后，路径生成分两种：
 
-```text
-plan_joint_path()
-```
-
-它在当前关节角和目标关节角之间做关节空间插值，并用 smoothstep 曲线让起止更平滑：
+- **有物块 / cartesian_topdown**：`plan_cartesian_topdown_path()`（见 8.1）
+- **无物块 / joint**：`plan_joint_path()` 在当前关节角和目标关节角之间做 smoothstep 插值
 
 ```text
 blend = t * t * (3 - 2 * t)
@@ -358,7 +411,7 @@ execute_joint_path()
 - `endpoint_world`。
 - 桌面接触数量。
 - 可视几何是否进入桌面薄盒。
-
+- 是否命中膨胀后的目标物块 AABB（写入 summary 的 `block_hit_samples`）。
 ## 10. 桌面避碰
 
 脚本会尽量读取模型中的真实桌面范围，并转成 `arm_base` 坐标。默认不会把桌子当作虚构平面，而是从 MuJoCo 模型几何体得到桌面实体范围。

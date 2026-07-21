@@ -65,6 +65,9 @@ DEFAULT_TARGET_BLOCK_GEOM = "target_box"
 DEFAULT_TARGET_BLOCK_POS_ARM_BASE = np.array([0.28, 0.0, 0.05], dtype=np.float64)
 DEFAULT_TARGET_BLOCK_HALF_SIZE = np.array([0.05, 0.05, 0.05], dtype=np.float64)
 DEFAULT_TARGET_BLOCK_CLEARANCE = 0.10
+DEFAULT_APPROACH_CLEARANCE = 0.08
+DEFAULT_CARTESIAN_STEP = 0.012
+DEFAULT_BLOCK_INFLATE = 0.015
 BASE_DEPTH_MARKER_RADIUS = 0.014
 BASE_DEPTH_MARKERS = (
     {
@@ -994,6 +997,9 @@ class ReachPointDebugEnv(AirbotPlayBase):
         self.live_coordinate_last_print_time = -float("inf")
         self.live_coordinate_error: Optional[str] = None
         self.live_coordinates: dict = {}
+        # Populated in post_load_mjcf once mj_model exists.
+        self.arm_joint_names: list[str] = []
+        self.arm_joint_qposadr = np.zeros(0, dtype=np.int32)
         super().__init__(config)
         self.configure_global_camera(args)
         self.configure_table_bounds()
@@ -1002,6 +1008,36 @@ class ReachPointDebugEnv(AirbotPlayBase):
                 self.cam_id = camera_id_from_name(self, args.target_camera)
             except ValueError:
                 pass
+
+    def post_load_mjcf(self):
+        super().post_load_mjcf()
+        # qz_lab3 eye_side MJCF inserts drawer joints before the arm, so qpos[:7]
+        # is NOT the Airbot arm. Resolve the real hinge addresses by joint name.
+        self.arm_joint_names = [f"joint{i}" for i in range(1, 7)]
+        self.arm_joint_qposadr = np.array(
+            [int(self.mj_model.joint(name).qposadr[0]) for name in self.arm_joint_names],
+            dtype=np.int32,
+        )
+
+    def resetState(self):
+        mujoco.mj_resetData(self.mj_model, self.mj_data)
+        if self.arm_joint_qposadr.size == 6:
+            self.mj_data.qpos[self.arm_joint_qposadr] = np.asarray(self.init_joint_pose[:6], dtype=np.float64)
+        else:
+            self.mj_data.qpos[: self.nj] = self.init_joint_pose.copy()
+        self.mj_data.ctrl[: self.nj] = self.init_joint_ctrl.copy()
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+    def updateControl(self, action):
+        # NOTE: AirbotPlayBase clamps qpos[nj-1] assuming the gripper lives there.
+        # In the qz_lab3 eye_side model, drawer joints shift the arm, so qpos[6] is
+        # joint5. Never clamp arbitrary qpos indices here; only clip actuator commands.
+        action = np.asarray(action, dtype=np.float64)
+        self.mj_data.ctrl[: self.nj] = np.clip(
+            action[: self.nj],
+            self.mj_model.actuator_ctrlrange[: self.nj, 0],
+            self.mj_model.actuator_ctrlrange[: self.nj, 1],
+        )
 
     def configure_global_camera(self, args: argparse.Namespace) -> None:
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, GLOBAL_CAMERA_HEAD_BODY)
@@ -2140,6 +2176,338 @@ def plan_joint_path(q_start: np.ndarray, q_goal: np.ndarray, max_joint_step: flo
     return q_start[None, :] + blend[:, None] * delta[None, :]
 
 
+def target_block_aabb_arm_base(
+    env: AirbotPlayBase,
+    inflate: float = 0.0,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    info = getattr(env, "target_block_info", None)
+    if not info:
+        return None
+    center = np.asarray(info["center_arm_base"], dtype=np.float64)
+    half = np.asarray(info["half_size"], dtype=np.float64)
+    pad = max(0.0, float(inflate))
+    lower = center - half - pad
+    upper = center + half + pad
+    return lower, upper
+
+
+def point_inside_aabb(point: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> bool:
+    p = np.asarray(point, dtype=np.float64)
+    return bool(np.all(p >= lower) and np.all(p <= upper))
+
+
+def interpolate_cartesian_segment(
+    start: np.ndarray,
+    goal: np.ndarray,
+    cartesian_step: float,
+) -> np.ndarray:
+    p0 = np.asarray(start, dtype=np.float64)
+    p1 = np.asarray(goal, dtype=np.float64)
+    dist = float(np.linalg.norm(p1 - p0))
+    step = max(1e-4, float(cartesian_step))
+    count = max(2, int(np.ceil(dist / step)) + 1)
+    blend = np.linspace(0.0, 1.0, count)
+    # Smoothstep keeps end-effector speed continuous at segment joints.
+    blend = blend * blend * (3.0 - 2.0 * blend)
+    return p0[None, :] + blend[:, None] * (p1 - p0)[None, :]
+
+
+def build_topdown_approach_waypoints(
+    start_arm_base: np.ndarray,
+    target_arm_base: np.ndarray,
+    block_aabb: Optional[tuple[np.ndarray, np.ndarray]],
+    approach_clearance: float,
+) -> list[dict]:
+    """Classic manipulation approach: lift -> translate at safe height -> descend.
+
+    This avoids long joint-space shortcuts that tunnel through the target object.
+    """
+    start = np.asarray(start_arm_base, dtype=np.float64)
+    target = np.asarray(target_arm_base, dtype=np.float64)
+    block_top = None if block_aabb is None else float(block_aabb[1][2])
+    z_safe = max(
+        float(start[2]),
+        float(target[2]),
+        (block_top if block_top is not None else float(target[2])) + max(0.0, float(approach_clearance)),
+    )
+
+    waypoints: list[dict] = []
+
+    def _append(name: str, point: np.ndarray, reason: str) -> None:
+        point = np.asarray(point, dtype=np.float64)
+        if waypoints and float(np.linalg.norm(point - waypoints[-1]["target_arm_base"])) < 1e-4:
+            return
+        if float(np.linalg.norm(point - start)) < 1e-4 and not waypoints:
+            return
+        waypoints.append(
+            {
+                "name": name,
+                "target_arm_base": point.copy(),
+                "reason": reason,
+            }
+        )
+
+    if float(start[2]) < z_safe - 1e-3:
+        _append(
+            "lift",
+            np.array([start[0], start[1], z_safe], dtype=np.float64),
+            "raise end-effector to a collision-free transit height",
+        )
+
+    if float(np.linalg.norm(start[:2] - target[:2])) > 1e-3 or (
+        waypoints and float(np.linalg.norm(waypoints[-1]["target_arm_base"][:2] - target[:2])) > 1e-3
+    ):
+        _append(
+            "translate",
+            np.array([target[0], target[1], z_safe], dtype=np.float64),
+            "move above the object while staying above the inflated block AABB",
+        )
+
+    _append(
+        "descend",
+        target.copy(),
+        "vertical descent onto the final above-block pose",
+    )
+    return waypoints
+
+
+def select_continuous_ik(
+    env: AirbotPlayBase,
+    arm_ik: AirbotPlayIK,
+    point_arm_base: np.ndarray,
+    orientation: np.ndarray,
+    ref_q: np.ndarray,
+    max_joint_jump: float = 0.45,
+    fk_tolerance: float = 0.008,
+) -> np.ndarray:
+    point = np.asarray(point_arm_base, dtype=np.float64)
+    ref_q = np.asarray(ref_q, dtype=np.float64)
+
+    def _as_candidate_list(result) -> list[np.ndarray]:
+        if result is None:
+            return []
+        arr = np.asarray(result, dtype=np.float64)
+        if arr.ndim == 1:
+            return [arr]
+        return [np.asarray(q, dtype=np.float64) for q in arr]
+
+    candidates: list[np.ndarray] = []
+    try:
+        candidates = _as_candidate_list(arm_ik.properIK(point, orientation, ref_q=None))
+    except ValueError:
+        candidates = []
+    if not candidates:
+        raise ValueError(f"No IK solution at Cartesian waypoint {point.tolist()}")
+
+    scored = []
+    for q in candidates:
+        jump = float(np.max(np.abs(q - ref_q)))
+        if jump > max_joint_jump:
+            continue
+        fk_err = evaluate_fk_error(env, q, point)
+        if fk_err > fk_tolerance:
+            continue
+        scored.append((jump, fk_err, q))
+
+    if not scored:
+        for q in candidates:
+            fk_err = evaluate_fk_error(env, q, point)
+            scored.append((float(np.max(np.abs(q - ref_q))), fk_err, q))
+        scored = [item for item in scored if item[1] <= max(fk_tolerance, 0.02)]
+    if not scored:
+        # Last resort: nearest joint-space candidate even if FK is slightly off.
+        scored = [
+            (float(np.max(np.abs(q - ref_q))), evaluate_fk_error(env, q, point), q)
+            for q in candidates
+        ]
+    return min(scored, key=lambda item: (item[0], item[1]))[2]
+
+
+def endpoint_path_hits_block(
+    env: AirbotPlayBase,
+    path_q: np.ndarray,
+    block_aabb: tuple[np.ndarray, np.ndarray],
+) -> Optional[dict]:
+    lower, upper = block_aabb
+    qpos = env.mj_data.qpos.copy()
+    qvel = env.mj_data.qvel.copy()
+    ctrl = env.mj_data.ctrl.copy()
+    try:
+        for index, q in enumerate(np.asarray(path_q, dtype=np.float64)):
+            env.mj_data.qpos[env.arm_joint_qposadr] = q
+            env.mj_data.qvel[:] = 0.0
+            mujoco.mj_forward(env.mj_model, env.mj_data)
+            point = endpoint_arm_base(env)
+            if point_inside_aabb(point, lower, upper):
+                return {
+                    "path_index": int(index),
+                    "endpoint_arm_base": [float(v) for v in point],
+                    "block_aabb_lower": [float(v) for v in lower],
+                    "block_aabb_upper": [float(v) for v in upper],
+                }
+    finally:
+        env.mj_data.qpos[:] = qpos
+        env.mj_data.qvel[:] = qvel
+        env.mj_data.ctrl[:] = ctrl
+        mujoco.mj_forward(env.mj_model, env.mj_data)
+    return None
+
+
+def densify_joint_segment(
+    env: AirbotPlayBase,
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    max_joint_step: float,
+    block_aabb: Optional[tuple[np.ndarray, np.ndarray]],
+    table_bounds: Optional[np.ndarray],
+    allow_table_penetration: bool,
+) -> np.ndarray:
+    bridge = plan_joint_path(q_start, q_goal, max_joint_step)
+    if block_aabb is not None:
+        hit = endpoint_path_hits_block(env, bridge, block_aabb)
+        if hit is not None:
+            raise ValueError(
+                "Joint bridge would penetrate the target block AABB: "
+                + json.dumps(hit, ensure_ascii=False)
+            )
+    if table_bounds is not None and not allow_table_penetration:
+        contact = first_table_contact_along_path(env, bridge)
+        if contact:
+            raise ValueError(
+                "Joint bridge collides with the table: " + json.dumps(contact, ensure_ascii=False)
+            )
+    return bridge
+
+
+def plan_cartesian_topdown_path(
+    env: AirbotPlayBase,
+    arm_ik: AirbotPlayIK,
+    start_arm_base: np.ndarray,
+    target_arm_base: np.ndarray,
+    ref_q: np.ndarray,
+    orientation: np.ndarray,
+    args: argparse.Namespace,
+    table_bounds: Optional[np.ndarray],
+) -> dict:
+    """Plan a block-aware Cartesian top-down approach and densify with short joint segments."""
+    inflate = max(0.0, float(getattr(args, "block_inflate", DEFAULT_BLOCK_INFLATE)))
+    block_aabb = target_block_aabb_arm_base(env, inflate=inflate)
+    approach_clearance = max(0.0, float(getattr(args, "approach_clearance", DEFAULT_APPROACH_CLEARANCE)))
+    cartesian_step = max(1e-3, float(getattr(args, "cartesian_step", DEFAULT_CARTESIAN_STEP)))
+    max_joint_step = max(1e-4, float(getattr(args, "max_joint_step", DEFAULT_MAX_JOINT_STEP)))
+    allow_table_penetration = bool(getattr(args, "allow_table_penetration", False))
+
+    waypoints = build_topdown_approach_waypoints(
+        start_arm_base,
+        target_arm_base,
+        block_aabb,
+        approach_clearance,
+    )
+    if not waypoints:
+        waypoints = [
+            {
+                "name": "direct",
+                "target_arm_base": np.asarray(target_arm_base, dtype=np.float64).copy(),
+                "reason": "target already coincides with a safe top-down approach",
+            }
+        ]
+
+    q_cursor = np.asarray(ref_q, dtype=np.float64)
+    p_cursor = np.asarray(start_arm_base, dtype=np.float64)
+    path_q: list[np.ndarray] = [q_cursor.copy()]
+    planned_waypoints = []
+
+    for waypoint in waypoints:
+        goal_p = np.asarray(waypoint["target_arm_base"], dtype=np.float64)
+        cart_points = interpolate_cartesian_segment(p_cursor, goal_p, cartesian_step)
+        for point in cart_points[1:]:
+            q_next = select_continuous_ik(env, arm_ik, point, orientation, q_cursor)
+            bridge = densify_joint_segment(
+                env,
+                q_cursor,
+                q_next,
+                max_joint_step,
+                block_aabb,
+                table_bounds,
+                allow_table_penetration,
+            )
+            path_q.extend(list(bridge[1:]))
+            q_cursor = q_next
+        planned_waypoints.append(
+            {
+                "name": waypoint["name"],
+                "target_arm_base": [float(v) for v in goal_p],
+                "reason": waypoint["reason"],
+                "q_goal": [float(v) for v in q_cursor],
+            }
+        )
+        p_cursor = goal_p
+
+    path = np.asarray(path_q, dtype=np.float64)
+    if block_aabb is not None:
+        hit = endpoint_path_hits_block(env, path, block_aabb)
+        if hit is not None:
+            raise ValueError(
+                "Planned Cartesian top-down path penetrates the target block AABB: "
+                + json.dumps(hit, ensure_ascii=False)
+            )
+        block_top = float(block_aabb[1][2])
+        qpos = env.mj_data.qpos.copy()
+        qvel = env.mj_data.qvel.copy()
+        ctrl = env.mj_data.ctrl.copy()
+        try:
+            for index, q in enumerate(path):
+                env.mj_data.qpos[env.arm_joint_qposadr] = q
+                env.mj_data.qvel[:] = 0.0
+                mujoco.mj_forward(env.mj_model, env.mj_data)
+                point = endpoint_arm_base(env)
+                over_footprint = (
+                    point[0] >= block_aabb[0][0]
+                    and point[0] <= block_aabb[1][0]
+                    and point[1] >= block_aabb[0][1]
+                    and point[1] <= block_aabb[1][1]
+                )
+                if over_footprint and point[2] < block_top:
+                    raise ValueError(
+                        "Planned path goes below the inflated block top while over the footprint: "
+                        + json.dumps(
+                            {
+                                "path_index": int(index),
+                                "endpoint_arm_base": [float(v) for v in point],
+                                "block_top": block_top,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+        finally:
+            env.mj_data.qpos[:] = qpos
+            env.mj_data.qvel[:] = qvel
+            env.mj_data.ctrl[:] = ctrl
+            mujoco.mj_forward(env.mj_model, env.mj_data)
+
+    return {
+        "path": path,
+        "q_goal": np.asarray(path[-1], dtype=np.float64),
+        "waypoints": planned_waypoints,
+        "block_aabb_lower": None if block_aabb is None else [float(v) for v in block_aabb[0]],
+        "block_aabb_upper": None if block_aabb is None else [float(v) for v in block_aabb[1]],
+        "approach_mode": "cartesian_topdown",
+    }
+
+
+def resolve_approach_mode(env: AirbotPlayBase, args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "approach_mode", "auto")).lower()
+    if mode == "auto":
+        if getattr(env, "target_block_info", None) and not bool(getattr(args, "no_block_avoidance", False)):
+            return "cartesian_topdown"
+        return "joint"
+    if mode not in {"joint", "cartesian_topdown"}:
+        raise ValueError(f"Unsupported approach mode: {mode}")
+    if mode == "cartesian_topdown" and bool(getattr(args, "no_block_avoidance", False)):
+        return "joint"
+    return mode
+
+
 def execute_joint_path(
     env: AirbotPlayBase,
     path: np.ndarray,
@@ -3162,7 +3530,78 @@ def run_reach_once(
         print("[reach_point] IK failed: " + json.dumps(summary, indent=2))
         return False, summary
 
-    path = plan_joint_path(ref_q, q_goal, max(args.max_joint_step, 1e-4))
+    approach_mode = resolve_approach_mode(env, args)
+    approach_plan = {
+        "approach_mode": approach_mode,
+        "waypoints": [],
+        "block_aabb_lower": None,
+        "block_aabb_upper": None,
+    }
+    try:
+        if approach_mode == "cartesian_topdown":
+            last_error = None
+            approach_plan = None
+            # Prefer the IK orientation already ranked for the goal, then fall back to other candidates.
+            candidate_orients = [(orientation_id, orientation)]
+            for idx, ori in enumerate(orientation_candidates(target_arm_base)):
+                if idx == orientation_id:
+                    continue
+                candidate_orients.append((idx, ori))
+            for ori_id, ori in candidate_orients:
+                try:
+                    approach_plan = plan_cartesian_topdown_path(
+                        env,
+                        arm_ik,
+                        start_arm_base,
+                        target_arm_base,
+                        ref_q,
+                        ori,
+                        args,
+                        table_bounds,
+                    )
+                    orientation = ori
+                    orientation_id = int(ori_id)
+                    break
+                except ValueError as exc:
+                    last_error = exc
+                    continue
+            if approach_plan is None:
+                raise ValueError(str(last_error) if last_error is not None else "Cartesian top-down planning failed")
+            path = approach_plan["path"]
+            q_goal = np.asarray(approach_plan["q_goal"], dtype=np.float64)
+        else:
+            path = plan_joint_path(ref_q, q_goal, max(args.max_joint_step, 1e-4))
+            block_aabb = None
+            if not bool(getattr(args, "no_block_avoidance", False)):
+                block_aabb = target_block_aabb_arm_base(
+                    env,
+                    inflate=max(0.0, float(getattr(args, "block_inflate", DEFAULT_BLOCK_INFLATE))),
+                )
+            if block_aabb is not None:
+                hit = endpoint_path_hits_block(env, path, block_aabb)
+                if hit is not None:
+                    raise ValueError(
+                        "Direct joint-space path penetrates the target block AABB; "
+                        "use --approach-mode cartesian_topdown (default for --target-from-block). "
+                        + json.dumps(hit, ensure_ascii=False)
+                    )
+                approach_plan["block_aabb_lower"] = [float(v) for v in block_aabb[0]]
+                approach_plan["block_aabb_upper"] = [float(v) for v in block_aabb[1]]
+    except ValueError as exc:
+        summary = {
+            "success": False,
+            "target_frame": target_frame,
+            "target_input": [float(v) for v in target],
+            "target_arm_base": [float(v) for v in target_arm_base],
+            "approach_mode": approach_mode,
+            "table_source": current_table_source(env),
+            "table_bounds_arm_base": None if table_bounds is None else [float(v) for v in table_bounds],
+            "target_block": getattr(env, "target_block_info", None),
+            "error": str(exc),
+        }
+        print("[reach_point] approach planning failed: " + json.dumps(summary, indent=2))
+        return False, summary
+
     gripper = float(env.sensor_joint_qpos[6])
     trace = execute_joint_path(
         env,
@@ -3193,15 +3632,44 @@ def run_reach_once(
         or final_table_contacts
         or visual_table_slab_violation_steps > 0
     )
+    block_aabb = target_block_aabb_arm_base(
+        env,
+        inflate=max(0.0, float(getattr(args, "block_inflate", DEFAULT_BLOCK_INFLATE))),
+    )
+    block_hits = []
+    if block_aabb is not None and not bool(getattr(args, "no_block_avoidance", False)):
+        lower, upper = block_aabb
+        for index, item in enumerate(trace):
+            point = np.asarray(item["endpoint_arm_base"], dtype=np.float64)
+            if point_inside_aabb(point, lower, upper):
+                block_hits.append(
+                    {
+                        "trace_index": int(index),
+                        "time": float(item["time"]),
+                        "endpoint_arm_base": [float(v) for v in point],
+                    }
+                )
+    block_collision = bool(block_hits)
     max_joint_tracking_error = float(np.max(np.abs(q_tracking_error)))
     saturated_joints = joint_force_saturation(env)
-    success = pos_error <= args.tolerance and (not table_collision or args.allow_table_penetration)
+    success = (
+        pos_error <= args.tolerance
+        and (not table_collision or args.allow_table_penetration)
+        and (not block_collision or bool(getattr(args, "no_block_avoidance", False)))
+    )
 
     summary = {
         "success": bool(success),
         "target_frame": target_frame,
         "target_input": [float(v) for v in target],
         "target_arm_base": [float(v) for v in target_arm_base],
+        "approach_mode": approach_plan.get("approach_mode", approach_mode),
+        "approach_waypoints": approach_plan.get("waypoints", []),
+        "target_block": getattr(env, "target_block_info", None),
+        "block_aabb_lower": approach_plan.get("block_aabb_lower"),
+        "block_aabb_upper": approach_plan.get("block_aabb_upper"),
+        "block_collision": block_collision,
+        "block_hit_samples": block_hits[:8],
         "table_source": current_table_source(env),
         "table_bounds_arm_base": None if table_bounds is None else [float(v) for v in table_bounds],
         "target_table_clearance": target_table_clearance,
@@ -3866,6 +4334,38 @@ def parse_args() -> argparse.Namespace:
         help="Text scale for the live coordinate overlay.",
     )
     parser.add_argument("--tolerance", type=float, default=0.02, help="Position success threshold in meters.")
+    parser.add_argument(
+        "--approach-mode",
+        choices=["auto", "joint", "cartesian_topdown"],
+        default="auto",
+        help=(
+            "Path generation mode. 'auto' uses Cartesian top-down when a target block is present, "
+            "otherwise falls back to direct joint-space interpolation."
+        ),
+    )
+    parser.add_argument(
+        "--approach-clearance",
+        type=float,
+        default=DEFAULT_APPROACH_CLEARANCE,
+        help="Extra height above the inflated block top used by Cartesian top-down transit.",
+    )
+    parser.add_argument(
+        "--cartesian-step",
+        type=float,
+        default=DEFAULT_CARTESIAN_STEP,
+        help="Cartesian sampling step (meters) along top-down approach segments.",
+    )
+    parser.add_argument(
+        "--block-inflate",
+        type=float,
+        default=DEFAULT_BLOCK_INFLATE,
+        help="Inflate the target-block AABB when checking end-effector penetration.",
+    )
+    parser.add_argument(
+        "--no-block-avoidance",
+        action="store_true",
+        help="Disable target-block AABB avoidance / success checks (legacy joint shortcut behavior).",
+    )
     parser.add_argument(
         "--max-joint-step",
         type=float,
