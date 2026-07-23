@@ -1,0 +1,100 @@
+<mujoco model="material_sorting_local_mmk2">
+
+  <include file="../scene.xml"/>
+  <include file="../mobile_chassis/mmk2/mmk2_options.xml"/>
+  <include file="../mobile_chassis/mmk2/mmk2_dependencies.xml"/>
+
+  <compiler angle="radian" meshdir="../../meshes/" texturedir="../../meshes/"/>
+
+  <asset>
+    <material name="ms_wall_mat" rgba="0.88 0.88 0.84 1"/>
+    <material name="ms_shelf_frame" rgba="0.30 0.32 0.36 1"/>
+    <material name="ms_shelf_board" rgba="0.72 0.72 0.68 1"/>
+    <material name="ms_table_mat" rgba="0.55 0.42 0.28 1"/>
+    <material name="ms_prop_white" rgba="0.90 0.90 0.90 1"/>
+    <material name="ms_box_pink" rgba="0.93 0.45 0.62 1"/>
+    <material name="ms_box_yellow" rgba="0.94 0.83 0.25 1"/>
+    <material name="ms_box_brown" rgba="0.55 0.36 0.22 1"/>
+  </asset>
+
+  <default>
+    <default class="ms_static_box">
+      <geom type="box" contype="1" conaffinity="1" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001"/>
+    </default>
+    <default class="ms_movable_box">
+      <geom type="box" contype="1" conaffinity="1" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="-3 -2 5" dir="1 1 -1"/>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="1 3 5" dir="-1 -1 -1"/>
+
+    <body name="mmk2" pos="-0.70 0.55 0" euler="0 0 1.5708">
+      <joint type="free" frictionloss="0.0001"/>
+      <include file="../mobile_chassis/mmk2/mmk2.xml"/>
+    </body>
+
+    <!-- Competition perimeter, table, shelf, props, and movable boxes. -->
+    <body name="material_perimeter_walls">
+      <geom class="ms_static_box" name="material_west_wall" size="0.03 1.65 1.0" pos="-2.93 1.25 1.0" material="ms_wall_mat"/>
+      <geom class="ms_static_box" name="material_east_wall" size="0.03 1.65 1.0" pos="0.43 1.25 1.0" material="ms_wall_mat"/>
+      <geom class="ms_static_box" name="material_south_wall" size="1.68 0.03 1.0" pos="-1.25 -0.40 1.0" material="ms_wall_mat"/>
+      <geom class="ms_static_box" name="material_north_wall" size="1.68 0.03 1.0" pos="-1.25 2.90 1.0" material="ms_wall_mat"/>
+    </body>
+
+    <body name="material_shelf" pos="-2.67 0.778 0">
+      <geom class="ms_static_box" name="material_shelf_post_bl" size="0.02 0.02 1.025" pos="-0.185 -0.388 1.025" material="ms_shelf_frame"/>
+      <geom class="ms_static_box" name="material_shelf_post_br" size="0.02 0.02 1.025" pos="0.185 -0.388 1.025" material="ms_shelf_frame"/>
+      <geom class="ms_static_box" name="material_shelf_post_fl" size="0.02 0.02 1.025" pos="-0.185 0.388 1.025" material="ms_shelf_frame"/>
+      <geom class="ms_static_box" name="material_shelf_post_fr" size="0.02 0.02 1.025" pos="0.185 0.388 1.025" material="ms_shelf_frame"/>
+      <geom class="ms_static_box" name="material_shelf_back_panel" size="0.01 0.40 1.025" pos="-0.195 0 1.025" material="ms_shelf_frame"/>
+      <geom class="ms_static_box" name="material_shelf_board_L1" size="0.18 0.40 0.01" pos="0 0 0.403" material="ms_shelf_board"/>
+      <geom class="ms_static_box" name="material_shelf_board_L2" size="0.18 0.40 0.01" pos="0 0 0.732" material="ms_shelf_board"/>
+      <geom class="ms_static_box" name="material_shelf_board_L3" size="0.18 0.40 0.01" pos="0 0 1.061" material="ms_shelf_board"/>
+      <geom class="ms_static_box" name="material_shelf_board_L4" size="0.18 0.40 0.01" pos="0 0 1.366" material="ms_shelf_board"/>
+      <geom class="ms_static_box" name="material_shelf_board_L5" size="0.18 0.40 0.01" pos="0 0 1.695" material="ms_shelf_board"/>
+      <geom class="ms_static_box" name="material_shelf_board_L6" size="0.18 0.40 0.01" pos="0 0 2.024" material="ms_shelf_board"/>
+    </body>
+
+    <body name="material_table" pos="-0.54 2.315 0">
+      <geom class="ms_static_box" name="material_table_top" size="0.83 0.40 0.02" pos="0 0 0.719" material="ms_table_mat" priority="1" condim="3" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+      <geom class="ms_static_box" name="material_table_leg_1" size="0.03 0.03 0.349" pos="-0.78 -0.36 0.349" material="ms_table_mat"/>
+      <geom class="ms_static_box" name="material_table_leg_2" size="0.03 0.03 0.349" pos="0.78 -0.36 0.349" material="ms_table_mat"/>
+      <geom class="ms_static_box" name="material_table_leg_3" size="0.03 0.03 0.349" pos="-0.78 0.36 0.349" material="ms_table_mat"/>
+      <geom class="ms_static_box" name="material_table_leg_4" size="0.03 0.03 0.349" pos="0.78 0.36 0.349" material="ms_table_mat"/>
+    </body>
+
+    <body name="prop_material_box" pos="-0.54 2.30 0.824">
+      <geom name="prop_material_box_collision" type="box" size="0.0920 0.1205 0.0850" material="ms_prop_white" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01"/>
+    </body>
+    <body name="prop_packaging_box" pos="-2.63 0.778 0.530" euler="1.5708 0 0">
+      <geom name="prop_packaging_box_collision" type="box" size="0.0887 0.1170 0.0510" material="ms_prop_white" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01"/>
+    </body>
+
+    <body name="box_pink" pos="-1.00 2.20 0.834" euler="0 0 0">
+      <joint name="box_pink_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="ms_movable_box" name="box_pink_collision" size="0.12 0.08 0.095" mass="0.20" material="ms_box_pink"/>
+    </body>
+    <body name="box_yellow" pos="-0.54 2.30 1.004" euler="0 0 1.5708">
+      <joint name="box_yellow_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="ms_movable_box" name="box_yellow_collision" size="0.12 0.08 0.095" mass="0.20" material="ms_box_yellow"/>
+    </body>
+    <body name="box_brown" pos="-2.63 0.778 0.837" euler="0 0 1.5708">
+      <joint name="box_brown_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="ms_movable_box" name="box_brown_collision" size="0.12 0.08 0.095" mass="0.20" material="ms_box_brown"/>
+    </body>
+
+    <camera name="material_table_debug_cam" fovy="55" pos="-0.70 1.25 1.65" euler="-0.95 0 0"/>
+    <camera name="material_shelf_debug_cam" fovy="55" pos="-1.75 0.778 1.35" xyaxes="0 1 0 -0.503700 0 0.863878"/>
+  </worldbody>
+
+  <actuator>
+    <include file="../mobile_chassis/mmk2/mmk2_control.xml"/>
+  </actuator>
+
+  <sensor>
+    <include file="../mobile_chassis/mmk2/mmk2_sensor.xml"/>
+  </sensor>
+
+</mujoco>
