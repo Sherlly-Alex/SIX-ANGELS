@@ -1,5 +1,0 @@
-path: C:/Users/19360/DISCOVERSE/reports/material_sorting_labelimg_yellow_dataset_20260722/yolo_train_ready
-train: images/train
-val: images/val
-nc: 1
-names: ['yellow']
