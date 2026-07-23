@@ -36,6 +36,15 @@ from robot.motion_controller import MotionController
 from sim.obstacle_manager import ObstacleManager
 from gui.nav_overlay import NavOverlay
 from gui.dynamic_nav_viewer import DynamicNavViewer
+from planning.local_goal_selector import select_local_goal
+from planning.dwb.trajectory import RobotState
+from planning.dwb.trajectory_generator import StandardTrajectoryGenerator
+from planning.dwb.controller import DWBController
+from planning.dwb.critics.obstacle_critic import ObstacleCritic
+from planning.dwb.critics.path_dist_critic import PathDistCritic
+from planning.dwb.critics.goal_dist_critic import GoalDistCritic
+from planning.dwb.critics.prefer_forward_critic import PreferForwardCritic
+from planning.dwb.critics.oscillation_critic import OscillationCritic
 
 STATE_MAPPING = "MAPPING"
 STATE_WAITING_FOR_GOAL = "WAITING_FOR_GOAL"
@@ -59,6 +68,12 @@ def main():
                         help="Viewer window width in pixels (default: 1600)")
     parser.add_argument("--height", type=int, default=900,
                         help="Viewer window height in pixels (default: 900)")
+    parser.add_argument("--controller", choices=["waypoint", "dwb"],
+                        default="waypoint",
+                        help="Local controller: waypoint (default) or dwb")
+    parser.add_argument("--obstacle_mode", choices=["static", "scripted_line"],
+                        default="static",
+                        help="Obstacle movement mode (default: static)")
     args = parser.parse_args()
 
     goal = [args.goal_x, args.goal_y]
@@ -127,6 +142,7 @@ def main():
     static_dist_map = static_grid.compute_distance_transform().copy()
 
     dyn_cfg = DynamicNavConfig()
+    dyn_cfg.obstacle_movement_mode = args.obstacle_mode
     dynamic_layer = DynamicLayer(static_dist_map,
                                  static_grid.resolution,
                                  dyn_cfg)
@@ -143,6 +159,33 @@ def main():
 
     overlay = None if args.headless else NavOverlay(interval=30)
     viewer = None if args.headless else DynamicNavViewer(config)
+
+    # DWB controller (only when --controller dwb)
+    dwb_controller = None
+    dwb_failure_count = 0
+    last_dwb_data = None
+    last_linear_vel = 0.0
+    last_angular_vel = 0.0
+    dwb_period = dyn_cfg.dwb_control_period
+    dwb_update_steps = max(1, round(dwb_period
+                                    / config.timestep / config.decimation))
+    if args.controller == "dwb":
+        dwb_gen = StandardTrajectoryGenerator(dyn_cfg)
+        dwb_critics = [
+            ObstacleCritic(weight=dyn_cfg.dwb_obstacle_weight),
+            PathDistCritic(weight=dyn_cfg.dwb_path_dist_weight),
+            GoalDistCritic(weight=dyn_cfg.dwb_goal_dist_weight),
+            PreferForwardCritic(
+                weight=dyn_cfg.dwb_prefer_forward_weight,
+                max_speed=dyn_cfg.dwb_max_speed,
+                min_progress_speed=dyn_cfg.dwb_min_progress_speed,
+                spin_yaw_threshold=dyn_cfg.dwb_spin_yaw_threshold,
+                spin_penalty=dyn_cfg.dwb_spin_penalty,
+            ),
+            OscillationCritic(weight=dyn_cfg.dwb_oscillation_weight),
+        ]
+        dwb_controller = DWBController(dwb_gen, dwb_critics)
+        print(f"[INFO] DWB controller enabled, update every {dwb_update_steps} steps")
 
     # ---------------------------------------------------------------- #
     # 4. Plan initial path
@@ -176,6 +219,7 @@ def main():
     total_distance = 0.0
     prev_pose = init_pose.copy()
     replan_count = 0
+    dwb_waypoint_idx = 0
 
     max_s = None if args.unlimited else args.max_steps
     for gstep in range(max_s if max_s else 999_999_999):
@@ -229,7 +273,10 @@ def main():
         # Path validation (FOLLOWING_PATH only)
         # ------------------------------------------------------------ #
         if state == STATE_FOLLOWING_PATH:
-            wp_idx = motion_ctrl.current_waypoint_idx
+            if args.controller == "dwb":
+                wp_idx = dwb_waypoint_idx
+            else:
+                wp_idx = motion_ctrl.current_waypoint_idx
             if path_validator.confirm_blocked(
                     current_path, wp_idx, planning_grid
             ):
@@ -264,19 +311,101 @@ def main():
                         viewer.notify_obstacle_spawn((obs_x, obs_y), gstep)
                     except Exception:
                         pass
+        # Step moving obstacle
+        if (obs_mgr.enabled and obs_mgr.spawned
+                and args.obstacle_mode == "scripted_line"):
+            obs_mgr.step_motion(config.timestep * config.decimation)
         # ------------------------------------------------------------ #
         # State actions
         # ------------------------------------------------------------ #
         linear_vel, angular_vel = 0.0, 0.0
 
         if state == STATE_FOLLOWING_PATH:
-            linear_vel, angular_vel, completed = motion_ctrl.follow_path(
-                robot_pose, current_path
-            )
-            if completed:
-                print(f"[STATE] FOLLOWING_PATH -> GOAL_REACHED")
-                state = STATE_GOAL_REACHED
-                linear_vel, angular_vel = 0.0, 0.0
+            if (args.controller == "dwb" and dwb_controller is not None
+                    and current_path is not None):
+                # Advance waypoint index when robot is close to current wp
+                if dwb_waypoint_idx < len(current_path):
+                    wp = current_path[dwb_waypoint_idx]
+                    if np.hypot(robot_pose[0] - wp[0],
+                                robot_pose[1] - wp[1]) < 0.3:
+                        dwb_waypoint_idx += 1
+                        if dwb_waypoint_idx >= len(current_path):
+                            dwb_waypoint_idx = len(current_path) - 1
+                if gstep % dwb_update_steps == 0:
+                    local_goal = select_local_goal(
+                        robot_pose, current_path,
+                        dwb_waypoint_idx,
+                        lookahead_distance=dyn_cfg.dwb_local_goal_distance,
+                    )
+                    dwb_state = RobotState(
+                        x=robot_pose[0], y=robot_pose[1],
+                        yaw=robot_pose[2],
+                        linear_vel=last_linear_vel,
+                        angular_vel=last_angular_vel,
+                    )
+                    dwb_ctx = {
+                        "planning_grid": planning_grid,
+                        "global_path": current_path,
+                        "local_goal": local_goal,
+                        "robot_radius": dyn_cfg.dwb_robot_radius,
+                        "safety_margin": dyn_cfg.dwb_safety_margin,
+                        "last_angular_vel": last_angular_vel,
+                        "last_linear_vel": last_linear_vel,
+                    }
+                    result = dwb_controller.compute_best(dwb_state, dwb_ctx)
+                    if result.trajectory is not None:
+                        last_dwb_data = {
+                            "success": result.success,
+                            "linear_vel": result.linear_vel,
+                            "angular_vel": result.angular_vel,
+                            "total_score": result.trajectory.total_score,
+                            "critic_scores": dict(result.trajectory.critic_scores),
+                            "best_poses": result.trajectory.poses,
+                            "candidates": dwb_controller.last_candidates,
+                        }
+                    else:
+                        last_dwb_data = None
+                    if result.success:
+                        linear_vel = result.linear_vel
+                        angular_vel = result.angular_vel
+                        last_linear_vel = linear_vel
+                        last_angular_vel = angular_vel
+                        dwb_failure_count = 0
+                    else:
+                        # Clear command state so the next dynamic window can
+                        # re-accelerate instead of staying trapped in pure spin.
+                        linear_vel = 0.0
+                        angular_vel = 0.0
+                        last_linear_vel = 0.0
+                        last_angular_vel = 0.0
+                        dwb_failure_count += 1
+                        if dwb_failure_count >= dyn_cfg.dwb_failure_confirm_count:
+                            print(
+                                f"[STATE] FOLLOWING_PATH -> REPLANNING "
+                                f"(DWB failures={dwb_failure_count})"
+                            )
+                            state = STATE_REPLANNING
+                else:
+                    linear_vel = last_linear_vel
+                    angular_vel = last_angular_vel
+
+                # Goal reached check for DWB
+                dist_to_goal = np.hypot(
+                    robot_pose[0] - goal[0],
+                    robot_pose[1] - goal[1],
+                )
+                if dist_to_goal < 0.3:
+                    print(f"[STATE] FOLLOWING_PATH -> GOAL_REACHED (DWB)")
+                    state = STATE_GOAL_REACHED
+                    linear_vel, angular_vel = 0.0, 0.0
+            else:
+                linear_vel, angular_vel, completed = motion_ctrl.follow_path(
+                    robot_pose, current_path
+                )
+                if completed:
+                    print(f"[STATE] FOLLOWING_PATH -> GOAL_REACHED")
+                    state = STATE_GOAL_REACHED
+                    linear_vel, angular_vel = 0.0, 0.0
 
         elif state == STATE_EMERGENCY_STOP:
             linear_vel, angular_vel = 0.0, 0.0
@@ -306,6 +435,10 @@ def main():
                 current_path = new_path
                 motion_ctrl.set_path(current_path)
                 path_validator.reset()
+                dwb_failure_count = 0
+                dwb_waypoint_idx = 0
+                last_linear_vel = 0.0
+                last_angular_vel = 0.0
                 state = STATE_FOLLOWING_PATH
             else:
                 clearance_last_ver = dynamic_layer.version
@@ -364,7 +497,8 @@ def main():
                 viewer.update(
                     gstep, slam, robot_pose, ranges, angles,
                     planning_grid, dynamic_layer, current_path, goal,
-                    obs_mgr, state, total_distance, replan_count
+                    obs_mgr, state, total_distance, replan_count,
+                    dwb_data=last_dwb_data
                 )
             except Exception:
                 pass

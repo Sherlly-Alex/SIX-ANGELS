@@ -72,6 +72,12 @@ class DynamicNavViewer:
         # Panel D — info text
         self.info_text = None
 
+        # DWB visualization artists (Panel A + Panel C)
+        self.map_dwb_best_line = None
+        self.traj_dwb_best_line = None
+        self.map_dwb_cand_lines = []
+        self.traj_dwb_cand_lines = []
+
         # Internal state
         self._all_paths = []
         self._event_log = []
@@ -136,7 +142,8 @@ class DynamicNavViewer:
 
     def update(self, step, slam, robot_pose, ranges, angles,
                planning_grid, dynamic_layer, current_path, goal,
-               obs_mgr, state, total_dist, replan_count):
+               obs_mgr, state, total_dist, replan_count,
+               dwb_data=None):
         self._frame_counter += 1
         if self._frame_counter % max(1, int(30 / self.update_rate)) != 0:
             return
@@ -147,12 +154,13 @@ class DynamicNavViewer:
                 self._prev_path = None
 
         self._update_map_panel(slam, robot_pose, goal, current_path,
-                               planning_grid, dynamic_layer, obs_mgr)
+                               planning_grid, dynamic_layer, obs_mgr,
+                               dwb_data)
         self._update_scan_panel(ranges, angles)
         self._update_trajectory_panel(slam, robot_pose, current_path,
-                                      goal, obs_mgr)
+                                      goal, obs_mgr, dwb_data)
         self._update_info_panel(step, robot_pose, state, total_dist,
-                                dynamic_layer, replan_count)
+                                dynamic_layer, replan_count, dwb_data)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
@@ -162,12 +170,42 @@ class DynamicNavViewer:
         plt.ioff()
         print("[GUI] Dynamic Nav Debugger closed")
 
+    # ------------------------------------------------------------------ #
+    # Helper — draw DWB candidate bundle
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _draw_dwb_candidates(ax, line_list, candidates, alpha=0.15, max_n=8):
+        """Update *line_list* to show up to *max_n* candidate trajectories."""
+        # Remove excess old lines
+        while len(line_list) > max_n:
+            oldest = line_list.pop(0)
+            oldest.remove()
+        # Draw / update
+        for i in range(min(len(candidates), max_n)):
+            cand = candidates[i]
+            poses = np.asarray(cand.get("poses", []))
+            if poses.shape[0] < 2:
+                continue
+            if i < len(line_list):
+                line_list[i].set_data(poses[:, 0], poses[:, 1])
+            else:
+                line, = ax.plot(
+                    poses[:, 0], poses[:, 1], '-',
+                    color='#888888', linewidth=0.6, alpha=alpha
+                )
+                line_list.append(line)
+        # Hide unused
+        for i in range(min(len(candidates), max_n), len(line_list)):
+            line_list[i].set_data([], [])
+
     # ----------------------------------------------------------------- #
     # Panel A — Occupancy Map + Dynamic Layer
     # ----------------------------------------------------------------- #
 
     def _update_map_panel(self, slam, robot_pose, goal, current_path,
-                          planning_grid, dynamic_layer, obs_mgr):
+                          planning_grid, dynamic_layer, obs_mgr,
+                          dwb_data=None):
         prob_map = slam.get_map_prob()
         grid = slam.grid
         extent = [
@@ -283,6 +321,26 @@ class DynamicNavViewer:
         elif self.map_obstacle_marker is not None:
             self.map_obstacle_marker.set_data([], [])
 
+        # DWB best trajectory (white thick line on map)
+        if dwb_data is not None and dwb_data.get("best_poses") is not None:
+            poses = np.asarray(dwb_data["best_poses"])
+            if poses.shape[0] >= 2:
+                if self.map_dwb_best_line is None:
+                    self.map_dwb_best_line, = self.ax_map.plot(
+                        poses[:, 0], poses[:, 1], '-', color='white',
+                        linewidth=2.0, alpha=0.85
+                    )
+                else:
+                    self.map_dwb_best_line.set_data(poses[:, 0], poses[:, 1])
+        elif self.map_dwb_best_line is not None:
+            self.map_dwb_best_line.set_data([], [])
+
+        # DWB candidate trajectories (faint colored lines)
+        candidates = dwb_data.get("candidates", []) if dwb_data else []
+        self._draw_dwb_candidates(
+            self.ax_map, self.map_dwb_cand_lines, candidates, alpha=0.15
+        )
+
     # ----------------------------------------------------------------- #
     # Panel B — LiDAR Scan
     # ----------------------------------------------------------------- #
@@ -325,7 +383,7 @@ class DynamicNavViewer:
     # ----------------------------------------------------------------- #
 
     def _update_trajectory_panel(self, slam, robot_pose, current_path,
-                                 goal, obs_mgr):
+                                 goal, obs_mgr, dwb_data=None):
         # SLAM trajectory (cyan solid)
         slam_traj = slam.get_trajectory()
         if len(slam_traj) > 1:
@@ -391,6 +449,26 @@ class DynamicNavViewer:
         elif self.traj_obstacle_circle is not None:
             self.traj_obstacle_circle.set_radius(0)
 
+        # DWB best trajectory on trajectory panel
+        if dwb_data is not None and dwb_data.get("best_poses") is not None:
+            poses = np.asarray(dwb_data["best_poses"])
+            if poses.shape[0] >= 2:
+                if self.traj_dwb_best_line is None:
+                    self.traj_dwb_best_line, = self.ax_traj.plot(
+                        poses[:, 0], poses[:, 1], '-', color='white',
+                        linewidth=2.0, alpha=0.85, label='DWB best'
+                    )
+                else:
+                    self.traj_dwb_best_line.set_data(poses[:, 0], poses[:, 1])
+        elif self.traj_dwb_best_line is not None:
+            self.traj_dwb_best_line.set_data([], [])
+
+        # DWB candidates on trajectory panel
+        candidates = dwb_data.get("candidates", []) if dwb_data else []
+        DynamicNavViewer._draw_dwb_candidates(
+            self.ax_traj, self.traj_dwb_cand_lines, candidates, alpha=0.12
+        )
+
         # Auto-scale axes
         all_x, all_y = [], []
         if len(slam_traj) > 0:
@@ -410,7 +488,7 @@ class DynamicNavViewer:
     # ----------------------------------------------------------------- #
 
     def _update_info_panel(self, step, robot_pose, state, total_dist,
-                           dynamic_layer, replan_count):
+                           dynamic_layer, replan_count, dwb_data=None):
         state_color = _STATE_COLOR_MAP.get(state, '#ffffff')
         ndyn = int(np.sum(dynamic_layer.occupied_mask()))
         yaw_deg = np.degrees(robot_pose[2])
@@ -422,8 +500,21 @@ class DynamicNavViewer:
             f"Dist:    {total_dist:.2f} m\n",
             f"ndyn:    {ndyn} (v{dynamic_layer.version})\n",
             f"Replans: {replan_count}\n",
-            f"\n=== Recent Events ===\n",
         ]
+        if dwb_data is not None:
+            success = "OK" if dwb_data.get("success") else "FAIL"
+            lines.extend([
+                f"\n=== DWB Controller ===\n",
+                f"Success: {success}\n",
+                f"Command: ({dwb_data.get('linear_vel', 0):.3f}, {dwb_data.get('angular_vel', 0):.3f})\n",
+                f"Total:   {dwb_data.get('total_score', 0):.3f}\n",
+            ])
+            scores = dwb_data.get("critic_scores", {})
+            if scores:
+                lines.append("Critics:\n")
+                for name, s in scores.items():
+                    lines.append(f"  {name}: {s:.3f}\n")
+        lines.append(f"\n=== Recent Events ===\n")
         recent = self._event_log[-5:] if self._event_log else ["(none)"]
         for ev in recent:
             lines.append(f"{ev}\n")
