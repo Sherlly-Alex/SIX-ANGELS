@@ -1,0 +1,146 @@
+<mujoco model="material_competition_scene">
+  <!-- 文旅机器人物料分拣比赛场景。几何严格对齐内置 3DGS 背景和碰撞体
+       (地面 z=0)：货架在西墙(6层)，原料区桌子在北墙。
+       __REPO_ROOT__ 由 server 在运行时替换成 examples/material_sorting。 -->
+  <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_options.xml"/>
+  <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_dependencies.xml"/>
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="4096" offsamples="4"/>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <scale com="0.05" camera="0.08" framelength="0.5" framewidth="0.02" forcewidth="0.1" contactwidth="0.01" contactheight="0.05"/>
+  </visual>
+
+  <compiler angle="radian" meshdir="__REPO_ROOT__/models/meshes"/>
+
+  <asset>
+    <texture type="2d" name="scene_floor_tex" builtin="checker" mark="edge" rgb1="0.80 0.80 0.82" rgb2="0.62 0.63 0.66" markrgb="0.2 0.2 0.2" width="500" height="500"/>
+    <material name="scene_floor" texture="scene_floor_tex" texuniform="true" texrepeat="8 8" reflectance="0.1"/>
+    <material name="zone_yellow" rgba="0.95 0.75 0.1 0.35"/>
+    <material name="zone_green" rgba="0.2 0.8 0.35 0.30"/>
+    <material name="zone_blue" rgba="0.2 0.45 0.9 0.30"/>
+    <material name="wall_mat" rgba="0.88 0.88 0.84 1"/>
+    <material name="shelf_frame" rgba="0.30 0.32 0.36 1"/>
+    <material name="shelf_board" rgba="0.72 0.72 0.68 1"/>
+    <material name="table_mat" rgba="0.55 0.42 0.28 1"/>
+    <!-- 物体碰撞体设为半透明:3DGS 关闭时也能看清占位;开启 GS 时被点云覆盖 -->
+    <material name="prop_white" rgba="0.90 0.90 0.90 0.55"/>
+    <material name="box_pink"   rgba="0.93 0.45 0.62 0.55"/>
+    <material name="box_yellow" rgba="0.94 0.83 0.25 0.55"/>
+    <material name="box_brown"  rgba="0.55 0.36 0.22 0.55"/>
+  </asset>
+
+  <default>
+    <default class="static_box">
+      <geom type="box" contype="1" conaffinity="1" condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001"/>
+    </default>
+    <default class="visual_zone">
+      <geom type="box" contype="0" conaffinity="0" group="2"/>
+    </default>
+    <default class="movable_box">
+      <geom type="box" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="-3 -2 5" dir="1 1 -1"/>
+    <light castshadow="false" directional="true" diffuse="0.35 0.35 0.35" specular="0.25 0.25 0.25" pos="1 3 5" dir="-1 -1 -1"/>
+    <light castshadow="false" directional="true" diffuse="0.25 0.25 0.25" specular="0.2 0.2 0.2" pos="-1.25 1.25 5" dir="0 0 -1"/>
+
+    <geom name="floor" type="plane" size="2.2 2.2 0.05" material="scene_floor" pos="-1.25 1.25 0"/>
+
+    <!-- 外围墙(与扫描室内边界对齐,提供碰撞供裁判判撞墙) -->
+    <body name="perimeter_walls">
+      <geom class="static_box" name="west_wall"  size="0.03 1.65 1.0" pos="-2.93 1.25 1.0" material="wall_mat"/>
+      <geom class="static_box" name="east_wall"  size="0.03 1.65 1.0" pos="0.43 1.25 1.0" material="wall_mat"/>
+      <geom class="static_box" name="south_wall" size="1.68 0.03 1.0" pos="-1.25 -0.40 1.0" material="wall_mat"/>
+      <geom class="static_box" name="north_wall" size="1.68 0.03 1.0" pos="-1.25 2.90 1.0" material="wall_mat"/>
+    </body>
+
+    <!-- 出发区 / 结束区(同一处:场景中心偏南,机器人朝北面向原料区桌子) -->
+    <body name="start_zone" pos="-0.70 0.55 0">
+      <geom class="visual_zone" name="start_zone_mark_a" size="0.45 0.04 0.00025" pos="0 0.45 0.00025" material="zone_green"/>
+      <geom class="visual_zone" name="start_zone_mark_b" size="0.45 0.04 0.00025" pos="0 -0.45 0.00025" material="zone_green"/>
+      <geom class="visual_zone" name="start_zone_mark_c" size="0.04 0.45 0.00025" pos="-0.45 0 0.00025" material="zone_green"/>
+      <geom class="visual_zone" name="start_zone_mark_d" size="0.04 0.45 0.00025" pos="0.45 0 0.00025" material="zone_green"/>
+    </body>
+
+    <!-- 取货区(货架前方,机器人从东侧伸右臂取货) -->
+    <body name="picking_zone" pos="-2.00 0.70 0">
+      <geom class="visual_zone" name="picking_zone_mark_n" size="0.45 0.04 0.00025" pos="0 0.72 0.00025" material="zone_yellow"/>
+      <geom class="visual_zone" name="picking_zone_mark_s" size="0.45 0.04 0.00025" pos="0 -0.72 0.00025" material="zone_yellow"/>
+    </body>
+
+    <!-- 配送区(原料区桌子前方) -->
+    <body name="delivery_zone" pos="-0.63 1.55 0">
+      <geom class="visual_zone" name="delivery_zone_mark_w" size="0.04 0.30 0.00025" pos="-0.95 0 0.00025" material="zone_blue"/>
+      <geom class="visual_zone" name="delivery_zone_mark_e" size="0.04 0.30 0.00025" pos="0.95 0 0.00025" material="zone_blue"/>
+      <geom class="visual_zone" name="delivery_zone_mark_s" size="0.95 0.04 0.00025" pos="0 -0.30 0.00025" material="zone_blue"/>
+    </body>
+
+    <body name="mmk2" pos="-0.70 0.55 0" euler="0 0 1.5708">
+      <joint type="free" frictionloss="0.0001"/>
+      <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2.xml"/>
+    </body>
+
+    <!-- 六层虚拟货架(西墙)。碰撞体对齐背景3DGS实测:立柱 y=0.390/1.165(中心 0.778,半间距 0.388),
+         板深 x∈[-2.83,-2.47]。body 居中 y=0.778(此前 0.72 偏南,已 +0.058 对齐)。6 层台面世界 z =
+         0.403/0.732/1.061/1.366/1.695/2.024。彩色可动盒/障碍物按任务固定摆放。 -->
+    <body name="shelf" pos="-2.67 0.778 0">
+      <geom class="static_box" name="shelf_post_bl" size="0.02 0.02 1.025" pos="-0.185 -0.388 1.025" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_post_br" size="0.02 0.02 1.025" pos="0.185 -0.388 1.025" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_post_fl" size="0.02 0.02 1.025" pos="-0.185 0.388 1.025" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_post_fr" size="0.02 0.02 1.025" pos="0.185 0.388 1.025" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_back_panel" size="0.01 0.40 1.025" pos="-0.195 0 1.025" material="shelf_frame"/>
+      <geom class="static_box" name="shelf_board_L1" size="0.18 0.40 0.01" pos="0 0 0.403" material="shelf_board"/>
+      <geom class="static_box" name="shelf_board_L2" size="0.18 0.40 0.01" pos="0 0 0.732" material="shelf_board"/>
+      <geom class="static_box" name="shelf_board_L3" size="0.18 0.40 0.01" pos="0 0 1.061" material="shelf_board"/>
+      <geom class="static_box" name="shelf_board_L4" size="0.18 0.40 0.01" pos="0 0 1.366" material="shelf_board"/>
+      <geom class="static_box" name="shelf_board_L5" size="0.18 0.40 0.01" pos="0 0 1.695" material="shelf_board"/>
+      <geom class="static_box" name="shelf_board_L6" size="0.18 0.40 0.01" pos="0 0 2.024" material="shelf_board"/>
+    </body>
+    <!-- 原料区桌子(北墙)。碰撞体贴合背景3DGS实测:桌面slab x∈[-1.39,0.31]宽1.70,
+         y∈[1.90,2.73]深0.82,顶面 z=0.739。 -->
+    <body name="material_table" pos="-0.54 2.315 0">
+      <geom class="static_box" name="material_table_top" size="0.83 0.40 0.02" pos="0 0 0.719" material="table_mat" priority="1" condim="3" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+      <geom class="static_box" name="material_table_leg_1" size="0.03 0.03 0.349" pos="-0.78 -0.36 0.349" material="table_mat"/>
+      <geom class="static_box" name="material_table_leg_2" size="0.03 0.03 0.349" pos="0.78 -0.36 0.349" material="table_mat"/>
+      <geom class="static_box" name="material_table_leg_3" size="0.03 0.03 0.349" pos="-0.78 0.36 0.349" material="table_mat"/>
+      <geom class="static_box" name="material_table_leg_4" size="0.03 0.03 0.349" pos="0.78 0.36 0.349" material="table_mat"/>
+    </body>
+
+    <!-- 固定障碍物(白色,任务的方位参照):不可移动,无自由关节。新初始状态:
+         正方体障碍块(material_box)固定在桌面当前位置;长方体障碍物(packaging_box)立在柜子 L1。
+         原白色圆柱体已移除。参照映射见 layout json 的 obstacle_kind。 -->
+    <body name="prop_material_box" pos="-0.54 2.30 0.824">
+      <geom name="prop_material_box_collision" type="box" size="0.0920 0.1205 0.0850" material="prop_white" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01"/>
+    </body>
+    <body name="prop_packaging_box" pos="-2.63 0.778 0.530" euler="1.5708 0 0">
+      <geom name="prop_packaging_box_collision" type="box" size="0.0887 0.1170 0.0510" material="prop_white" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001" solref="0.01 1" solimp="2 1 0.01"/>
+    </body>
+
+    <!-- 可动彩色长方体包装盒(24×16×19cm,自由关节)=3 个抓取物。新初始状态:pink 在桌面,
+         yellow 叠放在白色正方体障碍块正上方,brown 在柜子 L2。盒中心 z = 支撑面 + 半高0.095。
+         pink 在桌面横放:长边沿世界 X 方向; yellow/brown 仍按原抓取几何绕 z 转 90°。 -->
+    <body name="box_pink" pos="-1.00 2.20 0.834" euler="0 0 0">
+      <joint name="box_pink_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="movable_box" name="box_pink_collision" size="0.12 0.08 0.095" mass="0.20" material="box_pink"/>
+    </body>
+    <body name="box_yellow" pos="-0.54 2.30 1.004" euler="0 0 1.5708">
+      <joint name="box_yellow_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="movable_box" name="box_yellow_collision" size="0.12 0.08 0.095" mass="0.20" material="box_yellow"/>
+    </body>
+    <body name="box_brown" pos="-2.63 0.778 0.837" euler="0 0 1.5708">
+      <joint name="box_brown_freejoint" type="free" frictionloss="0.00005"/>
+      <geom class="movable_box" name="box_brown_collision" size="0.12 0.08 0.095" mass="0.20" material="box_brown"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_control.xml"/>
+  </actuator>
+  <sensor>
+    <include file="__REPO_ROOT__/models/mjcf/mobile_chassis/mmk2/mmk2_sensor.xml"/>
+  </sensor>
+</mujoco>

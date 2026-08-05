@@ -1,0 +1,31 @@
+# Python caches and build products
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local environments and editor state
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+
+# Runtime output
+*.log
+MUJOCO_LOG.TXT
+referee_results_*.json
+test-results/
+
+# Local training output
+examples/material_sorting/perception/training/
+
+# Server rendering assets are supplied by the official Server image
+examples/material_sorting/models/3dgs/
+
+# Temporary transfers
+*.tar.gz
+remote_sync*/

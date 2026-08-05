@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Fail fast when required Client source files are missing."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TASK = ROOT / "examples" / "material_sorting"
+
+REQUIRED = (
+    TASK / "client_task.py",
+    TASK / "instruction_parser.py",
+    TASK / "task_orchestration.py",
+    TASK / "material_competition_layout.json",
+    TASK / "mjcf" / "material_competition.xml",
+    TASK / "navigation" / "navigation_controller.py",
+    TASK / "perception" / "box_detect.py",
+    TASK / "perception" / "checkpoints" / "best.pt",
+    TASK / "desktop_grasp" / "manual_dual_arm_pregrasp.py",
+    TASK / "desktop_grasp" / "manual_dual_arm_to_shelf.py",
+    TASK / "desktop_grasp" / "semantic_target_locator.py",
+    TASK / "desktop_grasp" / "target_metadata.py",
+    ROOT / "scripts" / "run_client.sh",
+    ROOT / "scripts" / "run_desktop_grasp.sh",
+)
+
+
+def main() -> int:
+    missing = [path.relative_to(ROOT) for path in REQUIRED if not path.is_file()]
+    if missing:
+        for path in missing:
+            print(f"MISSING {path}")
+        return 1
+
+    checkpoint = TASK / "perception" / "checkpoints" / "best.pt"
+    if checkpoint.stat().st_size < 1_000_000:
+        print(f"INVALID {checkpoint.relative_to(ROOT)}: file is unexpectedly small")
+        return 1
+
+    syntax_errors: list[tuple[Path, SyntaxError]] = []
+    for path in ROOT.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            compile(path.read_text(encoding="utf-8-sig"), str(path), "exec")
+        except SyntaxError as exc:
+            syntax_errors.append((path.relative_to(ROOT), exc))
+
+    if syntax_errors:
+        for path, exc in syntax_errors:
+            print(f"SYNTAX {path}:{exc.lineno}: {exc.msg}")
+        return 1
+
+    print(
+        f"workspace OK ({len(REQUIRED)} required files present; "
+        f"Python syntax valid)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
