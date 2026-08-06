@@ -13,6 +13,7 @@ from executors.task1_full import (
 )
 from executors.task2 import Task2IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
+from navigation.navigation_types import NavigationStatus
 from shelf.state_tracker import ShelfStateTracker
 
 
@@ -124,6 +125,44 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
             _odom(-1.58, 0.85, 3.141592653589793)
         )
         self.assertTrue(done)
+        self.assertEqual(command, (0.0, 0.0))
+
+    def test_transfer_lateral_alignment_rotates_drives_then_restores_yaw(self) -> None:
+        motion = TransferMotion()
+        final_yaw = math.pi
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 1.00),
+                final_yaw,
+                _odom(-1.30, 0.85, final_yaw),
+                0.0,
+            )
+        )
+
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.85, final_yaw), 0.05
+        )
+        self.assertEqual(status.value, "navigating")
+        self.assertEqual(command[0], 0.0)
+        self.assertIn("rotating toward shelf-front", detail)
+
+        status, command, _detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.85, math.pi / 2.0), 0.20
+        )
+        self.assertEqual(status.value, "navigating")
+        self.assertGreater(command[0], 0.0)
+
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 1.00, math.pi / 2.0), 2.0
+        )
+        self.assertEqual(status.value, "navigating")
+        self.assertEqual(command[0], 0.0)
+        self.assertIn("restoring shelf-facing yaw", detail)
+
+        status, command, _detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 1.00, final_yaw), 3.0
+        )
+        self.assertEqual(status, NavigationStatus.GOAL_REACHED)
         self.assertEqual(command, (0.0, 0.0))
 
 

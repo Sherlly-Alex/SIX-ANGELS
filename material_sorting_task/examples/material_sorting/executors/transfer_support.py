@@ -70,6 +70,11 @@ def stand_from_held_center(
 class TransferMotion:
     """Collision-aware navigation plus short straight-line retreat motions."""
 
+    LATERAL_POSITION_TOLERANCE_M = 0.035
+    LATERAL_X_TOLERANCE_M = 0.18
+    LATERAL_YAW_TOLERANCE_RAD = 0.06
+    LATERAL_TIMEOUT_S = 20.0
+
     def __init__(self) -> None:
         limits = SpeedLimits(
             max_linear=0.18,
@@ -94,6 +99,11 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start: tuple[float, float, float] | None = None
         self._advance_distance_m = 0.0
+        self._lateral_target: tuple[float, float] | None = None
+        self._lateral_final_yaw = 0.0
+        self._lateral_heading = 0.0
+        self._lateral_phase = "idle"
+        self._lateral_start_s: float | None = None
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -107,6 +117,11 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start = None
         self._advance_distance_m = 0.0
+        self._lateral_target = None
+        self._lateral_final_yaw = 0.0
+        self._lateral_heading = 0.0
+        self._lateral_phase = "idle"
+        self._lateral_start_s = None
 
     def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
         pose = odometry_pose(odometry)
@@ -139,6 +154,134 @@ class TransferMotion:
             f"{self._goal.yaw:.2f}); nav_status={status.value}"
         )
         return status, (command.linear_x, command.angular_z), detail
+
+    def begin_lateral_alignment(
+        self,
+        target_xy: tuple[float, float],
+        final_yaw: float,
+        odometry: Any,
+        now_s: float,
+    ) -> bool:
+        """Start a bounded shelf-front lateral alignment.
+
+        The generic planner is deliberately not used here.  The robot is
+        already at a safe shelf-front x coordinate, so a full path-to-pose
+        request can repeatedly turn while trying to satisfy a tiny y offset
+        and the final shelf-facing yaw at the same time.  This helper makes
+        the motion explicit: rotate in place toward the lateral direction,
+        drive only along y while staying at the shelf-front x, then rotate in
+        place to the final shelf-facing yaw.
+        """
+
+        pose = odometry_pose(odometry)
+        try:
+            target_x = float(target_xy[0])
+            target_y = float(target_xy[1])
+            target_yaw = _wrap_to_pi(float(final_yaw))
+            start_s = float(now_s)
+        except (TypeError, ValueError, IndexError):
+            return False
+        if pose is None or not all(
+            math.isfinite(value)
+            for value in (target_x, target_y, target_yaw, start_s)
+        ):
+            return False
+        if abs(target_x - pose[0]) > self.LATERAL_X_TOLERANCE_M:
+            # This controller intentionally does not make a forward/backward
+            # correction near the shelf.  Let the caller fail safely instead
+            # of silently moving the carried object into the shelf front.
+            return False
+
+        self._lateral_target = (target_x, target_y)
+        self._lateral_final_yaw = target_yaw
+        self._lateral_heading = (
+            math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
+        )
+        self._lateral_phase = (
+            "rotate_final"
+            if abs(target_y - pose[1]) <= self.LATERAL_POSITION_TOLERANCE_M
+            else "rotate_lateral"
+        )
+        self._lateral_start_s = start_s
+        return True
+
+    def tick_lateral_alignment(
+        self,
+        odometry: Any,
+        now_s: float,
+    ) -> tuple[NavigationStatus, tuple[float, float], str]:
+        """Advance the bounded shelf-front lateral alignment by one tick."""
+
+        pose = odometry_pose(odometry)
+        if pose is None:
+            return NavigationStatus.NAVIGATING, (0.0, 0.0), (
+                "lateral alignment waiting for valid odometry"
+            )
+        if self._lateral_target is None or self._lateral_start_s is None:
+            return NavigationStatus.FAILED, (0.0, 0.0), (
+                "lateral alignment was not started"
+            )
+        elapsed = max(0.0, float(now_s) - self._lateral_start_s)
+        if elapsed > self.LATERAL_TIMEOUT_S:
+            self._lateral_phase = "failed"
+            return NavigationStatus.FAILED, (0.0, 0.0), (
+                f"lateral alignment timed out after {elapsed:.1f}s"
+            )
+
+        target_x, target_y = self._lateral_target
+        if self._lateral_phase == "rotate_lateral":
+            yaw_error = _wrap_to_pi(self._lateral_heading - pose[2])
+            if abs(yaw_error) <= self.LATERAL_YAW_TOLERANCE_RAD:
+                self._lateral_phase = "drive_lateral"
+            else:
+                angular = max(-0.35, min(0.35, 1.4 * yaw_error))
+                return NavigationStatus.NAVIGATING, (0.0, angular), (
+                    "lateral alignment rotating toward shelf-front direction; "
+                    f"yaw_err={yaw_error:.3f}"
+                )
+
+        if self._lateral_phase == "drive_lateral":
+            y_error = target_y - pose[1]
+            if abs(y_error) <= self.LATERAL_POSITION_TOLERANCE_M:
+                self._lateral_phase = "rotate_final"
+            else:
+                # Keep x close to the recorded shelf-front line by applying a
+                # small heading correction while moving along y.  Do not move
+                # forward until the lateral heading is reasonably aligned.
+                x_error = target_x - pose[0]
+                heading_offset = max(
+                    -0.25,
+                    min(0.25, -math.sin(self._lateral_heading) * 0.8 * x_error),
+                )
+                desired_yaw = self._lateral_heading + heading_offset
+                yaw_error = _wrap_to_pi(desired_yaw - pose[2])
+                angular = max(-0.30, min(0.30, 1.2 * yaw_error))
+                linear = min(0.09, max(0.035, 0.55 * abs(y_error)))
+                if abs(yaw_error) > 0.18:
+                    linear = 0.0
+                return NavigationStatus.NAVIGATING, (linear, angular), (
+                    "lateral alignment driving along shelf front; "
+                    f"y_err={y_error:.3f}, x_err={x_error:.3f}"
+                )
+
+        if self._lateral_phase == "rotate_final":
+            yaw_error = _wrap_to_pi(self._lateral_final_yaw - pose[2])
+            if abs(yaw_error) <= self.LATERAL_YAW_TOLERANCE_RAD:
+                self._lateral_phase = "done"
+                return NavigationStatus.GOAL_REACHED, (0.0, 0.0), (
+                    "lateral alignment complete; shelf-facing yaw restored"
+                )
+            angular = max(-0.35, min(0.35, 1.4 * yaw_error))
+            return NavigationStatus.NAVIGATING, (0.0, angular), (
+                "lateral alignment restoring shelf-facing yaw; "
+                f"yaw_err={yaw_error:.3f}"
+            )
+
+        if self._lateral_phase == "done":
+            return NavigationStatus.GOAL_REACHED, (0.0, 0.0), (
+                "lateral alignment complete"
+            )
+        return NavigationStatus.FAILED, (0.0, 0.0), "lateral alignment failed"
 
     def begin_retreat(self, odometry: Any, distance_m: float) -> bool:
         pose = odometry_pose(odometry)
@@ -219,3 +362,7 @@ __all__ = [
     "stand_from_held_center",
     "world_to_base",
 ]
+
+
+def _wrap_to_pi(angle: float) -> float:
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi

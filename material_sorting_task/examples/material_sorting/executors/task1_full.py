@@ -333,25 +333,21 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     max(0.58, min(0.98, self._final_place_stand[1])),
                 )
             if not self._motion_started:
-                goal = NavigationGoal(
-                    # Complete lateral alignment while the carried box is
-                    # still outside the shelf front.
-                    x=self._shelf_scan_stand[0],
-                    y=self._final_place_stand[1],
-                    yaw=self.SHELF_YAW,
-                    position_tolerance=0.07,
-                    yaw_tolerance=0.07,
-                    safety_radius=0.0,
-                    segment=NavigationSegment.NAV_SHELF,
-                    source_tag="integrated_task1_safe_place_lateral",
-                )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_lateral_alignment(
+                    # Only align y here; x remains at the safe shelf-front
+                    # scan stand.  The later straight-advance phase is the
+                    # only phase allowed to enter the shelf front.
+                    (self._shelf_scan_stand[0], self._final_place_stand[1]),
+                    self.SHELF_YAW,
+                    context.odometry,
+                    context.now_s,
+                ):
                     return StageResult.blocked(
                         "task 1 could not plan safe lateral shelf placement alignment",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            status, command, detail = self._transfer.tick_navigation(
+            status, command, detail = self._transfer.tick_lateral_alignment(
                 context.odometry, context.now_s
             )
             if status is NavigationStatus.GOAL_REACHED:
