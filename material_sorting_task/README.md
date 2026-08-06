@@ -7,11 +7,11 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
-和得分真值。任务 1 已提供显式 `nav_only` 底盘实动、`pregrasp_only` 开放预抓取以及
-`contact_only` 双侧接触模式：最后一种会从视觉世界坐标导航到随机桌边目标，调用桌面
-抓取标定逆解，在 Server 确认双臂同时接触目标后保持；另有 `lift_only` 模式在完成
-4 mm 有限预紧后保持双臂姿态，通过升降轴将方块抬高 0.15 米。搬运和放置以及
-任务 2/3 正式执行器仍未开放，不会把空动作误判为成功。
+和得分真值。任务 1 已提供显式 `nav_only`、`pregrasp_only`、`contact_only` 和
+`lift_only` 分段测试模式。新增的 `task12_full` 将已验证的导航与桌面抓取接到统一货架
+层状态识别、任务 1 空层放置、任务 2 货架抓取和原桌面点放置；任务 1/2 的切换仍只由
+Server 裁判确认。该整合模式已经通过本地接口和状态机测试，需在 4090 官方镜像中逐段
+标定验证。任务 3 仍为安全占位，不会把空动作误判为成功。
 
 ## 目录
 
@@ -146,6 +146,24 @@ MATERIAL_EXECUTION_MODE=lift_only \
 MATERIAL_DETECT_BACKEND=yolo \
 bash scripts/run_client.sh
 ```
+
+### 任务 1 + 任务 2 整合测试
+
+`task12_full` 是唯一启用货架搬运与任务 2 的模式。它继续使用同一个
+`client_task.py` 发布底盘、升降柱、头部和双臂命令，不得同时启动旧版
+`client_task_1.py`、队友验证脚本或其他控制节点：
+
+```bash
+MATERIAL_EXECUTION_MODE=task12_full \
+MATERIAL_DETECT_BACKEND=yolo \
+MATERIAL_DETECTION_LOG_PERIOD=0 \
+bash scripts/run_client.sh
+```
+
+建议第一次先固定 Server seed，并准备随时 `Ctrl+C`。任务 1 会依次执行桌面抓取、直线
+后撤、货架语义识别、空层放置和返回结束区；裁判推进后，任务 2 才会从已识别层抓取
+彩色方块并放回任务 1 保存的桌面原坐标。详细接口、目录和停机条件见
+[`docs/SHELF_TASK12_INTEGRATION.md`](docs/SHELF_TASK12_INTEGRATION.md)。
 
 该模式仍会响应 `/material/unsafe_collision` 并立即停止推进。它只用于验证“夹住并抬起”，
 不执行底盘搬运或货架放置。

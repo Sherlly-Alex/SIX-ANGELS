@@ -7,7 +7,9 @@
 3. Extend the task 1 navigation-only executor through grasp, place and return;
    then obtain the full 40 points repeatedly. (navigation-to-pick scaffold done)
 4. Support randomized color, table side and shelf layer.
-5. Add task 2 and task 3 without resetting Client or scene state.
+5. Validate the integrated task 1/2 executor across fixed and randomized seeds;
+   then add task 3 without resetting Client or scene state. (`task12_full`
+   interface integration done; 4090 physical validation pending)
 6. Add local recovery for detection loss, failed grasp and failed placement.
 7. Run multi-seed regression and package all offline weights.
 
@@ -32,7 +34,9 @@ across the deliberate block. `contact_only` reuses the desktop-grasp calibrated
 contact IK and freezes on stable bilateral `/material/grasp_confirmed` feedback.
 If the nominal contact pose does not yet produce bilateral feedback, it reuses
 the standalone grasp's 1 mm steps with a hard 4 mm inward-search bound.
-The task 1/3 standalone desktop grasp executor still has no grasp result
-action/status. Compliant squeeze, Server-confirmed lift, transport, placement,
-task 2 shelf grasp, recovery, and post-grasp controller handoff still need to be
-implemented and validated in the official Client container.
+The standalone desktop-grasp executor still has no formal result action/status.
+The experimental `task12_full` path now performs task-1 transport/shelf place
+and task-2 shelf grasp/return-to-origin through the formal `TaskExecutor`,
+`StageResult`, `ArmCommand`, and referee interfaces. It must still be physically
+validated and calibrated in the official Client container. Task 3 and local
+recovery remain unimplemented.

@@ -11,8 +11,10 @@ from executors.task1 import (
     Task1NavigationExecutor,
     Task1PregraspExecutor,
 )
-from executors.task2 import Task2Executor
+from executors.task1_full import Task1IntegratedExecutor
+from executors.task2 import Task2Executor, Task2IntegratedExecutor
 from executors.task3 import Task3Executor
+from shelf.task_memory import CompetitionTaskMemory
 
 EXECUTION_MODES = (
     "stub",
@@ -21,6 +23,7 @@ EXECUTION_MODES = (
     "pregrasp_only",
     "contact_only",
     "lift_only",
+    "task12_full",
 )
 
 
@@ -60,6 +63,13 @@ def build_task_executors(
         return {
             1: Task1LiftExecutor(),
             2: Task2Executor(),
+            3: Task3Executor(),
+        }
+    if normalized == "task12_full":
+        memory = CompetitionTaskMemory()
+        return {
+            1: Task1IntegratedExecutor(memory),
+            2: Task2IntegratedExecutor(memory),
             3: Task3Executor(),
         }
     raise ValueError(

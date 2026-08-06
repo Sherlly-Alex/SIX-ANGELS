@@ -190,6 +190,13 @@ class CompetitionClient(Node):
                 "requiring Server bilateral-contact confirmation; it then "
                 "holds and blocks before transport"
             )
+        elif self.execution_mode == "task12_full":
+            self.get_logger().warning(
+                "task12_full enables integrated task-1 table pick, stable "
+                "shelf-state recognition and empty-layer placement, followed by "
+                "task-2 shelf pick and return to task-1's saved table origin; "
+                "task 3 remains fail-closed"
+            )
         else:
             self.get_logger().info(
                 "formal mode is referee-driven; placeholder executors fail closed and keep "
@@ -274,7 +281,14 @@ class CompetitionClient(Node):
                 # One malformed detector result must never take down the
                 # command publisher or leave the previous velocity latched.
                 continue
-            if color not in {"pink", "yellow", "brown"}:
+            if color not in {
+                "pink",
+                "yellow",
+                "brown",
+                "material_box",
+                "packaging_box",
+                "shelf_obstacle",
+            }:
                 continue
             if not all(math.isfinite(value) for value in point):
                 continue
@@ -401,6 +415,7 @@ class CompetitionClient(Node):
             "pregrasp_only",
             "contact_only",
             "lift_only",
+            "task12_full",
         } and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()
