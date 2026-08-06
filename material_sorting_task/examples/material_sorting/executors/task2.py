@@ -7,7 +7,7 @@ import math
 from desktop_grasp.pregrasp_core import (
     PregraspInputError,
     PregraspPlanningError,
-    SPINE_MAX,
+    SPINE_MIN,
     SlideLiftController,
 )
 from executors.base import (
@@ -386,6 +386,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             # The box is now clear of the shelf in XY, but the arms are still
             # at the low shelf-pick height.  Raise the spine fully while the
             # base remains stationary before planning the table-bound turn.
+            # On MMK2 the slide coordinate is inverted: SPINE_MIN is the
+            # physically highest pose and SPINE_MAX is the lowest pose.
             self._phase = "lift_for_table_transport"
             self._motion_started = False
             self._transfer.reset()
@@ -396,7 +398,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     self._slide_start = self._held_arm_command.spine_position
                     self._held_arm_command = self._slide_hold.plan(
                         self._held_arm_command,
-                        SPINE_MAX,
+                        SPINE_MIN,
                         context.joint_states,
                     )
                 except (PregraspInputError, PregraspPlanningError) as exc:
@@ -407,7 +409,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             result = self._tick_slide(
                 context,
                 "raising the held box to maximum transport height",
-                slide_raises_center=True,
             )
             if result is not None:
                 return result
@@ -668,8 +669,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self,
         context: ExecutionContext,
         action: str,
-        *,
-        slide_raises_center: bool = False,
     ) -> StageResult | None:
         try:
             command, reached, detail = self._slide_hold.update(
@@ -698,14 +697,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     "task 2 lost the slide/held-center transform during placement",
                     arm_command=command,
                 )
-            # When lowering onto a support, a lower spine moves the held
-            # center down by ``start-current``.  During transport the spine
-            # is raised instead, so the held center follows ``current-start``.
-            dz = (
-                command.spine_position - self._slide_start
-                if slide_raises_center
-                else self._slide_start - command.spine_position
-            )
+            # MMK2's slide coordinate is inverted: decreasing the coordinate
+            # raises the arms and increasing it lowers them.  Therefore the
+            # held object's physical z displacement is start minus current.
+            dz = self._slide_start - command.spine_position
             self._held_center_base = (
                 self._held_center_base[0],
                 self._held_center_base[1],
