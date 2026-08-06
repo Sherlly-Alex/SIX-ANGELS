@@ -92,6 +92,8 @@ class TransferMotion:
         self._last_tick_s: float | None = None
         self._retreat_start: tuple[float, float, float] | None = None
         self._retreat_distance_m = 0.0
+        self._advance_start: tuple[float, float, float] | None = None
+        self._advance_distance_m = 0.0
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -103,6 +105,8 @@ class TransferMotion:
         self._last_tick_s = None
         self._retreat_start = None
         self._retreat_distance_m = 0.0
+        self._advance_start = None
+        self._advance_distance_m = 0.0
 
     def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
         pose = odometry_pose(odometry)
@@ -168,6 +172,44 @@ class TransferMotion:
             False,
             (linear, angular),
             f"retreating straight; remaining={max(0.0, remaining):.3f} m",
+        )
+
+    def begin_advance(self, odometry: Any, distance_m: float) -> bool:
+        """Start a short forward motion while preserving the current yaw."""
+
+        pose = odometry_pose(odometry)
+        distance = float(distance_m)
+        if pose is None or not math.isfinite(distance) or distance <= 0.0:
+            return False
+        self._advance_start = pose
+        self._advance_distance_m = distance
+        return True
+
+    def tick_advance(self, odometry: Any) -> tuple[bool, tuple[float, float], str]:
+        """Advance along the recorded heading without turning toward a waypoint."""
+
+        pose = odometry_pose(odometry)
+        if pose is None:
+            return False, (0.0, 0.0), "waiting for valid odometry"
+        if self._advance_start is None:
+            return False, (0.0, 0.0), "straight advance was not started"
+        start_x, start_y, yaw_ref = self._advance_start
+        dx = pose[0] - start_x
+        dy = pose[1] - start_y
+        advanced_m = dx * math.cos(yaw_ref) + dy * math.sin(yaw_ref)
+        remaining = self._advance_distance_m - advanced_m
+        if remaining <= 0.015:
+            return True, (0.0, 0.0), f"straight advance complete ({advanced_m:.3f} m)"
+        yaw_error = math.atan2(
+            math.sin(yaw_ref - pose[2]),
+            math.cos(yaw_ref - pose[2]),
+        )
+        linear = min(0.10, max(0.035, 0.55 * remaining))
+        angular = max(-0.20, min(0.20, 0.8 * yaw_error))
+        return (
+            False,
+            (linear, angular),
+            f"advancing straight; remaining={max(0.0, remaining):.3f} m",
         )
 
 

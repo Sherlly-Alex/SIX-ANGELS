@@ -25,8 +25,14 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     name = "task1_integrated_table_to_empty_shelf"
 
     TABLE_RETREAT_M = 0.35
-    SHELF_OBSERVE_X = -1.88
-    SHELF_OBSERVE_Y = 0.778
+    # The old fixed x=-1.88 was a shelf-pick stand.  With a task-1 box held
+    # about 0.70 m ahead of the base it put the box center behind the shelf
+    # front before recognition had started.  Turn farther east, then derive a
+    # scan stand from the measured held-object transform.
+    SHELF_FRONT_X = -2.465
+    SHELF_SCAN_CENTER_CLEARANCE_M = 0.18
+    SHELF_TURN_X = -1.30
+    SHELF_OBSERVE_Y = 0.85
     SHELF_YAW = math.pi
     SHELF_CLEARANCE_M = 0.055
     SHELF_RETREAT_M = 0.32
@@ -44,6 +50,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._release = ReleaseSpreadController()
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
+        self._shelf_scan_stand: tuple[float, float] | None = None
+        self._final_place_stand: tuple[float, float] | None = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start: float | None = None
@@ -57,6 +65,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._release.reset()
         self._held_center_base = None
         self._place_world = None
+        self._shelf_scan_stand = None
+        self._final_place_stand = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start = None
@@ -174,25 +184,33 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "navigate_shelf"
+            self._phase = "navigate_shelf_turn"
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "navigate_shelf":
+        if self._phase == "navigate_shelf_turn":
+            if self._shelf_scan_stand is None:
+                self._shelf_scan_stand = shelf_observation_stand(
+                    self._held_center_base,
+                    shelf_front_x=self.SHELF_FRONT_X,
+                    shelf_y=self.SHELF_OBSERVE_Y,
+                    center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
+                    shelf_yaw=self.SHELF_YAW,
+                )
             if not self._motion_started:
                 goal = NavigationGoal(
-                    x=self.SHELF_OBSERVE_X,
-                    y=self.SHELF_OBSERVE_Y,
+                    x=self.SHELF_TURN_X,
+                    y=self._shelf_scan_stand[1],
                     yaw=self.SHELF_YAW,
-                    position_tolerance=0.07,
+                    position_tolerance=0.08,
                     yaw_tolerance=0.06,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_SHELF,
-                    source_tag="integrated_task1_shelf_observation",
+                    source_tag="integrated_task1_safe_shelf_turn",
                 )
                 if not self._transfer.begin_navigation(goal, context.odometry):
                     return StageResult.blocked(
-                        "task 1 could not plan a safe route to the shelf observation stand",
+                        "task 1 could not plan a safe route to the shelf turn point",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
@@ -200,20 +218,37 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 context.odometry, context.now_s
             )
             if status is NavigationStatus.GOAL_REACHED:
-                return StageResult.succeeded(
-                    "task 1 reached the shelf observation stand while preserving the grasp",
-                    arm_command=self._held_arm_command,
-                )
-            if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                self._phase = "approach_shelf_scan"
+                self._motion_started = False
+                self._transfer.reset()
+            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
                 return StageResult.blocked(
-                    f"task 1 shelf transport stopped safely: {detail}",
+                    f"task 1 shelf-turn navigation stopped safely: {detail}",
                     arm_command=self._held_arm_command,
                 )
-            return StageResult.running(
-                f"task 1 transporting the lifted box to the shelf; {detail}",
-                base_command=command,
-                arm_command=self._held_arm_command,
+            else:
+                return StageResult.running(
+                    f"task 1 moving to the safe shelf turn point; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+
+        if self._phase == "approach_shelf_scan":
+            assert self._shelf_scan_stand is not None
+            done, running = self._tick_straight_advance(
+                context,
+                self._shelf_scan_stand,
+                action="approaching the shelf scan stand",
             )
+            if running is not None:
+                return running
+            if done:
+                return StageResult.succeeded(
+                    "task 1 reached the safe shelf observation stand with the "
+                    f"carried center still {self.SHELF_SCAN_CENTER_CLEARANCE_M:.2f} m "
+                    "in front of the shelf",
+                    arm_command=self._held_arm_command,
+                )
         return StageResult.blocked(
             f"task 1 invalid transport phase {self._phase!r}",
             arm_command=self._held_arm_command,
@@ -272,32 +307,39 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             result = self._tick_slide(context, "moving held box to shelf clearance height")
             if result is not None:
                 return result
-            self._phase = "navigate_final"
+            self._phase = "navigate_place_lateral"
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "navigate_final":
+        if self._phase == "navigate_place_lateral":
             assert self._place_world is not None
-            if not self._motion_started:
-                stand_x, stand_y = stand_from_held_center(
+            assert self._shelf_scan_stand is not None
+            if self._final_place_stand is None:
+                self._final_place_stand = stand_from_held_center(
                     self._place_world,
                     self._held_center_base,
                     self.SHELF_YAW,
                 )
-                stand_y = max(0.58, min(0.98, stand_y))
+                self._final_place_stand = (
+                    self._final_place_stand[0],
+                    max(0.58, min(0.98, self._final_place_stand[1])),
+                )
+            if not self._motion_started:
                 goal = NavigationGoal(
-                    x=stand_x,
-                    y=stand_y,
+                    # Complete lateral alignment while the carried box is
+                    # still outside the shelf front.
+                    x=self._shelf_scan_stand[0],
+                    y=self._final_place_stand[1],
                     yaw=self.SHELF_YAW,
-                    position_tolerance=0.06,
+                    position_tolerance=0.07,
                     yaw_tolerance=0.07,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_SHELF,
-                    source_tag="integrated_task1_shelf_place",
+                    source_tag="integrated_task1_safe_place_lateral",
                 )
                 if not self._transfer.begin_navigation(goal, context.odometry):
                     return StageResult.blocked(
-                        "task 1 could not plan the final shelf placement alignment",
+                        "task 1 could not plan safe lateral shelf placement alignment",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
@@ -305,24 +347,90 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 context.odometry, context.now_s
             )
             if status is NavigationStatus.GOAL_REACHED:
+                self._phase = "approach_place_final"
+                self._motion_started = False
+                self._transfer.reset()
+            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                return StageResult.blocked(
+                    f"task 1 safe lateral shelf alignment stopped: {detail}",
+                    arm_command=self._held_arm_command,
+                )
+            else:
+                return StageResult.running(
+                    f"task 1 aligning laterally outside the shelf; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+
+        if self._phase == "approach_place_final":
+            assert self._final_place_stand is not None
+            done, running = self._tick_straight_advance(
+                context,
+                self._final_place_stand,
+                action="entering the recognized empty shelf layer",
+            )
+            if running is not None:
+                return running
+            if done:
                 state = self._memory.require_shelf_state()
                 return StageResult.succeeded(
-                    f"task 1 aligned to empty shelf layer L{state.empty_layer}; "
-                    f"confidence={state.confidence:.2f}",
+                    f"task 1 entered only the recognized empty shelf layer "
+                    f"L{state.empty_layer}; confidence={state.confidence:.2f}",
                     arm_command=self._held_arm_command,
                 )
-            if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-                return StageResult.blocked(
-                    f"task 1 final shelf alignment stopped safely: {detail}",
-                    arm_command=self._held_arm_command,
-                )
-            return StageResult.running(
-                f"task 1 aligning held box to the empty shelf center; {detail}",
-                base_command=command,
-                arm_command=self._held_arm_command,
-            )
         return StageResult.blocked(
             f"task 1 invalid shelf-alignment phase {self._phase!r}",
+            arm_command=self._held_arm_command,
+        )
+
+    def _tick_straight_advance(
+        self,
+        context: ExecutionContext,
+        target_xy: tuple[float, float],
+        *,
+        action: str,
+    ) -> tuple[bool, StageResult | None]:
+        """Reach a nearby target without allowing a new turn near the shelf."""
+
+        pose = odometry_pose(context.odometry)
+        if pose is None:
+            return False, StageResult.running(
+                f"task 1 waiting for odometry before {action}",
+                arm_command=self._held_arm_command,
+            )
+        if not self._motion_started:
+            forward_m, lateral_m = target_delta_in_heading(
+                pose,
+                target_xy,
+                self.SHELF_YAW,
+            )
+            if abs(lateral_m) > 0.09:
+                return False, StageResult.blocked(
+                    f"task 1 refused straight shelf approach with "
+                    f"lateral_error={lateral_m:.3f} m",
+                    arm_command=self._held_arm_command,
+                )
+            if forward_m < -0.03:
+                return False, StageResult.blocked(
+                    f"task 1 overshot the safe shelf approach target by "
+                    f"{-forward_m:.3f} m",
+                    arm_command=self._held_arm_command,
+                )
+            if forward_m <= 0.015:
+                return True, None
+            if not self._transfer.begin_advance(context.odometry, forward_m):
+                return False, StageResult.running(
+                    f"task 1 waiting to start {action}",
+                    arm_command=self._held_arm_command,
+                )
+            self._motion_started = True
+
+        done, command, detail = self._transfer.tick_advance(context.odometry)
+        if done:
+            return True, None
+        return False, StageResult.running(
+            f"task 1 {action}; {detail}",
+            base_command=command,
             arm_command=self._held_arm_command,
         )
 
@@ -502,7 +610,54 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         return None
 
 
-__all__ = ["Task1IntegratedExecutor"]
+def shelf_observation_stand(
+    held_center_base: tuple[float, float, float],
+    *,
+    shelf_front_x: float,
+    shelf_y: float,
+    center_clearance_m: float,
+    shelf_yaw: float = math.pi,
+) -> tuple[float, float]:
+    """Keep the carried-object center outside the shelf during recognition."""
+
+    if not all(math.isfinite(float(value)) for value in held_center_base):
+        raise ValueError("held_center_base contains non-finite values")
+    clearance = float(center_clearance_m)
+    if not math.isfinite(clearance) or clearance <= 0.0:
+        raise ValueError("center_clearance_m must be finite and positive")
+    desired_center_world = (
+        float(shelf_front_x) + clearance,
+        float(shelf_y),
+        float(held_center_base[2]),
+    )
+    return stand_from_held_center(
+        desired_center_world,
+        held_center_base,
+        float(shelf_yaw),
+    )
+
+
+def target_delta_in_heading(
+    robot_pose: tuple[float, float, float],
+    target_xy: tuple[float, float],
+    heading: float,
+) -> tuple[float, float]:
+    """Return target forward/lateral displacement in a fixed heading frame."""
+
+    dx = float(target_xy[0]) - float(robot_pose[0])
+    dy = float(target_xy[1]) - float(robot_pose[1])
+    c = math.cos(float(heading))
+    s = math.sin(float(heading))
+    forward = c * dx + s * dy
+    lateral = -s * dx + c * dy
+    return forward, lateral
+
+
+__all__ = [
+    "Task1IntegratedExecutor",
+    "shelf_observation_stand",
+    "target_delta_in_heading",
+]
 
 
 def _with_head_pitch(command: ArmCommand, pitch: float) -> ArmCommand:

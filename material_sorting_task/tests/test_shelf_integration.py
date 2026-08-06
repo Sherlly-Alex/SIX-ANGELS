@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import math
 import unittest
+from types import SimpleNamespace
 
 from executors import build_task_executors
 from executors.base import TargetObservation
-from executors.task1_full import Task1IntegratedExecutor
+from executors.task1_full import (
+    Task1IntegratedExecutor,
+    shelf_observation_stand,
+    target_delta_in_heading,
+)
 from executors.task2 import Task2IntegratedExecutor
-from executors.transfer_support import stand_from_held_center
+from executors.transfer_support import TransferMotion, stand_from_held_center
 from shelf.state_tracker import ShelfStateTracker
 
 
@@ -80,6 +86,62 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         )
         self.assertAlmostEqual(stand[0], -1.98, places=6)
         self.assertAlmostEqual(stand[1], 0.798, places=6)
+
+    def test_shelf_scan_stand_keeps_carried_center_outside_front(self) -> None:
+        held = (0.70, -0.025, 0.984)
+        stand = shelf_observation_stand(
+            held,
+            shelf_front_x=-2.465,
+            shelf_y=0.85,
+            center_clearance_m=0.18,
+        )
+        # Facing west, the held center is base + R(pi) * held.
+        carried_center_x = stand[0] - held[0]
+        carried_center_y = stand[1] - held[1]
+        self.assertAlmostEqual(carried_center_x, -2.285, places=6)
+        self.assertAlmostEqual(carried_center_y, 0.85, places=6)
+        self.assertGreater(carried_center_x, -2.465)
+
+    def test_straight_shelf_delta_is_forward_when_target_is_west(self) -> None:
+        forward, lateral = target_delta_in_heading(
+            (-1.30, 0.825, 3.141592653589793),
+            (-1.585, 0.825),
+            3.141592653589793,
+        )
+        self.assertAlmostEqual(forward, 0.285, places=6)
+        self.assertAlmostEqual(lateral, 0.0, places=6)
+
+    def test_transfer_advance_holds_heading_and_finishes_by_odometry(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(motion.begin_advance(_odom(-1.30, 0.85, 3.141592653589793), 0.28))
+        done, command, _detail = motion.tick_advance(
+            _odom(-1.40, 0.85, 3.141592653589793)
+        )
+        self.assertFalse(done)
+        self.assertGreater(command[0], 0.0)
+        self.assertAlmostEqual(command[1], 0.0, places=6)
+        done, command, _detail = motion.tick_advance(
+            _odom(-1.58, 0.85, 3.141592653589793)
+        )
+        self.assertTrue(done)
+        self.assertEqual(command, (0.0, 0.0))
+
+
+def _odom(x: float, y: float, yaw: float):
+    half = 0.5 * yaw
+    return SimpleNamespace(
+        pose=SimpleNamespace(
+            pose=SimpleNamespace(
+                position=SimpleNamespace(x=x, y=y),
+                orientation=SimpleNamespace(
+                    x=0.0,
+                    y=0.0,
+                    z=math.sin(half),
+                    w=math.cos(half),
+                ),
+            )
+        )
+    )
 
 
 if __name__ == "__main__":

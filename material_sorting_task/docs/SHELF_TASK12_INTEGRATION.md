@@ -13,14 +13,17 @@ Implemented flow:
 1. Task 1 uses the existing table navigation, open pregrasp, bounded 4 mm
    preload, and 0.15 m lift.
 2. It records the calibrated task-1 source coordinate in shared process memory.
-3. It retreats straight before turning, navigates to the shelf, and fuses the
-   canonical semantic observations over multiple detector frames.
+3. It retreats straight, turns west at a safe point east of the shelf, and
+   then approaches the scan stand in a straight line. The scan stand is derived
+   from the measured held-object transform so the carried center remains 0.18 m
+   in front of the shelf while semantic observations are fused.
 4. A result is accepted only when one colored shelf box and the white packaging
    obstacle vote for two distinct layers in L1-L3. The carried task-1 color is
    ignored. The remaining unique layer is the task-1 placement target.
-5. Placement preserves the grasp while changing the slide, aligns the base from
-   the measured held-object transform, lowers to the official board height,
-   spreads both arms, retreats, and returns to the end zone.
+5. Placement preserves the grasp while changing the slide, completes lateral
+   alignment outside the shelf, enters the recognized empty layer in a straight
+   line, lowers to the official board height, spreads both arms, retreats, and
+   returns to the end zone.
 6. The formal `CompetitionController` waits for Server referee progression.
 7. Task 2 verifies that its instruction color matches the stored shelf result,
    fuses live lateral detection with the calibrated layer center, performs a
