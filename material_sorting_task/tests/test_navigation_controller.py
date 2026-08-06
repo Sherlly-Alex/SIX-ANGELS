@@ -37,45 +37,51 @@ def material_grid_with_cached_distance_map():
 
 
 class NavigationControllerTests(unittest.TestCase):
-    def test_reaches_both_randomized_table_side_pick_stands(self) -> None:
-        for target_x in (-1.00, -0.18):
-            with self.subTest(target_x=target_x):
-                controller = NavigationController(
-                    material_grid_with_cached_distance_map(),
-                    SpeedLimits(0.20, 0.65, 0.35, 1.20, 0.20, 0.50),
-                    pos_tolerance=0.08,
-                    yaw_tolerance=0.05,
-                    lookahead_distance=0.45,
-                    timeout=60.0,
-                    emergency_distance=0.20,
-                )
-                goal = NavigationGoal(
-                    x=target_x,
-                    y=1.64,
-                    yaw=math.pi / 2.0,
-                    position_tolerance=0.08,
-                    yaw_tolerance=0.05,
-                    safety_radius=0.56,
-                    segment=NavigationSegment.NAV_TABLE,
-                    source_tag="test",
-                )
-                x, y, yaw = -0.70, 0.55, math.pi / 2.0
-                self.assertTrue(controller.set_goal(goal, x, y))
+    def test_reaches_randomized_table_pick_stands_without_static_estop(self) -> None:
+        # y=1.67 covers the deeper randomized target that previously put the
+        # 0.56 m stand inside the table's 0.20 m emergency-clearance band.
+        for target_x in (-1.00, -0.22):
+            for goal_y in (1.55, 1.67):
+                with self.subTest(target_x=target_x, goal_y=goal_y):
+                    self._assert_reaches_pick_stand(target_x, goal_y)
 
-                for _ in range(400):
-                    command = controller.update(x, y, yaw, 0.05, None)
-                    self.assertLessEqual(abs(command.linear_x), 0.20 + 1e-9)
-                    self.assertLessEqual(abs(command.angular_z), 0.65 + 1e-9)
-                    x += command.linear_x * math.cos(yaw) * 0.05
-                    y += command.linear_x * math.sin(yaw) * 0.05
-                    yaw = (
-                        yaw + command.angular_z * 0.05 + math.pi
-                    ) % (2.0 * math.pi) - math.pi
-                    if controller.status is NavigationStatus.GOAL_REACHED:
-                        break
+    def _assert_reaches_pick_stand(self, target_x: float, goal_y: float) -> None:
+        controller = NavigationController(
+            material_grid_with_cached_distance_map(),
+            SpeedLimits(0.20, 0.65, 0.35, 1.20, 0.20, 0.50),
+            pos_tolerance=0.08,
+            yaw_tolerance=0.05,
+            lookahead_distance=0.45,
+            timeout=60.0,
+            emergency_distance=0.20,
+        )
+        goal = NavigationGoal(
+            x=target_x,
+            y=goal_y,
+            yaw=math.pi / 2.0,
+            position_tolerance=0.08,
+            yaw_tolerance=0.05,
+            safety_radius=0.65,
+            segment=NavigationSegment.NAV_TABLE,
+            source_tag="test",
+        )
+        x, y, yaw = -0.70, 0.55, math.pi / 2.0
+        self.assertTrue(controller.set_goal(goal, x, y))
 
-                self.assertEqual(controller.status, NavigationStatus.GOAL_REACHED)
-                self.assertLessEqual(math.hypot(x - goal.x, y - goal.y), 0.08)
+        for _ in range(400):
+            command = controller.update(x, y, yaw, 0.05, None)
+            self.assertLessEqual(abs(command.linear_x), 0.20 + 1e-9)
+            self.assertLessEqual(abs(command.angular_z), 0.65 + 1e-9)
+            x += command.linear_x * math.cos(yaw) * 0.05
+            y += command.linear_x * math.sin(yaw) * 0.05
+            yaw = (
+                yaw + command.angular_z * 0.05 + math.pi
+            ) % (2.0 * math.pi) - math.pi
+            if controller.status is NavigationStatus.GOAL_REACHED:
+                break
+
+        self.assertEqual(controller.status, NavigationStatus.GOAL_REACHED)
+        self.assertLessEqual(math.hypot(x - goal.x, y - goal.y), 0.08)
 
 
 if __name__ == "__main__":

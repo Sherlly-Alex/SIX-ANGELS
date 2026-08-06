@@ -100,9 +100,9 @@ class Task1NavigationExecutorTests(unittest.TestCase):
         self.assertTrue(moving.controls_base)
         self.assertIsNotNone(executor.goal)
         self.assertAlmostEqual(executor.goal.x, -0.18)
-        self.assertAlmostEqual(executor.goal.y, 1.64)
+        self.assertAlmostEqual(executor.goal.y, 1.55)
 
-        at_goal = context(0.05, odometry(-0.18, 1.64, math.pi / 2.0))
+        at_goal = context(0.05, odometry(-0.18, 1.55, math.pi / 2.0))
         reached = executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal)
         self.assertEqual(reached.status, StageStatus.SUCCEEDED)
         self.assertFalse(reached.controls_base)

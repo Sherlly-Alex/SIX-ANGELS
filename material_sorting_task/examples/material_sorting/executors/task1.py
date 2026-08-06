@@ -44,7 +44,10 @@ class Task1NavigationExecutor:
     task_id = 1
     name = "task1_navigation_only"
 
-    TABLE_STANDOFF_M = 0.56
+    # Keep the nominal stand outside the static table's 0.20 m emergency
+    # clearance even when randomization places the target deeper on the table.
+    # This also matches KnownSceneProvider's calibrated table approach distance.
+    TABLE_STANDOFF_M = 0.65
     POSITION_TOLERANCE_M = 0.08
     YAW_TOLERANCE_RAD = 0.05
     TARGET_MAX_AGE_S = 1.5
