@@ -7,6 +7,7 @@ from executors.dry_run import DryRunTaskExecutor
 from executors.task1 import (
     Task1ContactExecutor,
     Task1Executor,
+    Task1LiftExecutor,
     Task1NavigationExecutor,
     Task1PregraspExecutor,
 )
@@ -19,6 +20,7 @@ EXECUTION_MODES = (
     "nav_only",
     "pregrasp_only",
     "contact_only",
+    "lift_only",
 )
 
 
@@ -51,6 +53,12 @@ def build_task_executors(
     if normalized == "contact_only":
         return {
             1: Task1ContactExecutor(),
+            2: Task2Executor(),
+            3: Task3Executor(),
+        }
+    if normalized == "lift_only":
+        return {
+            1: Task1LiftExecutor(),
             2: Task2Executor(),
             3: Task3Executor(),
         }

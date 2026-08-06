@@ -183,6 +183,13 @@ class CompetitionClient(Node):
                 "bilateral target contact, then holds and blocks before "
                 "squeeze or lift"
             )
+        elif self.execution_mode == "lift_only":
+            self.get_logger().warning(
+                "lift_only enables task-1 navigation, open pregrasp, the "
+                "bounded 4 mm arm preload and a 0.15 m slide lift without "
+                "requiring Server bilateral-contact confirmation; it then "
+                "holds and blocks before transport"
+            )
         else:
             self.get_logger().info(
                 "formal mode is referee-driven; placeholder executors fail closed and keep "
@@ -393,6 +400,7 @@ class CompetitionClient(Node):
             "nav_only",
             "pregrasp_only",
             "contact_only",
+            "lift_only",
         } and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()

@@ -35,6 +35,9 @@ HEAD_TARGET = (0.0, 0.45)
 
 FEEDBACK_POS_TOL = 0.03
 SQUEEZE_CONTACT_POS_TOL = 0.24
+LIFT_HEIGHT = 0.15
+LIFT_SLIDE_COMMAND_RATIO = 0.05
+LIFT_ARM_POSITION_TOL = 0.24
 FEEDBACK_VEL_TOL = 0.01
 FEEDBACK_STABLE_TIME = 0.50
 COMMAND_RATE_PER_S = 1.20
@@ -403,8 +406,9 @@ class ContactGraspController(OpenPregraspController):
 
     # Contact with the box can stop the measured joints before they reach the
     # unconstrained IK solution.  This tolerance does not declare success; it
-    # only permits the hard-bounded inward search to advance.  Server bilateral
-    # contact remains the sole success condition.
+    # only permits the hard-bounded inward search to advance.  The contact-only
+    # executor still uses Server bilateral contact as its sole success signal;
+    # lift-only may instead require the maximum bounded preload to settle.
     ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
@@ -482,9 +486,158 @@ class ContactGraspController(OpenPregraspController):
         )
 
 
+class SlideLiftController:
+    """Raise the spine while preserving the established dual-arm preload."""
+
+    def __init__(self, lift_height: float = LIFT_HEIGHT) -> None:
+        self._lift_height = float(lift_height)
+        if not math.isfinite(self._lift_height) or self._lift_height <= 0.0:
+            raise ValueError("lift_height must be finite and positive")
+        self._target_vector: np.ndarray | None = None
+        self._action_vector: np.ndarray | None = None
+        self._last_update_s: float | None = None
+        self._stable_since_s: float | None = None
+        self._actual_lift_m = 0.0
+
+    @property
+    def planned(self) -> bool:
+        return self._target_vector is not None
+
+    @property
+    def actual_lift_m(self) -> float:
+        return self._actual_lift_m
+
+    @property
+    def target_slide(self) -> float | None:
+        if self._target_vector is None:
+            return None
+        return float(self._target_vector[0])
+
+    def reset(self) -> None:
+        self._target_vector = None
+        self._action_vector = None
+        self._last_update_s = None
+        self._stable_since_s = None
+        self._actual_lift_m = 0.0
+
+    def plan(self, hold_command: ArmCommand, joint_states: Any) -> ArmCommand:
+        _joint_maps(joint_states)
+        start_slide = float(hold_command.spine_position)
+        if not math.isfinite(start_slide):
+            raise PregraspInputError("held spine command is non-finite")
+        target_slide = float(
+            np.clip(start_slide - self._lift_height, SPINE_MIN, SPINE_MAX)
+        )
+        self._actual_lift_m = start_slide - target_slide
+        if self._actual_lift_m <= 1e-6:
+            raise PregraspPlanningError(
+                f"lift unavailable at held slide={start_slide:.3f}"
+            )
+
+        values = np.array(
+            [
+                start_slide,
+                *hold_command.head_positions,
+                *hold_command.left_arm_positions,
+                hold_command.left_gripper_position,
+                *hold_command.right_arm_positions,
+                hold_command.right_gripper_position,
+            ],
+            dtype=float,
+        )
+        if values.shape != (17,) or not np.all(np.isfinite(values)):
+            raise PregraspInputError("held arm command is invalid")
+        self._action_vector = values
+        self._target_vector = values.copy()
+        self._target_vector[0] = target_slide
+        self._last_update_s = None
+        self._stable_since_s = None
+        return self.command()
+
+    def update(
+        self,
+        now_s: float,
+        joint_states: Any,
+    ) -> tuple[ArmCommand, bool, str]:
+        if self._target_vector is None or self._action_vector is None:
+            raise PregraspPlanningError("slide-lift update called before plan")
+        positions, velocities = _joint_maps(joint_states)
+        now = float(now_s)
+        if not math.isfinite(now):
+            raise PregraspInputError("control time is non-finite")
+        if self._last_update_s is None:
+            dt = 0.05
+        else:
+            dt = min(0.20, max(0.01, now - self._last_update_s))
+        self._last_update_s = now
+
+        slide_diff = float(self._target_vector[0] - self._action_vector[0])
+        max_step = COMMAND_RATE_PER_S * LIFT_SLIDE_COMMAND_RATIO * dt
+        self._action_vector[0] += math.copysign(
+            min(abs(slide_diff), max_step),
+            slide_diff,
+        ) if abs(slide_diff) > 0.0 else 0.0
+
+        measured_left = np.array(
+            [positions[f"left_arm_joint{index}"] for index in range(1, 7)],
+            dtype=float,
+        )
+        measured_right = np.array(
+            [positions[f"right_arm_joint{index}"] for index in range(1, 7)],
+            dtype=float,
+        )
+        target_left = self._target_vector[3:9]
+        target_right = self._target_vector[10:16]
+        slide_error = abs(positions["slide_joint"] - self._target_vector[0])
+        left_error = float(np.max(np.abs(measured_left - target_left)))
+        right_error = float(np.max(np.abs(measured_right - target_right)))
+        command_error = abs(self._action_vector[0] - self._target_vector[0])
+        max_velocity = max(
+            abs(velocities.get("slide_joint", 0.0)),
+            *(abs(velocities.get(f"left_arm_joint{index}", 0.0)) for index in range(1, 7)),
+            *(abs(velocities.get(f"right_arm_joint{index}", 0.0)) for index in range(1, 7)),
+        )
+        stable_now = (
+            slide_error <= FEEDBACK_POS_TOL
+            and left_error <= LIFT_ARM_POSITION_TOL
+            and right_error <= LIFT_ARM_POSITION_TOL
+            and command_error <= FEEDBACK_POS_TOL
+            and max_velocity <= FEEDBACK_VEL_TOL
+        )
+        reached = False
+        if stable_now:
+            if self._stable_since_s is None:
+                self._stable_since_s = now
+            reached = now - self._stable_since_s >= FEEDBACK_STABLE_TIME
+        else:
+            self._stable_since_s = None
+        detail = (
+            f"lift={self._actual_lift_m:.3f}m, "
+            f"slide_target={self._target_vector[0]:.3f}, "
+            f"slide_err={slide_error:.3f}, left_err={left_error:.3f}, "
+            f"right_err={right_error:.3f}, cmd_err={command_error:.3f}, "
+            f"max_vel={max_velocity:.3f}"
+        )
+        return self.command(), reached, detail
+
+    def command(self) -> ArmCommand:
+        if self._action_vector is None:
+            raise PregraspPlanningError("slide-lift command requested before plan")
+        values = self._action_vector
+        return ArmCommand(
+            spine_position=float(values[0]),
+            head_positions=(float(values[1]), float(values[2])),
+            left_arm_positions=tuple(float(value) for value in values[3:9]),
+            left_gripper_position=float(values[9]),
+            right_arm_positions=tuple(float(value) for value in values[10:16]),
+            right_gripper_position=float(values[16]),
+        )
+
+
 __all__ = [
     "ContactGraspController",
     "OpenPregraspController",
     "PregraspInputError",
     "PregraspPlanningError",
+    "SlideLiftController",
 ]

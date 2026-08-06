@@ -9,6 +9,7 @@ import numpy as np
 from desktop_grasp.pregrasp_core import (
     ContactGraspController,
     OpenPregraspController,
+    SlideLiftController,
 )
 from executors.base import (
     ArmCommand,
@@ -17,7 +18,11 @@ from executors.base import (
     TargetObservation,
     TaskStage,
 )
-from executors.task1 import Task1ContactExecutor, Task1PregraspExecutor
+from executors.task1 import (
+    Task1ContactExecutor,
+    Task1LiftExecutor,
+    Task1PregraspExecutor,
+)
 from navigation.navigation_types import NavigationStatus, VelocityCommand
 
 
@@ -28,6 +33,15 @@ ARM_COMMAND = ArmCommand(
     left_gripper_position=1.0,
     right_arm_positions=(-0.1, -0.2, -0.3, -0.4, -0.5, -0.6),
     right_gripper_position=1.0,
+)
+
+LIFTED_ARM_COMMAND = ArmCommand(
+    spine_position=0.25,
+    head_positions=ARM_COMMAND.head_positions,
+    left_arm_positions=ARM_COMMAND.left_arm_positions,
+    left_gripper_position=ARM_COMMAND.left_gripper_position,
+    right_arm_positions=ARM_COMMAND.right_arm_positions,
+    right_gripper_position=ARM_COMMAND.right_gripper_position,
 )
 
 
@@ -105,6 +119,30 @@ class FakeContactController:
         self.updates_since_plan = 0
         return ARM_COMMAND
 
+
+class FakeLiftController:
+    def __init__(self) -> None:
+        self.planned = False
+        self.actual_lift_m = 0.15
+        self.plan_command = None
+        self.update_count = 0
+
+    def reset(self) -> None:
+        self.planned = False
+        self.update_count = 0
+
+    def plan(self, hold_command, joint_states):
+        self.plan_command = hold_command
+        self.planned = True
+        return LIFTED_ARM_COMMAND
+
+    def update(self, now_s, joint_states):
+        self.update_count += 1
+        return (
+            LIFTED_ARM_COMMAND,
+            self.update_count >= 2,
+            "fake lift feedback",
+        )
 
 class FakeKdl:
     def __init__(self) -> None:
@@ -271,6 +309,47 @@ class OpenPregraspControllerTests(unittest.TestCase):
             )
 
         self.assertTrue(reached)
+
+
+class SlideLiftControllerTests(unittest.TestCase):
+    def test_lift_changes_only_spine_and_preserves_arm_preload(self) -> None:
+        controller = SlideLiftController(lift_height=0.15)
+        feedback = joint_states(
+            slide=ARM_COMMAND.spine_position,
+            left_arm=ARM_COMMAND.left_arm_positions,
+            right_arm=ARM_COMMAND.right_arm_positions,
+        )
+
+        command = controller.plan(ARM_COMMAND, feedback)
+
+        self.assertAlmostEqual(controller.target_slide, 0.25, places=6)
+        self.assertAlmostEqual(controller.actual_lift_m, 0.15, places=6)
+        self.assertEqual(command.left_arm_positions, ARM_COMMAND.left_arm_positions)
+        self.assertEqual(command.right_arm_positions, ARM_COMMAND.right_arm_positions)
+        self.assertEqual(
+            command.left_gripper_position,
+            ARM_COMMAND.left_gripper_position,
+        )
+        self.assertEqual(
+            command.right_gripper_position,
+            ARM_COMMAND.right_gripper_position,
+        )
+
+        reached = False
+        for tick in range(30):
+            feedback = joint_states(
+                slide=command.spine_position,
+                left_arm=command.left_arm_positions,
+                right_arm=command.right_arm_positions,
+            )
+            command, reached, _detail = controller.update(tick * 0.20, feedback)
+            if reached:
+                break
+
+        self.assertTrue(reached)
+        self.assertAlmostEqual(command.spine_position, 0.25, places=6)
+        self.assertEqual(command.left_arm_positions, ARM_COMMAND.left_arm_positions)
+        self.assertEqual(command.right_arm_positions, ARM_COMMAND.right_arm_positions)
 
 
 class Task1PregraspExecutorTests(unittest.TestCase):
@@ -487,6 +566,98 @@ class Task1ContactExecutorTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.BLOCKED)
         self.assertIn("unsafe collision", result.message)
         self.assertEqual(result.arm_command, ARM_COMMAND)
+
+
+class Task1LiftExecutorTests(unittest.TestCase):
+    def _reach_grasp_stage(self):
+        contact_controller = FakeContactController()
+        lift_controller = FakeLiftController()
+        executor = Task1LiftExecutor(
+            pregrasp_controller=FakePregraspController(),
+            contact_controller=contact_controller,
+            lift_controller=lift_controller,
+        )
+        executor._navigation = FakeNavigationController()
+        initial = context(0.0, odometry(-0.70, 0.55, math.pi / 2.0))
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
+        executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
+        at_goal = context(0.05, odometry(-0.18, 1.55, math.pi / 2.0))
+        self.assertEqual(
+            executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.ACQUIRE_TARGET, at_goal)
+        self.assertEqual(
+            executor.tick(TaskStage.ACQUIRE_TARGET, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.ALIGN_FOR_PICK, at_goal)
+        executor.tick(TaskStage.ALIGN_FOR_PICK, at_goal)
+        self.assertEqual(
+            executor.tick(TaskStage.ALIGN_FOR_PICK, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.GRASP, at_goal)
+        return executor, contact_controller, lift_controller
+
+    def test_settled_max_preload_lifts_without_server_contact_confirmation(self) -> None:
+        executor, contact_controller, lift_controller = self._reach_grasp_stage()
+        result = None
+        now_s = 0.10
+        for _ in range(20):
+            result = executor.tick(
+                TaskStage.GRASP,
+                context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
+            )
+            if result.status is StageStatus.SUCCEEDED:
+                break
+            now_s += 0.35
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, StageStatus.SUCCEEDED)
+        self.assertEqual(contact_controller.tighten_offsets, [0.001, 0.002, 0.003, 0.004])
+        self.assertIn("without Server", result.message)
+
+        lift_context = context(
+            now_s + 0.05,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+        )
+        executor.enter_stage(TaskStage.LIFT, lift_context)
+        lifting = executor.tick(TaskStage.LIFT, lift_context)
+        self.assertEqual(lifting.status, StageStatus.RUNNING)
+        lifted = executor.tick(
+            TaskStage.LIFT,
+            context(now_s + 0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
+        )
+        self.assertEqual(lifted.status, StageStatus.SUCCEEDED)
+        self.assertEqual(lift_controller.plan_command, ARM_COMMAND)
+        self.assertEqual(lifted.arm_command, LIFTED_ARM_COMMAND)
+
+        transport_context = context(
+            now_s + 0.15,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+        )
+        executor.enter_stage(TaskStage.TRANSPORT, transport_context)
+        held = executor.tick(TaskStage.TRANSPORT, transport_context)
+        self.assertEqual(held.status, StageStatus.BLOCKED)
+        self.assertEqual(held.arm_command, LIFTED_ARM_COMMAND)
+        self.assertIn("transport", held.message)
+
+    def test_unsafe_collision_blocks_lift_and_holds_preload(self) -> None:
+        executor, _contact_controller, _lift_controller = self._reach_grasp_stage()
+        executor._held_arm_command = ARM_COMMAND
+        collision = context(
+            1.0,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            unsafe_collision=True,
+        )
+        executor.enter_stage(TaskStage.LIFT, collision)
+
+        result = executor.tick(TaskStage.LIFT, collision)
+
+        self.assertEqual(result.status, StageStatus.BLOCKED)
+        self.assertEqual(result.arm_command, ARM_COMMAND)
+        self.assertIn("unsafe collision", result.message)
 
 
 if __name__ == "__main__":

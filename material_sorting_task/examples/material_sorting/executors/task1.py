@@ -22,6 +22,7 @@ from desktop_grasp.pregrasp_core import (
     OpenPregraspController,
     PregraspInputError,
     PregraspPlanningError,
+    SlideLiftController,
 )
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import (
@@ -448,6 +449,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     CONTACT_SEARCH_STEP_M = 0.001
     CONTACT_SEARCH_MAX_M = 0.004
     CONTACT_SEARCH_INTERVAL_S = 0.30
+    REQUIRE_SERVER_CONTACT = True
+    ALLOW_SETTLED_MAX_SEARCH = False
 
     def __init__(
         self,
@@ -523,7 +526,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         # continuing toward the unconstrained IK solution.  A short stable
         # confirmation rejects single-frame contact noise.  If contact drops,
         # resume the bounded inward ramp from the same command.
-        if self._contact_since_s is not None:
+        if self.REQUIRE_SERVER_CONTACT and self._contact_since_s is not None:
             if context.grasp_confirmed:
                 contact_age_s = max(0.0, now_s - self._contact_since_s)
                 if contact_age_s >= self.CONTACT_CONFIRM_TIME_S:
@@ -556,7 +559,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-        if context.grasp_confirmed:
+        if self.REQUIRE_SERVER_CONTACT and context.grasp_confirmed:
             self._contact_since_s = now_s
             return StageResult.running(
                 "task 1 Server detected bilateral target contact; "
@@ -616,11 +619,28 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 arm_command=command,
             )
 
+        if (
+            pose_settled
+            and self.ALLOW_SETTLED_MAX_SEARCH
+            and self._contact_search_used_m
+            >= self.CONTACT_SEARCH_MAX_M - 1e-9
+        ):
+            return StageResult.succeeded(
+                "task 1 maximum bounded inward preload settled; "
+                "proceeding without Server bilateral-contact confirmation",
+                arm_command=command,
+            )
+
         elapsed_s = max(0.0, now_s - self._stage_started_s)
         if elapsed_s >= self.CONTACT_TIMEOUT_S:
+            timeout_goal = (
+                "bilateral Server confirmation"
+                if self.REQUIRE_SERVER_CONTACT
+                else "the maximum bounded preload to settle"
+            )
             return StageResult.blocked(
-                "task 1 contact approach timed out without bilateral Server "
-                f"confirmation after {elapsed_s:.1f}s: {detail}",
+                f"task 1 contact approach timed out waiting for {timeout_goal} "
+                f"after {elapsed_s:.1f}s: {detail}",
                 arm_command=command,
             )
         settled_text = "contact pose settled; " if pose_settled else ""
@@ -647,5 +667,131 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             )
         return StageResult.running(
             f"task 1 waiting for contact feedback inputs: {detail}",
+            arm_command=self._held_arm_command,
+        )
+
+
+class Task1LiftExecutor(Task1ContactExecutor):
+    """Apply the bounded preload, lift 15 cm, then hold before transport."""
+
+    name = "task1_lift_only"
+    REQUIRE_SERVER_CONTACT = False
+    ALLOW_SETTLED_MAX_SEARCH = True
+    CONTACT_TIMEOUT_S = 25.0
+    LIFT_TIMEOUT_S = 15.0
+
+    def __init__(
+        self,
+        pregrasp_controller: OpenPregraspController | None = None,
+        contact_controller: ContactGraspController | None = None,
+        lift_controller: SlideLiftController | None = None,
+    ) -> None:
+        super().__init__(
+            pregrasp_controller=pregrasp_controller,
+            contact_controller=contact_controller,
+        )
+        self._lift = lift_controller or SlideLiftController()
+
+    def reset(self) -> None:
+        super().reset()
+        self._lift.reset()
+
+    def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
+        super().enter_stage(stage, context)
+        if stage is TaskStage.LIFT:
+            self._lift.reset()
+
+    def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
+        if stage is TaskStage.LIFT:
+            if stage is not self.active_stage:
+                return StageResult.blocked(
+                    f"task 1 lift stage mismatch: active={self.active_stage}",
+                    arm_command=self._held_arm_command,
+                )
+            if context.unsafe_collision:
+                return StageResult.blocked(
+                    "task 1 lift stopped because Server reported an unsafe collision",
+                    arm_command=self._held_arm_command,
+                )
+            return self._tick_lift(context)
+
+        if stage is TaskStage.TRANSPORT:
+            if stage is not self.active_stage:
+                return StageResult.blocked(
+                    f"task 1 transport stage mismatch: active={self.active_stage}",
+                    arm_command=self._held_arm_command,
+                )
+            return StageResult.blocked(
+                "task 1 box is lifted and held; transport and placement are "
+                "disabled in lift_only mode",
+                arm_command=self._held_arm_command,
+            )
+
+        return super().tick(stage, context)
+
+    def cancel(self, reason: str) -> None:
+        super().cancel(reason)
+        self._lift.reset()
+
+    def _tick_lift(self, context: ExecutionContext) -> StageResult:
+        if self._held_arm_command is None:
+            return StageResult.blocked("task 1 lift has no held grasp command")
+        if not self._lift.planned:
+            try:
+                self._held_arm_command = self._lift.plan(
+                    self._held_arm_command,
+                    context.joint_states,
+                )
+            except PregraspInputError as exc:
+                return self._wait_for_lift_inputs(context, str(exc))
+            except PregraspPlanningError as exc:
+                return StageResult.blocked(
+                    f"task 1 slide-lift planning failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+
+        try:
+            command, reached, detail = self._lift.update(
+                context.now_s,
+                context.joint_states,
+            )
+        except PregraspInputError as exc:
+            return self._wait_for_lift_inputs(context, str(exc))
+        except PregraspPlanningError as exc:
+            return StageResult.blocked(
+                f"task 1 slide-lift control failed: {exc}",
+                arm_command=self._held_arm_command,
+            )
+        self._held_arm_command = command
+        if reached:
+            return StageResult.succeeded(
+                f"task 1 lifted the held box {self._lift.actual_lift_m:.3f} m; "
+                "holding before transport",
+                arm_command=command,
+            )
+        elapsed_s = max(0.0, float(context.now_s) - self._stage_started_s)
+        if elapsed_s >= self.LIFT_TIMEOUT_S:
+            return StageResult.blocked(
+                f"task 1 slide lift timed out after {elapsed_s:.1f}s: {detail}",
+                arm_command=command,
+            )
+        return StageResult.running(
+            f"task 1 raising the spine while preserving arm preload; {detail}",
+            arm_command=command,
+        )
+
+    def _wait_for_lift_inputs(
+        self,
+        context: ExecutionContext,
+        detail: str,
+    ) -> StageResult:
+        elapsed_s = max(0.0, float(context.now_s) - self._stage_started_s)
+        if elapsed_s >= self.LIFT_TIMEOUT_S:
+            return StageResult.blocked(
+                f"task 1 timed out waiting for lift feedback: {detail}",
+                arm_command=self._held_arm_command,
+            )
+        return StageResult.running(
+            f"task 1 waiting for lift feedback: {detail}",
             arm_command=self._held_arm_command,
         )

@@ -9,7 +9,8 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
 和得分真值。任务 1 已提供显式 `nav_only` 底盘实动、`pregrasp_only` 开放预抓取以及
 `contact_only` 双侧接触模式：最后一种会从视觉世界坐标导航到随机桌边目标，调用桌面
-抓取标定逆解，在 Server 确认双臂同时接触目标后保持。柔顺挤压、抬升、搬运和放置以及
+抓取标定逆解，在 Server 确认双臂同时接触目标后保持；另有 `lift_only` 模式在完成
+4 mm 有限预紧后保持双臂姿态，通过升降轴将方块抬高 0.15 米。搬运和放置以及
 任务 2/3 正式执行器仍未开放，不会把空动作误判为成功。
 
 ## 目录
@@ -133,6 +134,21 @@ bash scripts/run_client.sh
 该模式会真实接触目标方块，但不会挤压或抬升。检测结果摘要默认每 5 秒输出一次；
 可用 `MATERIAL_DETECTION_LOG_PERIOD=0` 完全关闭摘要，或设置其他秒数。状态转换、
 接触确认、碰撞和错误日志不受影响。
+
+### 任务 1 抬升测试
+
+`lift_only` 复用完整导航、开放预抓取和 4 mm 有限向内预紧。最终预紧姿态稳定后，不再
+等待 Server 的双侧接触布尔量，而是保持双臂和张开的夹爪命令，仅缓慢调整升降轴，将
+方块抬高 0.15 米。抬升完成后持续保持，并在搬运前安全阻塞：
+
+```bash
+MATERIAL_EXECUTION_MODE=lift_only \
+MATERIAL_DETECT_BACKEND=yolo \
+bash scripts/run_client.sh
+```
+
+该模式仍会响应 `/material/unsafe_collision` 并立即停止推进。它只用于验证“夹住并抬起”，
+不执行底盘搬运或货架放置。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 
