@@ -40,7 +40,22 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     name = "task2_integrated_shelf_to_original_table_point"
     SOURCE_ORIENTATION = "yaw90"
 
+    # First stop well outside the shelf, extend/lower the open arms there,
+    # then advance straight to the calibrated pick stand.  Starting the arm
+    # motion at the old x=-1.88 made the elbows/grippers sweep through the
+    # shelf obstacle while descending.
+    SHELF_PICK_APPROACH_X = -1.50
     SHELF_PICK_X = -1.88
+    # ``OpenPregraspController`` places the TCP about 0.08 m in front of its
+    # requested center for the west-facing shelf pose.  This synthetic center
+    # therefore leaves the TCP about 0.22 m east of the shelf front while the
+    # arms are being opened and lowered.
+    SHELF_FRONT_X = -2.465
+    SHELF_ARM_STAGE_TARGET_X = SHELF_FRONT_X + 0.135
+    SHELF_ARM_APPROACH_TIMEOUT_S = 25.0
+    # ALIGN_FOR_PICK now contains two arm moves plus the short base advance;
+    # give both the staging and final pregrasp enough time in one stage.
+    PREGRASP_TIMEOUT_S = 55.0
     SHELF_YAW = math.pi
     TABLE_YAW = math.pi / 2.0
     SHELF_RETREAT_M = 0.32
@@ -58,6 +73,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._release = ReleaseSpreadController()
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
+        self._staged_target_world: tuple[float, float, float] | None = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start: float | None = None
@@ -70,6 +86,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._release.reset()
         self._held_center_base = None
         self._place_world = None
+        self._staged_target_world = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start = None
@@ -83,6 +100,15 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         if stage is TaskStage.NAVIGATE_TO_PICK:
             self._transfer.reset()
             self._phase = "navigate_shelf_pick"
+        elif stage is TaskStage.ALIGN_FOR_PICK:
+            # The inherited pregrasp controller is first used for a safe
+            # shelf-front staging pose.  It is reset and replanned for the
+            # real box only after the base has advanced straight to the pick
+            # stand.
+            self._pregrasp.reset()
+            self._transfer.reset()
+            self._staged_target_world = None
+            self._phase = "stage_arms"
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
             self._transfer.reset()
@@ -115,7 +141,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             return self._tick_navigate_to_pick(context)
         if stage is TaskStage.ACQUIRE_TARGET:
             return self._tick_acquire_target(context)
-        if stage in {TaskStage.ALIGN_FOR_PICK, TaskStage.GRASP, TaskStage.LIFT}:
+        if stage is TaskStage.ALIGN_FOR_PICK:
+            return self._tick_align_for_pick(context)
+        if stage in {TaskStage.GRASP, TaskStage.LIFT}:
             result = super().tick(stage, context)
             if result.status is StageStatus.SUCCEEDED and stage is TaskStage.LIFT:
                 self._capture_held_center(context)
@@ -149,6 +177,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._pregrasp.reset()
+        self._staged_target_world = None
 
     def _task2_target(self, context: ExecutionContext) -> tuple[str, tuple[float, float, float]]:
         state = self._memory.require_shelf_state()
@@ -167,7 +197,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             return StageResult.blocked(str(exc))
         if not self._motion_started:
             goal = NavigationGoal(
-                x=self.SHELF_PICK_X,
+                x=self.SHELF_PICK_APPROACH_X,
                 y=max(0.58, min(0.98, center[1])),
                 yaw=self.SHELF_YAW,
                 position_tolerance=0.06,
@@ -188,7 +218,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._locked_target_world = center
             self._locked_target_orientation = self.SOURCE_ORIENTATION
             return StageResult.succeeded(
-                f"task 2 reached the {target_color} shelf pick stand"
+                f"task 2 reached the far shelf arm-staging stand for {target_color}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
             return StageResult.blocked(f"task 2 shelf navigation stopped safely: {detail}")
@@ -216,6 +246,105 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         return StageResult.succeeded(
             "task 2 fused live shelf detection with the stable layer geometry at "
             f"{tuple(round(value, 3) for value in center)}"
+        )
+
+    def _tick_align_for_pick(self, context: ExecutionContext) -> StageResult:
+        """Open/lower outside the shelf, then advance the base to the box."""
+
+        if self._locked_target_world is None:
+            return StageResult.blocked(
+                "task 2 shelf alignment has no locked target",
+                arm_command=self._held_arm_command,
+            )
+
+        if self._staged_target_world is None:
+            self._staged_target_world = (
+                self.SHELF_ARM_STAGE_TARGET_X,
+                self._locked_target_world[1],
+                self._locked_target_world[2],
+            )
+
+        if self._phase == "stage_arms":
+            # Temporarily aim the inherited open-pregrasp controller at a
+            # point in front of the shelf.  Restore the real target on every
+            # tick so task memory and the later contact controller always see
+            # the actual detected box.
+            actual_target = self._locked_target_world
+            self._locked_target_world = self._staged_target_world
+            try:
+                result = super().tick(TaskStage.ALIGN_FOR_PICK, context)
+            finally:
+                self._locked_target_world = actual_target
+
+            if result.status is StageStatus.BLOCKED:
+                return StageResult.blocked(
+                    f"task 2 safe shelf-front arm staging failed: {result.message}",
+                    arm_command=result.arm_command,
+                )
+            if result.status is StageStatus.SUCCEEDED:
+                self._pregrasp.reset()
+                self._phase = "approach_pick"
+                self._motion_started = False
+                self._transfer.reset()
+                return StageResult.running(
+                    "task 2 arms reached the shelf-front staging pose; "
+                    "advancing the base straight toward the shelf box",
+                    arm_command=self._held_arm_command,
+                )
+            return StageResult.running(
+                f"task 2 opening/lowering arms outside the shelf; {result.message}",
+                arm_command=result.arm_command,
+            )
+
+        if self._phase == "approach_pick":
+            if not self._motion_started:
+                distance = max(
+                    0.0, self.SHELF_PICK_APPROACH_X - self.SHELF_PICK_X
+                )
+                if not self._transfer.begin_advance(context.odometry, distance):
+                    return StageResult.running(
+                        "task 2 waiting for odometry before the straight shelf approach",
+                        arm_command=self._held_arm_command,
+                    )
+                self._motion_started = True
+            done, command, detail = self._transfer.tick_advance(context.odometry)
+            if not done:
+                elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+                if elapsed >= self.SHELF_ARM_APPROACH_TIMEOUT_S:
+                    return StageResult.blocked(
+                        "task 2 straight shelf approach timed out: " + detail,
+                        arm_command=self._held_arm_command,
+                    )
+                return StageResult.running(
+                    f"task 2 advancing with arms held outside the shelf; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+            self._phase = "final_pregrasp"
+            self._motion_started = False
+            self._pregrasp.reset()
+
+        if self._phase == "final_pregrasp":
+            result = super().tick(TaskStage.ALIGN_FOR_PICK, context)
+            if result.status is StageStatus.BLOCKED:
+                return StageResult.blocked(
+                    f"task 2 final shelf pregrasp failed: {result.message}",
+                    arm_command=result.arm_command,
+                )
+            if result.status is StageStatus.SUCCEEDED:
+                return StageResult.succeeded(
+                    "task 2 both open arms reached the shelf-box pregrasp pose "
+                    "after the safe straight approach",
+                    arm_command=result.arm_command,
+                )
+            return StageResult.running(
+                f"task 2 fine-aligning arms around the shelf box; {result.message}",
+                arm_command=result.arm_command,
+            )
+
+        return StageResult.blocked(
+            f"task 2 invalid shelf-pick alignment phase {self._phase!r}",
+            arm_command=self._held_arm_command,
         )
 
     def _capture_held_center(self, context: ExecutionContext) -> None:

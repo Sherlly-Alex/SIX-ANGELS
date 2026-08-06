@@ -32,9 +32,12 @@ Implemented flow:
    transport posture, and returns to the end zone.
 6. The formal `CompetitionController` waits for Server referee progression.
 7. Task 2 verifies that its instruction color matches the stored shelf result,
-   fuses live lateral detection with the calibrated layer center, performs a
-   shelf grasp and bounded 0.08 m lift, transports the box to the stored task-1
-   origin, releases it, and returns to the end zone.
+   navigates to a farther arm-staging stand, opens and lowers both arms while
+   still outside the shelf, then advances straight to the calibrated pick
+   stand before the final pregrasp. It fuses live lateral detection with the
+   calibrated layer center, performs a shelf grasp and bounded 0.08 m lift,
+   transports the box to the stored task-1 origin, releases it, and returns to
+   the end zone.
 
 Task 3 remains fail-closed.
 

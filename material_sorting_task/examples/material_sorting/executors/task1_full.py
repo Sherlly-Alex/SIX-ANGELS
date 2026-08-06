@@ -38,7 +38,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     # packaging box was only visible for one frame; the farther pose gives the
     # head camera a wider view before the separate final placement approach.
     SHELF_SCAN_CENTER_CLEARANCE_M = 0.75
-    SHELF_TURN_X = -0.95
+    # Keep the carried box out of the shelf's swept volume while the base
+    # changes from the table heading to the shelf-facing heading.  The old
+    # point was close enough that, for some table slots, the held box swept
+    # through the shelf opening during the final turn.
+    SHELF_TURN_X = -0.55
     SHELF_OBSERVE_Y = 0.85
     SHELF_YAW = math.pi
     SHELF_CLEARANCE_M = 0.055
