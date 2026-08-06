@@ -50,13 +50,16 @@ def context(
     pose,
     *,
     with_target: bool = True,
+    target_position=(-0.18, 2.20, 0.834),
+    target_orientation=None,
 ) -> ExecutionContext:
     observations = {}
     if with_target:
         observations["brown"] = TargetObservation(
             color="brown",
-            position_world=(-0.18, 2.20, 0.834),
+            position_world=target_position,
             received_at_s=now_s,
+            orientation=target_orientation,
         )
     return ExecutionContext(
         now_s=now_s,
@@ -112,6 +115,43 @@ class Task1NavigationExecutorTests(unittest.TestCase):
         self.assertEqual(blocked.status, StageStatus.BLOCKED)
         self.assertFalse(blocked.controls_base)
         self.assertIn("arm/perception handoff is not implemented", blocked.message)
+
+    def test_snaps_biased_yaw90_detection_to_safe_right_source_slot(self) -> None:
+        executor = Task1NavigationExecutor()
+        executor._navigation = FakeNavigationController()
+        initial = context(
+            0.0,
+            odometry(-0.70, 0.55, math.pi / 2.0),
+            target_position=(-0.223, 2.321, 0.834),
+            target_orientation="yaw90",
+        )
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
+
+        result = executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._locked_target_world, (-0.18, 2.20, 0.834))
+        self.assertEqual(executor._locked_target_orientation, "yaw0")
+        self.assertAlmostEqual(executor.goal.x, -0.18)
+        self.assertAlmostEqual(executor.goal.y, 1.55)
+
+    def test_rejects_detection_outside_both_table_source_slots(self) -> None:
+        executor = Task1NavigationExecutor()
+        executor._navigation = FakeNavigationController()
+        initial = context(
+            0.0,
+            odometry(-0.70, 0.55, math.pi / 2.0),
+            target_position=(-0.54, 2.30, 0.834),
+            target_orientation="yaw90",
+        )
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
+
+        result = executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertFalse(result.controls_base)
+        self.assertIsNone(executor.goal)
+        self.assertIn("outside both calibrated", result.message)
 
 
 if __name__ == "__main__":

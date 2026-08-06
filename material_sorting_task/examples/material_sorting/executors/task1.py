@@ -48,6 +48,15 @@ class Task1NavigationExecutor:
     # clearance even when randomization places the target deeper on the table.
     # This also matches KnownSceneProvider's calibrated table approach distance.
     TABLE_STANDOFF_M = 0.65
+    # Server randomization changes which colored box occupies the table-side
+    # source and whether it is in the left or right slot; the slot centers and
+    # yaw remain fixed by the competition layout.  RGB-D occasionally fits the
+    # neighbouring white cube's/top face depth and shifts a valid observation
+    # by one box half-extent.  Use perception to select a slot, then plan from
+    # its calibrated center instead of sending that depth bias to the arms.
+    TABLE_SOURCE_SLOTS_M = ((-1.00, 2.20), (-0.18, 2.20))
+    TABLE_SOURCE_SNAP_MAX_M = 0.18
+    TABLE_SOURCE_ORIENTATION = "yaw0"
     POSITION_TOLERANCE_M = 0.08
     YAW_TOLERANCE_RAD = 0.05
     TARGET_MAX_AGE_S = 1.5
@@ -140,11 +149,30 @@ class Task1NavigationExecutor:
                     target_color,
                     detail=f"latest observation is {age_s:.2f}s old",
                 )
-            target_x, target_y, _target_z = observation.position_world
             if not all(math.isfinite(v) for v in observation.position_world):
                 return StageResult.blocked(
                     f"task 1 target observation for {target_color!r} is non-finite"
                 )
+            calibrated_target = self._calibrated_table_source(
+                observation.position_world
+            )
+            if calibrated_target is None:
+                nearest_error_m = min(
+                    math.hypot(
+                        float(observation.position_world[0]) - slot_x,
+                        float(observation.position_world[1]) - slot_y,
+                    )
+                    for slot_x, slot_y in self.TABLE_SOURCE_SLOTS_M
+                )
+                return self._wait_for_target(
+                    context,
+                    target_color,
+                    detail=(
+                        "stable observation is outside both calibrated "
+                        f"table-source slots (nearest_error={nearest_error_m:.3f}m)"
+                    ),
+                )
+            target_x, target_y, _target_z = calibrated_target
 
             self._goal = NavigationGoal(
                 x=float(target_x),
@@ -154,12 +182,10 @@ class Task1NavigationExecutor:
                 yaw_tolerance=self.YAW_TOLERANCE_RAD,
                 safety_radius=self.TABLE_STANDOFF_M,
                 segment=NavigationSegment.NAV_TABLE,
-                source_tag="perception_derived",
+                source_tag="perception_slot_calibrated",
             )
-            self._locked_target_world = tuple(
-                float(value) for value in observation.position_world
-            )
-            self._locked_target_orientation = observation.orientation
+            self._locked_target_world = calibrated_target
+            self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
             if not self._navigation.set_goal(self._goal, robot_x, robot_y):
                 return StageResult.blocked(
                     "task 1 could not plan a collision-free path to "
@@ -218,6 +244,25 @@ class Task1NavigationExecutor:
             dt = now - self._last_tick_s
         self._last_tick_s = now
         return min(0.20, max(0.01, dt))
+
+    @classmethod
+    def _calibrated_table_source(
+        cls,
+        observation_world: tuple[float, float, float],
+    ) -> tuple[float, float, float] | None:
+        """Snap one plausible RGB-D observation to the nearest legal source slot."""
+
+        observed_x, observed_y, observed_z = (
+            float(value) for value in observation_world
+        )
+        slot_x, slot_y = min(
+            cls.TABLE_SOURCE_SLOTS_M,
+            key=lambda slot: math.hypot(observed_x - slot[0], observed_y - slot[1]),
+        )
+        error_m = math.hypot(observed_x - slot_x, observed_y - slot_y)
+        if error_m > cls.TABLE_SOURCE_SNAP_MAX_M:
+            return None
+        return float(slot_x), float(slot_y), observed_z
 
     @staticmethod
     def _odometry_pose(odometry) -> tuple[float, float, float] | None:
