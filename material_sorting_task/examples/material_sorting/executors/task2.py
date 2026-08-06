@@ -25,8 +25,13 @@ from executors.transfer_support import (
     world_to_base,
 )
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
-from shelf.manipulation import ReleaseSpreadController, SlideHoldController
+from shelf.manipulation import (
+    ReleaseSpreadController,
+    ShelfOpenPregraspController,
+    SlideHoldController,
+)
 from shelf.task_memory import CompetitionTaskMemory
+from shelf.target_center import StableTargetCenterTracker
 
 
 class Task2Executor(PlaceholderTaskExecutor):
@@ -46,7 +51,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # motion at the old x=-1.88 made the elbows/grippers sweep through the
     # shelf obstacle while descending.
     SHELF_PICK_APPROACH_X = -1.50
-    SHELF_PICK_X = -1.88
+    # The final stand is derived from the detected object centre.  At the
+    # shelf-facing yaw, keeping the object 0.75 m forward of the base matches
+    # the verified dual-arm reach without reading a Server object coordinate.
+    PICK_TARGET_BASE_X = 0.75
     # ``OpenPregraspController`` places the TCP about 0.08 m in front of its
     # requested center for the west-facing shelf pose.  This synthetic center
     # therefore leaves the TCP about 0.22 m east of the shelf front while the
@@ -54,9 +62,13 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     SHELF_FRONT_X = -2.465
     SHELF_ARM_STAGE_TARGET_X = SHELF_FRONT_X + 0.135
     SHELF_ARM_APPROACH_TIMEOUT_S = 25.0
+    SHELF_CENTER_CAMERA_SETTLE_S = 0.80
+    SHELF_CENTER_ACQUIRE_TIMEOUT_S = 15.0
+    SHELF_FINAL_LATERAL_TOLERANCE_M = 0.05
+    SHELF_PREGRASP_HALF_WIDTH_M = 0.18
     # ALIGN_FOR_PICK now contains two arm moves plus the short base advance;
     # give both the staging and final pregrasp enough time in one stage.
-    PREGRASP_TIMEOUT_S = 55.0
+    PREGRASP_TIMEOUT_S = 75.0
     SHELF_YAW = math.pi
     TABLE_YAW = math.pi / 2.0
     # The held shelf box is still roughly 0.75 m in front of the base.  A
@@ -71,31 +83,44 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         # Eight centimetres clears the source board while keeping the box
         # below the next shelf board (vertical free space is about 0.139 m).
-        super().__init__(lift_controller=SlideLiftController(lift_height=0.08))
+        super().__init__(
+            pregrasp_controller=ShelfOpenPregraspController(
+                half_width=self.SHELF_PREGRASP_HALF_WIDTH_M
+            ),
+            lift_controller=SlideLiftController(lift_height=0.08),
+        )
         self._memory = memory
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
         self._release = ReleaseSpreadController()
+        self._target_center_tracker = StableTargetCenterTracker()
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
+        self._coarse_target_world: tuple[float, float, float] | None = None
         self._staged_target_world: tuple[float, float, float] | None = None
+        self._pick_stand_world: tuple[float, float] | None = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start: float | None = None
         self._slide_applied = False
+        self._phase_started_s = 0.0
 
     def reset(self) -> None:
         super().reset()
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._target_center_tracker.reset()
         self._held_center_base = None
         self._place_world = None
+        self._coarse_target_world = None
         self._staged_target_world = None
+        self._pick_stand_world = None
         self._phase = "idle"
         self._motion_started = False
         self._slide_start = None
         self._slide_applied = False
+        self._phase_started_s = 0.0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -104,6 +129,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         if stage is TaskStage.NAVIGATE_TO_PICK:
             self._transfer.reset()
+            self._target_center_tracker.reset()
+            self._coarse_target_world = None
+            self._pick_stand_world = None
             self._phase = "navigate_shelf_pick"
         elif stage is TaskStage.ALIGN_FOR_PICK:
             # The inherited pregrasp controller is first used for a safe
@@ -113,7 +141,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._pregrasp.reset()
             self._transfer.reset()
             self._staged_target_world = None
+            self._pick_stand_world = None
             self._phase = "stage_arms"
+            self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
             self._transfer.reset()
@@ -221,8 +251,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             context.odometry, context.now_s
         )
         if status is NavigationStatus.GOAL_REACHED:
-            self._locked_target_world = center
-            self._locked_target_orientation = self.SOURCE_ORIENTATION
+            self._coarse_target_world = center
             return StageResult.succeeded(
                 f"task 2 reached the far shelf arm-staging stand for {target_color}"
             )
@@ -238,28 +267,26 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             target_color, center = self._task2_target(context)
         except RuntimeError as exc:
             return StageResult.blocked(str(exc))
-        observation = context.target_observations.get(target_color)
-        if observation is not None:
-            age = max(0.0, float(context.now_s) - observation.received_at_s)
-            x, y, _z = observation.position_world
-            if age <= 2.0 and -2.92 <= x <= -2.38 and 0.36 <= y <= 1.20:
-                # RGB-D commonly reports the visible shelf-box front surface.
-                # Keep calibrated shelf X/Z and use live YOLO only for lateral
-                # alignment, matching the teammate's useful geometry fusion.
-                center = (center[0], max(0.58, min(0.98, float(y))), center[2])
+        # This is deliberately only a coarse layer/ROI target.  The camera is
+        # still looking from the far navigation pose, where the shelf box can
+        # lie at the image boundary.  The complete detected object centre is
+        # locked later, after the safe arm staging pose has aimed the head at
+        # the shelf layer and the camera has settled.
+        self._coarse_target_world = center
         self._locked_target_world = center
         self._locked_target_orientation = self.SOURCE_ORIENTATION
         return StageResult.succeeded(
-            "task 2 fused live shelf detection with the stable layer geometry at "
-            f"{tuple(round(value, 3) for value in center)}"
+            f"task 2 validated the {target_color} shelf layer; coarse target="
+            f"{tuple(round(value, 3) for value in center)}; full RGB-D object "
+            "centre will be locked after camera staging"
         )
 
     def _tick_align_for_pick(self, context: ExecutionContext) -> StageResult:
         """Open/lower outside the shelf, then advance the base to the box."""
 
-        if self._locked_target_world is None:
+        if self._locked_target_world is None or self._coarse_target_world is None:
             return StageResult.blocked(
-                "task 2 shelf alignment has no locked target",
+                "task 2 shelf alignment has no coarse target",
                 arm_command=self._held_arm_command,
             )
 
@@ -289,12 +316,19 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
             if result.status is StageStatus.SUCCEEDED:
                 self._pregrasp.reset()
-                self._phase = "approach_pick"
+                self._phase = "acquire_center"
                 self._motion_started = False
                 self._transfer.reset()
+                self._phase_started_s = float(context.now_s)
+                self._target_center_tracker.reset(
+                    accept_after_s=(
+                        float(context.now_s) + self.SHELF_CENTER_CAMERA_SETTLE_S
+                    )
+                )
                 return StageResult.running(
-                    "task 2 arms reached the shelf-front staging pose; "
-                    "advancing the base straight toward the shelf box",
+                    "task 2 arms reached the shelf-front staging pose; holding "
+                    "the base while the camera settles before multi-frame "
+                    "object-centre locking",
                     arm_command=self._held_arm_command,
                 )
             return StageResult.running(
@@ -302,33 +336,158 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 arm_command=result.arm_command,
             )
 
+        if self._phase == "acquire_center":
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            estimate = self._target_center_tracker.update(
+                context.target_observations.get(target_color),
+                now_s=context.now_s,
+                reference_layer_z=self._coarse_target_world[2],
+            )
+            if estimate is None:
+                elapsed = max(
+                    0.0, float(context.now_s) - self._phase_started_s
+                )
+                if elapsed >= self.SHELF_CENTER_ACQUIRE_TIMEOUT_S:
+                    return StageResult.blocked(
+                        "task 2 could not lock a stable RGB-D shelf-box centre "
+                        f"after {elapsed:.1f}s; "
+                        f"{self._target_center_tracker.status()}",
+                        arm_command=self._held_arm_command,
+                    )
+                return StageResult.running(
+                    "task 2 holding outside the shelf and collecting fresh "
+                    "target-centre frames; "
+                    f"{self._target_center_tracker.status()}",
+                    arm_command=self._held_arm_command,
+                )
+
+            self._locked_target_world = estimate.center_world
+            # The competition shelf slot has a fixed box orientation.  The
+            # RGB-D cuboid orientation can flip under arm occlusion, so it is
+            # not allowed to change the symmetric contact width here.
+            self._locked_target_orientation = self.SOURCE_ORIENTATION
+            self._phase = "align_pick_lateral"
+            self._phase_started_s = float(context.now_s)
+            self._motion_started = False
+            self._transfer.reset()
+            deviation = tuple(
+                round(value, 3) for value in estimate.max_axis_deviation
+            )
+            return StageResult.running(
+                "task 2 locked the detected shelf-box geometric centre at "
+                f"{tuple(round(value, 3) for value in estimate.center_world)} "
+                f"from {estimate.sample_count} inliers; max_dev={deviation}; "
+                "preparing safe lateral base alignment",
+                arm_command=self._held_arm_command,
+            )
+
+        if self._phase == "align_pick_lateral":
+            pose = odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "task 2 waiting for odometry before target-centre alignment",
+                    arm_command=self._held_arm_command,
+                )
+            if not self._motion_started:
+                if not self._transfer.begin_lateral_alignment(
+                    (pose[0], self._locked_target_world[1]),
+                    self.SHELF_YAW,
+                    context.odometry,
+                    context.now_s,
+                ):
+                    return StageResult.blocked(
+                        "task 2 could not start shelf-box lateral alignment",
+                        arm_command=self._held_arm_command,
+                    )
+                self._motion_started = True
+            status, command, detail = self._transfer.tick_lateral_alignment(
+                context.odometry, context.now_s
+            )
+            if status is NavigationStatus.GOAL_REACHED:
+                self._phase = "approach_pick"
+                self._phase_started_s = float(context.now_s)
+                self._motion_started = False
+                self._transfer.reset()
+            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                return StageResult.blocked(
+                    f"task 2 target-centre lateral alignment stopped: {detail}",
+                    arm_command=self._held_arm_command,
+                )
+            else:
+                return StageResult.running(
+                    f"task 2 aligning the base with the detected object centre; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+
         if self._phase == "approach_pick":
             if not self._motion_started:
-                distance = max(
-                    0.0, self.SHELF_PICK_APPROACH_X - self.SHELF_PICK_X
-                )
-                if not self._transfer.begin_advance(context.odometry, distance):
+                pose = odometry_pose(context.odometry)
+                if pose is None:
                     return StageResult.running(
                         "task 2 waiting for odometry before the straight shelf approach",
                         arm_command=self._held_arm_command,
                     )
-                self._motion_started = True
-            done, command, detail = self._transfer.tick_advance(context.odometry)
-            if not done:
-                elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-                if elapsed >= self.SHELF_ARM_APPROACH_TIMEOUT_S:
+                target_base = world_to_base(self._locked_target_world, pose)
+                lateral_error = target_base[1]
+                if abs(lateral_error) > self.SHELF_FINAL_LATERAL_TOLERANCE_M:
                     return StageResult.blocked(
-                        "task 2 straight shelf approach timed out: " + detail,
+                        "task 2 refused shelf approach because the detected "
+                        f"object is still {lateral_error:+.3f} m off centre",
                         arm_command=self._held_arm_command,
                     )
-                return StageResult.running(
-                    f"task 2 advancing with arms held outside the shelf; {detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
-            self._phase = "final_pregrasp"
-            self._motion_started = False
-            self._pregrasp.reset()
+                distance = target_base[0] - self.PICK_TARGET_BASE_X
+                if distance < -0.03:
+                    return StageResult.blocked(
+                        "task 2 overshot the detected shelf-box stand by "
+                        f"{-distance:.3f} m",
+                        arm_command=self._held_arm_command,
+                    )
+                if distance <= 0.015:
+                    self._phase = "final_pregrasp"
+                    self._motion_started = False
+                    self._pregrasp.reset()
+                    # The inherited controller measures its timeout from the
+                    # beginning of ALIGN_FOR_PICK.  Camera settling and base
+                    # alignment are separate bounded phases, so give the
+                    # final object-centred IK move its own timeout window.
+                    self._stage_started_s = float(context.now_s)
+                elif not self._transfer.begin_advance(
+                    context.odometry, distance
+                ):
+                    return StageResult.running(
+                        "task 2 waiting to start the detected-centre shelf approach",
+                        arm_command=self._held_arm_command,
+                    )
+                else:
+                    self._pick_stand_world = (
+                        self._locked_target_world[0] + self.PICK_TARGET_BASE_X,
+                        self._locked_target_world[1],
+                    )
+                    self._motion_started = True
+            if self._phase == "approach_pick":
+                done, command, detail = self._transfer.tick_advance(context.odometry)
+                if not done:
+                    elapsed = max(
+                        0.0, float(context.now_s) - self._phase_started_s
+                    )
+                    if elapsed >= self.SHELF_ARM_APPROACH_TIMEOUT_S:
+                        return StageResult.blocked(
+                            "task 2 straight shelf approach timed out: " + detail,
+                            arm_command=self._held_arm_command,
+                        )
+                    return StageResult.running(
+                        "task 2 advancing straight toward the locked object "
+                        f"centre; {detail}",
+                        base_command=command,
+                        arm_command=self._held_arm_command,
+                    )
+                self._phase = "final_pregrasp"
+                self._motion_started = False
+                self._pregrasp.reset()
+                self._stage_started_s = float(context.now_s)
 
         if self._phase == "final_pregrasp":
             result = super().tick(TaskStage.ALIGN_FOR_PICK, context)

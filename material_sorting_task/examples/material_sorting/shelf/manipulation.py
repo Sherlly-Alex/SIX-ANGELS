@@ -18,12 +18,37 @@ from desktop_grasp.pregrasp_core import (
     LIFT_ARM_POSITION_TOL,
     LIFT_SLIDE_COMMAND_RATIO,
     OpenPregraspController,
+    PREGRASP_BACKOFF_X,
     PregraspInputError,
     PregraspPlanningError,
     SPINE_MAX,
     SPINE_MIN,
     _joint_maps,
 )
+
+
+class ShelfOpenPregraspController(OpenPregraspController):
+    """Open around a shelf box without the desktop controller's wide sweep."""
+
+    def __init__(self, *, half_width: float = 0.18, kdl=None) -> None:
+        super().__init__(kdl=kdl)
+        self.half_width = float(half_width)
+        if not math.isfinite(self.half_width) or self.half_width <= 0.0:
+            raise ValueError("shelf pregrasp half_width must be finite and positive")
+
+    def plan(
+        self,
+        target_world: tuple[float, float, float],
+        odometry: Any,
+        joint_states: Any,
+    ) -> ArmCommand:
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=PREGRASP_BACKOFF_X,
+            half_width=self.half_width,
+        )
 
 
 class ReleaseSpreadController(OpenPregraspController):
@@ -331,4 +356,9 @@ class SlideHoldController:
         )
 
 
-__all__ = ["ArmRetractController", "ReleaseSpreadController", "SlideHoldController"]
+__all__ = [
+    "ArmRetractController",
+    "ReleaseSpreadController",
+    "ShelfOpenPregraspController",
+    "SlideHoldController",
+]

@@ -70,6 +70,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._motion_started = False
         self._slide_start: float | None = None
         self._slide_applied = False
+        # PLACE contains two independent arm motions (lower, then release).
+        # Keep a phase-local deadline so a slow lowering motion cannot consume
+        # the whole release timeout before the grippers even start to open.
+        self._phase_started_s = 0.0
 
     def reset(self) -> None:
         super().reset()
@@ -87,6 +91,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._motion_started = False
         self._slide_start = None
         self._slide_applied = False
+        self._phase_started_s = 0.0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -108,6 +113,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             self._slide_hold.reset()
             self._release.reset()
             self._phase = "lower"
+            self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.VERIFY_PLACE:
             self._phase = "verify"
         elif stage is TaskStage.RETURN_TO_END:
@@ -498,6 +504,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             if result is not None:
                 return result
             self._phase = "release"
+            # Start a fresh deadline for the release motion.  The lowering
+            # controller has its own bounded timer and may legitimately take
+            # most of the placement stage budget in simulation.
+            self._phase_started_s = float(context.now_s)
 
         if self._phase == "release":
             if not self._release.planned:
@@ -528,7 +538,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     "task 1 opened both arms and released the box on the empty shelf layer",
                     arm_command=command,
                 )
-            if float(context.now_s) - self._stage_started_s >= self.PLACE_TIMEOUT_S:
+            if float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
                 return StageResult.blocked(
                     f"task 1 shelf release timed out: {detail}",
                     arm_command=command,
@@ -664,7 +674,15 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
         self._held_arm_command = command
         if not reached:
-            elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+            # PLACE's lowering phase has a local deadline.  ALIGN_FOR_PLACE
+            # keeps its stage-wide timeout because it is a single continuous
+            # scan/approach operation.
+            started_s = (
+                self._phase_started_s
+                if self.active_stage is TaskStage.PLACE
+                else self._stage_started_s
+            )
+            elapsed = max(0.0, float(context.now_s) - started_s)
             timeout = 60.0 if self.active_stage is TaskStage.ALIGN_FOR_PLACE else self.PLACE_TIMEOUT_S
             if elapsed >= timeout:
                 return StageResult.blocked(

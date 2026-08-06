@@ -162,11 +162,12 @@ bash scripts/run_client.sh
 
 建议第一次先固定 Server seed，并准备随时 `Ctrl+C`。任务 1 会依次执行桌面抓取、直线
 后撤、货架语义识别、空层放置和返回结束区；裁判推进后，任务 2 才会从已识别层抓取
-彩色方块并放回任务 1 保存的桌面原坐标。详细接口、目录和停机条件见
+彩色方块并放回任务 1 保存的桌面原坐标。任务 2 的缓存货架状态只用于粗导航和层位；
+抓取前会在货架外采集多帧 RGB-D 目标物体中心、横向对中，再直线靠近，不读取 Server
+真实物体坐标。详细接口、目录和停机条件见
 [`docs/SHELF_TASK12_INTEGRATION.md`](docs/SHELF_TASK12_INTEGRATION.md)。
 
-该模式仍会响应 `/material/unsafe_collision` 并立即停止推进。它只用于验证“夹住并抬起”，
-不执行底盘搬运或货架放置。
+该模式仍会响应 `/material/unsafe_collision` 并立即停止推进。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 

@@ -5,8 +5,9 @@ import unittest
 from types import SimpleNamespace
 
 from control_types import ArmCommand
+from desktop_grasp.pregrasp_core import SPINE_MIN
 from executors import build_task_executors
-from executors.base import TargetObservation
+from executors.base import ExecutionContext, StageStatus, TargetObservation, TaskStage
 from executors.task1_full import (
     Task1IntegratedExecutor,
     shelf_observation_stand,
@@ -15,8 +16,10 @@ from executors.task1_full import (
 from executors.task2 import Task2IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
 from navigation.navigation_types import NavigationStatus
-from shelf.manipulation import ArmRetractController
+from shelf.manipulation import ArmRetractController, ShelfOpenPregraspController
 from shelf.state_tracker import ShelfStateTracker
+from shelf.target_center import StableTargetCenterTracker
+from shelf.task_memory import CompetitionTaskMemory
 
 
 def observation(label: str, xyz, stamp: float, score: float = 0.9) -> TargetObservation:
@@ -74,12 +77,77 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class StableTargetCenterTrackerTests(unittest.TestCase):
+    def test_locks_full_object_center_and_rejects_one_spatial_outlier(self) -> None:
+        tracker = StableTargetCenterTracker()
+        tracker.reset(accept_after_s=10.5)
+        samples = [
+            # This pre-settle frame must not enter the fresh observation set.
+            (10.4, (-2.74, 0.90, 0.84)),
+            (10.6, (-2.671, 0.814, 0.842)),
+            (10.8, (-2.669, 0.816, 0.844)),
+            (11.0, (-2.672, 0.815, 0.843)),
+            # A colour/depth edge fit in the same broad shelf ROI.
+            (11.2, (-2.742, 0.875, 0.842)),
+            (11.4, (-2.670, 0.813, 0.841)),
+            (11.6, (-2.673, 0.817, 0.845)),
+            (11.8, (-2.668, 0.815, 0.843)),
+        ]
+        result = None
+        for stamp, center in samples:
+            result = tracker.update(
+                observation("brown", center, stamp),
+                now_s=stamp,
+                reference_layer_z=0.837,
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.sample_count, 6)
+        self.assertAlmostEqual(result.center_world[0], -2.6705, places=3)
+        self.assertAlmostEqual(result.center_world[1], 0.815, places=3)
+        self.assertAlmostEqual(result.center_world[2], 0.843, places=3)
+        self.assertLess(result.max_axis_deviation[1], 0.003)
+
+    def test_ignores_stale_fast_duplicate_and_wrong_layer_frames(self) -> None:
+        tracker = StableTargetCenterTracker()
+        tracker.reset(accept_after_s=20.0)
+
+        tracker.update(
+            observation("yellow", (-2.67, 0.81, 0.84), 19.9),
+            now_s=20.0,
+            reference_layer_z=0.84,
+        )
+        tracker.update(
+            observation("yellow", (-2.67, 0.81, 0.84), 20.0),
+            now_s=21.0,
+            reference_layer_z=0.84,
+        )
+        tracker.update(
+            observation("yellow", (-2.67, 0.81, 0.84), 20.1),
+            now_s=20.1,
+            reference_layer_z=0.84,
+        )
+        tracker.update(
+            observation("yellow", (-2.67, 0.81, 1.16), 20.3),
+            now_s=20.3,
+            reference_layer_z=0.84,
+        )
+
+        self.assertEqual(tracker.sample_count, 1)
+
+
 class IntegratedExecutorWiringTests(unittest.TestCase):
     def test_task12_mode_uses_one_shared_memory_instance(self) -> None:
         executors = build_task_executors("task12_full")
         self.assertIsInstance(executors[1], Task1IntegratedExecutor)
         self.assertIsInstance(executors[2], Task2IntegratedExecutor)
         self.assertIs(executors[1]._memory, executors[2]._memory)
+
+    def test_task2_uses_narrow_shelf_pregrasp_controller(self) -> None:
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+        self.assertIsInstance(executor._pregrasp, ShelfOpenPregraspController)
+        self.assertAlmostEqual(executor._pregrasp.half_width, 0.18, places=6)
 
     def test_place_stand_preserves_held_object_transform(self) -> None:
         stand = stand_from_held_center(
@@ -204,6 +272,64 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertFalse(reached)
         _command, reached, _detail = controller.update(1.30, neutral)
         self.assertTrue(reached)
+
+    def test_task2_raises_to_physical_top_before_table_navigation(self) -> None:
+        class RecordingSlideHold:
+            def __init__(self) -> None:
+                self.target_slide = None
+                self.command = None
+
+            @property
+            def planned(self) -> bool:
+                return self.target_slide is not None
+
+            def plan(self, hold_command, target_slide, _joint_states):
+                self.target_slide = float(target_slide)
+                self.command = hold_command
+                return hold_command
+
+            def update(self, _now_s, _joint_states):
+                return self.command, False, "waiting for physical top"
+
+        memory = CompetitionTaskMemory(
+            task1_origin_world=(-0.20, 2.30, 0.84),
+            task1_color="brown",
+        )
+        executor = Task2IntegratedExecutor(memory)
+        hold = ArmCommand(
+            spine_position=0.714,
+            head_positions=(0.0, 0.45),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=1.0,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=1.0,
+        )
+        context = ExecutionContext(
+            now_s=10.0,
+            instruction={},
+            task_index=2,
+            attempt=1,
+            odometry=_odom(-2.10, 0.85, math.pi),
+            joint_states=_arm_joint_state(
+                slide=hold.spine_position,
+                head=hold.head_positions,
+                left=hold.left_arm_positions,
+                right=hold.right_arm_positions,
+            ),
+        )
+        executor.enter_stage(TaskStage.TRANSPORT, context)
+        executor._phase = "lift_for_table_transport"
+        executor._held_arm_command = hold
+        executor._held_center_base = (0.82, 0.0, 0.58)
+        recording_slide = RecordingSlideHold()
+        executor._slide_hold = recording_slide
+
+        result = executor.tick(TaskStage.TRANSPORT, context)
+
+        self.assertEqual(recording_slide.target_slide, SPINE_MIN)
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertFalse(result.controls_base)
+        self.assertIn("maximum transport height", result.message)
 
 
 def _odom(x: float, y: float, yaw: float):

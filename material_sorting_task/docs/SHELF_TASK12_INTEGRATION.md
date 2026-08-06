@@ -31,14 +31,19 @@ Implemented flow:
    board height, spreads both arms, retreats, retracts to the neutral
    transport posture, and returns to the end zone.
 6. The formal `CompetitionController` waits for Server referee progression.
-7. Task 2 verifies that its instruction color matches the stored shelf result,
-   navigates to a farther arm-staging stand, opens and lowers both arms while
-   still outside the shelf, then advances straight to the calibrated pick
-   stand before the final pregrasp. It fuses live lateral detection with the
-   calibrated layer center, performs a shelf grasp and bounded 0.08 m lift,
-   retreats the held shelf box farther clear of the shelf, raises the spine to
-   the maximum transport height while stationary, then transports it to the
-   stored task-1 origin, releases it, and returns to the end zone.
+7. Task 2 verifies that its instruction color matches the stored shelf result
+   and uses that result only for rough navigation and layer selection. At the
+   farther arm-staging stand it opens/lowers both arms, waits for the camera to
+   settle, and locks the target box's complete 3-D geometric center from fresh
+   time-separated RGB-D detections. A component-median/inlier gate rejects edge
+   and arm-occlusion frames. While still outside the shelf, the base first
+   aligns laterally with that detected object center and then advances straight
+   until the detected center reaches the verified 0.75 m base-frame reach.
+   Shelf pregrasp uses a narrower symmetric 0.18 m half-width; contact width is
+   still derived from the box orientation. It then performs the shelf grasp and
+   bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
+   raises the spine to the maximum transport height while stationary, transports
+   it to the stored task-1 origin, releases it, and returns to the end zone.
 
 Task 3 remains fail-closed.
 
@@ -59,6 +64,7 @@ Important files:
 - `examples/material_sorting/executors/task2.py`
 - `examples/material_sorting/executors/transfer_support.py`
 - `examples/material_sorting/shelf/state_tracker.py`
+- `examples/material_sorting/shelf/target_center.py`
 - `examples/material_sorting/shelf/task_memory.py`
 - `examples/material_sorting/shelf/manipulation.py`
 
@@ -71,6 +77,8 @@ conditions occurs:
 - A navigation plan fails or enters emergency stop.
 - Shelf color and task-2 instruction disagree.
 - The shelf scan cannot obtain stable votes for two distinct occupied layers.
+- Fresh task-2 RGB-D frames cannot produce a stable target-object center, or
+  the detected center is still laterally misaligned before shelf entry.
 - IK, joint feedback, slide convergence, or release convergence fails.
 - Required task-1 origin/shelf memory is missing.
 
@@ -80,7 +88,9 @@ No 30-second forced state advance and no client-side scoring are used.
 
 Local static compilation and unit tests cover interface wiring, shared memory,
 carried-color filtering, multi-frame layer voting, fail-closed ambiguous-layer
-handling, and held-object placement geometry. Physical clearances, camera view,
-IK convergence and referee timing must still be validated in the official
-4090 Server/Client images, first with a fixed seed and then across randomized
-seeds.
+handling, robust task-2 object-center locking with outlier rejection, the
+shelf-specific pregrasp width, and held-object placement geometry. Runtime
+manipulation uses no Server/referee object coordinate; Server truth remains
+diagnostic/scoring-only. Physical clearances, camera view, IK convergence and
+referee timing must still be validated in the official 4090 Server/Client
+images, first with a fixed seed and then across randomized seeds.
