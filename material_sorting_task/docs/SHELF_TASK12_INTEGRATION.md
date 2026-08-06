@@ -15,10 +15,10 @@ Implemented flow:
 2. It records the calibrated task-1 source coordinate in shared process memory.
 3. It retreats straight, turns west at a safe point east of the shelf, and
    then approaches the scan stand in a straight line. The scan stand is derived
-   from the measured held-object transform and remains near the safe turn point,
-   where the carried center is about 0.45 m in front of the shelf and the
-   packaging box remains visible. Final placement uses a separate closer
-   straight approach after semantic fusion.
+   from the measured held-object transform and remains well outside the shelf,
+   with the carried center about 0.75 m in front of the shelf so the lower
+   packaging box has room to remain visible. Final placement uses a separate
+   closer straight approach after semantic fusion.
 4. A result is accepted only when one colored shelf box and the white packaging
    obstacle vote for two distinct layers in L1-L3. The carried task-1 color is
    ignored. The remaining unique layer is the task-1 placement target.
