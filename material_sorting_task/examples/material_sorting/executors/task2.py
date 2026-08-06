@@ -7,6 +7,7 @@ import math
 from desktop_grasp.pregrasp_core import (
     PregraspInputError,
     PregraspPlanningError,
+    SPINE_MAX,
     SlideLiftController,
 )
 from executors.base import (
@@ -125,6 +126,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._phase = "verify"
         elif stage is TaskStage.TRANSPORT:
             self._transfer.reset()
+            self._slide_hold.reset()
             self._phase = "retreat_shelf"
         elif stage is TaskStage.RETURN_TO_END:
             self._transfer.reset()
@@ -381,6 +383,34 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
+            # The box is now clear of the shelf in XY, but the arms are still
+            # at the low shelf-pick height.  Raise the spine fully while the
+            # base remains stationary before planning the table-bound turn.
+            self._phase = "lift_for_table_transport"
+            self._motion_started = False
+            self._transfer.reset()
+
+        if self._phase == "lift_for_table_transport":
+            if not self._slide_hold.planned:
+                try:
+                    self._slide_start = self._held_arm_command.spine_position
+                    self._held_arm_command = self._slide_hold.plan(
+                        self._held_arm_command,
+                        SPINE_MAX,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"task 2 could not plan maximum transport lift: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+            result = self._tick_slide(
+                context,
+                "raising the held box to maximum transport height",
+                slide_raises_center=True,
+            )
+            if result is not None:
+                return result
             self._phase = "navigate_table_mid"
             self._motion_started = False
             self._transfer.reset()
@@ -638,6 +668,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self,
         context: ExecutionContext,
         action: str,
+        *,
+        slide_raises_center: bool = False,
     ) -> StageResult | None:
         try:
             command, reached, detail = self._slide_hold.update(
@@ -666,7 +698,14 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     "task 2 lost the slide/held-center transform during placement",
                     arm_command=command,
                 )
-            dz = self._slide_start - command.spine_position
+            # When lowering onto a support, a lower spine moves the held
+            # center down by ``start-current``.  During transport the spine
+            # is raised instead, so the held center follows ``current-start``.
+            dz = (
+                command.spine_position - self._slide_start
+                if slide_raises_center
+                else self._slide_start - command.spine_position
+            )
             self._held_center_base = (
                 self._held_center_base[0],
                 self._held_center_base[1],
