@@ -79,10 +79,14 @@ class FakeContactController:
         self.plan_target = None
         self.plan_orientation = None
         self.update_count = 0
+        self.updates_since_plan = 0
+        self.tighten_offsets = []
 
     def reset(self) -> None:
         self.planned = False
         self.update_count = 0
+        self.updates_since_plan = 0
+        self.tighten_offsets = []
 
     def plan(self, target_world, orientation, odometry, joint_states):
         self.plan_target = target_world
@@ -92,7 +96,14 @@ class FakeContactController:
 
     def update(self, now_s, joint_states):
         self.update_count += 1
-        return ARM_COMMAND, self.update_count >= 2, "fake contact feedback"
+        self.updates_since_plan += 1
+        return ARM_COMMAND, self.updates_since_plan >= 2, "fake contact feedback"
+
+    def tighten(self, target_world, inward_offset, odometry, joint_states):
+        self.tighten_offsets.append(inward_offset)
+        self.half_width = 0.118 - inward_offset
+        self.updates_since_plan = 0
+        return ARM_COMMAND
 
 
 class FakeKdl:
@@ -380,6 +391,45 @@ class Task1ContactExecutorTests(unittest.TestCase):
 
         self.assertEqual(resumed.status, StageStatus.RUNNING)
         self.assertGreater(contact_controller.update_count, updates_at_contact)
+
+    def test_settled_pose_searches_inward_in_bounded_millimeter_steps(self) -> None:
+        executor, contact_controller, at_goal = self._reach_contact_stage()
+
+        executor.tick(TaskStage.GRASP, at_goal)
+        search = executor.tick(
+            TaskStage.GRASP,
+            context(0.60, odometry(-0.18, 1.64, math.pi / 2.0)),
+        )
+
+        self.assertEqual(search.status, StageStatus.RUNNING)
+        self.assertEqual(contact_controller.tighten_offsets, [0.001])
+        self.assertIn("1/4 mm", search.message)
+
+        # Each tightened pose must settle again before the next millimeter;
+        # the total search is capped at the desktop-grasp module's 4 mm bound.
+        now_s = 1.20
+        for expected_mm in (2, 3, 4):
+            executor.tick(
+                TaskStage.GRASP,
+                context(now_s, odometry(-0.18, 1.64, math.pi / 2.0)),
+            )
+            now_s += 0.10
+            result = executor.tick(
+                TaskStage.GRASP,
+                context(now_s, odometry(-0.18, 1.64, math.pi / 2.0)),
+            )
+            self.assertAlmostEqual(
+                contact_controller.tighten_offsets[-1],
+                expected_mm / 1000.0,
+            )
+            now_s += 0.60
+
+        self.assertEqual(len(contact_controller.tighten_offsets), 4)
+        executor.tick(
+            TaskStage.GRASP,
+            context(now_s, odometry(-0.18, 1.64, math.pi / 2.0)),
+        )
+        self.assertEqual(len(contact_controller.tighten_offsets), 4)
 
     def test_unsafe_structure_collision_holds_contact_command(self) -> None:
         executor, _contact_controller, at_goal = self._reach_contact_stage()

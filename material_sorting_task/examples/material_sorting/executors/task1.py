@@ -397,6 +397,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     SOURCE_ORIENTATION = "yaw0"
     CONTACT_CONFIRM_TIME_S = 0.30
     CONTACT_TIMEOUT_S = 15.0
+    CONTACT_SEARCH_STEP_M = 0.001
+    CONTACT_SEARCH_MAX_M = 0.004
+    CONTACT_SEARCH_INTERVAL_S = 0.30
 
     def __init__(
         self,
@@ -406,17 +409,23 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         super().__init__(pregrasp_controller=pregrasp_controller)
         self._contact = contact_controller or ContactGraspController()
         self._contact_since_s: float | None = None
+        self._contact_search_used_m = 0.0
+        self._contact_search_next_s = 0.0
 
     def reset(self) -> None:
         super().reset()
         self._contact.reset()
         self._contact_since_s = None
+        self._contact_search_used_m = 0.0
+        self._contact_search_next_s = 0.0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
         if stage is TaskStage.GRASP:
             self._contact.reset()
             self._contact_since_s = None
+            self._contact_search_used_m = 0.0
+            self._contact_search_next_s = float(context.now_s)
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is TaskStage.GRASP:
@@ -451,6 +460,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         super().cancel(reason)
         self._contact.reset()
         self._contact_since_s = None
+        self._contact_search_used_m = 0.0
+        self._contact_search_next_s = 0.0
 
     def _tick_contact(self, context: ExecutionContext) -> StageResult:
         if self._locked_target_world is None:
@@ -519,6 +530,44 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             )
         self._held_arm_command = command
 
+        if (
+            pose_settled
+            and now_s >= self._contact_search_next_s
+            and self._contact_search_used_m
+            < self.CONTACT_SEARCH_MAX_M - 1e-9
+        ):
+            next_offset = min(
+                self.CONTACT_SEARCH_MAX_M,
+                self._contact_search_used_m + self.CONTACT_SEARCH_STEP_M,
+            )
+            try:
+                command = self._contact.tighten(
+                    self._locked_target_world,
+                    next_offset,
+                    context.odometry,
+                    context.joint_states,
+                )
+            except PregraspInputError as exc:
+                return self._wait_for_contact_inputs(context, str(exc))
+            except PregraspPlanningError as exc:
+                return StageResult.blocked(
+                    f"task 1 bounded contact-search planning failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+            self._contact_search_used_m = next_offset
+            self._contact_search_next_s = (
+                now_s + self.CONTACT_SEARCH_INTERVAL_S
+            )
+            self._held_arm_command = command
+            return StageResult.running(
+                "task 1 contact pose settled without bilateral feedback; "
+                "applying bounded inward search step "
+                f"{self._contact_search_used_m * 1000.0:.0f}/"
+                f"{self.CONTACT_SEARCH_MAX_M * 1000.0:.0f} mm; "
+                f"half_width={self._contact.half_width:.3f}",
+                arm_command=command,
+            )
+
         elapsed_s = max(0.0, now_s - self._stage_started_s)
         if elapsed_s >= self.CONTACT_TIMEOUT_S:
             return StageResult.blocked(
@@ -531,6 +580,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             "task 1 moving both open grippers inward; "
             f"calibrated_orientation={self.SOURCE_ORIENTATION}, "
             f"half_width={self._contact.half_width:.3f}; "
+            f"contact_search={self._contact_search_used_m * 1000.0:.0f}/"
+            f"{self.CONTACT_SEARCH_MAX_M * 1000.0:.0f}mm; "
             f"{settled_text}grasp_confirmed=false; {detail}",
             arm_command=command,
         )

@@ -118,7 +118,8 @@ Server 的 `/material/unsafe_collision` 会让执行器立即停止推进并保�
 `contact_only` 继续调用桌面抓取模块的标定逆解：完成开放预抓取后，按照任务 1
 货源槽位的固定 `yaw0` 方向让两个张开的夹爪缓慢向内移动。Server 的
 `/material/grasp_confirmed` 必须连续为真 0.30 秒；首次检测到双侧接触时会立即冻结
-当前命令，确认后保持接触姿态，并在柔顺挤压和抬升前阻塞。
+当前命令。如果标定接触位尚未得到双侧反馈，则复用桌面抓取模块的 1 mm 步进、最大
+4 mm 有限向内搜索；确认后保持接触姿态，并在确认后的柔顺挤压和抬升前阻塞。
 
 ```bash
 MATERIAL_EXECUTION_MODE=contact_only \

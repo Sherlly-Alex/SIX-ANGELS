@@ -30,6 +30,8 @@ Server referee before retrying or advancing a scored task. The explicit
 pregrasp pose using the same long-lived Client and keeps the last commanded pose
 across the deliberate block. `contact_only` reuses the desktop-grasp calibrated
 contact IK and freezes on stable bilateral `/material/grasp_confirmed` feedback.
+If the nominal contact pose does not yet produce bilateral feedback, it reuses
+the standalone grasp's 1 mm steps with a hard 4 mm inward-search bound.
 The task 1/3 standalone desktop grasp executor still has no grasp result
 action/status. Compliant squeeze, Server-confirmed lift, transport, placement,
 task 2 shelf grasp, recovery, and post-grasp controller handoff still need to be

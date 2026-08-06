@@ -442,6 +442,34 @@ class ContactGraspController(OpenPregraspController):
             half_width=self._half_width,
         )
 
+    def tighten(
+        self,
+        target_world: tuple[float, float, float],
+        inward_offset: float,
+        odometry: Any,
+        joint_states: Any,
+    ) -> ArmCommand:
+        """Replan a bounded inward contact-search step from measured joints."""
+
+        if self._orientation is None:
+            raise PregraspPlanningError("contact tighten requested before initial plan")
+        offset = float(inward_offset)
+        if not math.isfinite(offset) or offset < 0.0:
+            raise PregraspInputError("inward_offset must be finite and non-negative")
+        robot_pose = _odometry_pose(odometry)
+        nominal_half_width = _oriented_grasp_half_width(
+            self._orientation,
+            robot_pose[2],
+        )
+        self._half_width = max(nominal_half_width - offset, 0.01)
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=GRASP_BACKOFF_X,
+            half_width=self._half_width,
+        )
+
 
 __all__ = [
     "ContactGraspController",
