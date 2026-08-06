@@ -24,6 +24,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$TASK_DIR"
+
+# Fail before starting the high-rate perception process when a remote upload
+# mixed incompatible Client files from different revisions.
+echo "checking Client module consistency..."
+python3 -c \
+  'from client_task import CompetitionClient; from executors.base import TargetObservation'
+
 python3 perception/box_detect.py \
   --backend "$BACKEND" \
   --checkpoint "$CHECKPOINT" \

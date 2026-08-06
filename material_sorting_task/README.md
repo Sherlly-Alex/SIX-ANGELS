@@ -6,14 +6,18 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 ## 当前状态
 
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
-目前是安全骨架：能够接收并校验三项结构化指令、监听裁判状态和保持底盘停止，但抓取与
-放置状态机仍需继续实现。
+已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
+和得分真值。任务 1 已提供显式 `nav_only` 实动模式，可从视觉世界坐标导航到随机桌边
+目标并在机械臂动作前停车；任务 1 后续动作及任务 2/3 正式执行器仍安全阻塞，不会把空
+动作误判为成功。
 
 ## 目录
 
 ```text
 examples/material_sorting/
   client_task.py                 正式 Client 入口
+  competition_controller.py      三任务连续调度与裁判同步
+  executors/                     任务 1/2/3 执行器接口和安全占位实现
   instruction_parser.py          结构化指令解析与校验
   task_orchestration.py          三任务编排辅助函数
   navigation/                    底盘导航模块
@@ -60,6 +64,37 @@ MATERIAL_DETECT_BACKEND=color bash scripts/run_client.sh
 ROS_DOMAIN_ID=99
 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ```
+
+### 调度链路测试
+
+默认 `MATERIAL_EXECUTION_MODE=stub`，正式 Client 会在第一个尚未实现的动作阶段安全
+阻塞。只验证状态机和三任务顺序时，可以显式启用不控制机器人的 dry-run：
+
+```bash
+MATERIAL_EXECUTION_MODE=dry_run \
+MATERIAL_DRY_RUN_TICKS_PER_STAGE=2 \
+bash scripts/run_client.sh
+```
+
+dry-run 只验证任务 1 -> 任务 2 -> 任务 3 的内部调度、日志和进程生命周期，不产生机器人
+动作，也不会得到 Server 评分。正式模式的任务切换必须等待 `/referee/taskinfo`、
+`/referee/gameinfo` 和 `/referee/score`。
+
+### 任务 1 底盘实动测试
+
+`nav_only` 会读取 `/material/detections` 中任务 1 目标颜色的稳定世界坐标，使用静态场景
+A*、限速和急停检查导航到桌边抓取站位。到位后会停车，并在尚未接入的机械臂阶段安全
+阻塞：
+
+```bash
+MATERIAL_EXECUTION_MODE=nav_only \
+MATERIAL_DETECT_BACKEND=yolo \
+bash scripts/run_client.sh
+```
+
+该模式会真实发布 `/cmd_vel`。测试前必须确认只有一个 Client 在运行，并使用新启动的
+Server；速度在执行器和 ROS 发布入口处被双重限制为不超过 0.20/0.22 m/s 和
+0.65/0.70 rad/s。此模式不会完成或结算任务，测试后需重启 Server 恢复初始场景。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 

@@ -11,8 +11,15 @@ TASK = ROOT / "examples" / "material_sorting"
 
 REQUIRED = (
     TASK / "client_task.py",
+    TASK / "competition_controller.py",
     TASK / "instruction_parser.py",
     TASK / "task_orchestration.py",
+    TASK / "executors" / "__init__.py",
+    TASK / "executors" / "base.py",
+    TASK / "executors" / "dry_run.py",
+    TASK / "executors" / "task1.py",
+    TASK / "executors" / "task2.py",
+    TASK / "executors" / "task3.py",
     TASK / "material_competition_layout.json",
     TASK / "mjcf" / "material_competition.xml",
     TASK / "navigation" / "navigation_controller.py",

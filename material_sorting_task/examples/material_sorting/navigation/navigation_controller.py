@@ -198,16 +198,35 @@ class NavigationController:
                 return VelocityCommand(0.0, 0.0)
 
         # --- advance waypoint ---
-        if self._waypoint_idx < len(self._path):
-            wx, wy = self._path[self._waypoint_idx]
-            if math.hypot(robot_x - wx, robot_y - wy) < self._pos_tol:
+        # A differential-drive robot cuts A* grid-cell corners and may never
+        # pass within the final-position tolerance of an intermediate cell.
+        # Select the nearest waypoint ahead of the current index and keep the
+        # index monotonic so the lookahead cannot pull the robot backwards.
+        if self._path:
+            start_idx = min(self._waypoint_idx, len(self._path) - 1)
+            nearest_idx = min(
+                range(start_idx, len(self._path)),
+                key=lambda index: math.hypot(
+                    robot_x - self._path[index][0],
+                    robot_y - self._path[index][1],
+                ),
+            )
+            self._waypoint_idx = max(self._waypoint_idx, nearest_idx)
+            waypoint_tolerance = max(
+                self._pos_tol,
+                1.5 * self._grid.resolution,
+            )
+            while self._waypoint_idx + 1 < len(self._path):
+                wx, wy = self._path[self._waypoint_idx]
+                if math.hypot(robot_x - wx, robot_y - wy) > waypoint_tolerance:
+                    break
                 self._waypoint_idx += 1
 
         # --- local goal ---
         lg_x, lg_y, _lg_yaw = select_local_goal(
             robot_x, robot_y, self._path,
             lookahead_distance=self._lookahead,
-            closest_index=max(0, self._waypoint_idx - 1),
+            closest_index=self._waypoint_idx,
         )
 
         # --- velocity command ---

@@ -90,6 +90,7 @@ class BoxDetectNode(Node):
         self.slide = 0.0
         self.head = [0.0, 0.0]
         self.last_shelf_obstacle_t = 0.0
+        self.last_detection_log_t = 0.0
 
         self.backend_name = backend
         if backend == "gt":
@@ -469,6 +470,7 @@ class BoxDetectNode(Node):
                 "orientation": r.get("orientation")}
                for r in best_by_class.values()]
 
+        should_log_detections = now_t - self.last_detection_log_t >= 1.0
         for r in best_by_class.values():
             if self.pub_res_img:
                 u, v, w, h = r["bbox"]
@@ -481,9 +483,14 @@ class BoxDetectNode(Node):
                             f"PUB {r['class']} {r['method']} n={r['n_points']} ({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f})",
                             (max(0, u - 100), max(18, v - h // 2 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-            self.get_logger().info(
-                f"[publish] {r['class']} {r['method']} n={r['n_points']} score={r['score']:.1f} "
-                f"pixel=({r['center_u']},{r['center_v']}) center_world={np.round(r['world'],3)}")
+            if should_log_detections:
+                self.get_logger().info(
+                    f"[publish] {r['class']} {r['method']} n={r['n_points']} "
+                    f"score={r['score']:.1f} pixel=({r['center_u']},"
+                    f"{r['center_v']}) center_world={np.round(r['world'],3)}"
+                )
+        if should_log_detections:
+            self.last_detection_log_t = now_t
 
         self.publish_detections(out, msg.header.stamp)
         if self.pub_res_img:
@@ -570,6 +577,11 @@ def main():
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception:
+        # ROS Humble may surface a publisher-context exception when Ctrl+C
+        # invalidates the context during an active image callback.
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():
@@ -578,7 +590,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
