@@ -1,8 +1,9 @@
-"""ROS-free dual-arm open-pregrasp planning and feedback control.
+"""ROS-free dual-arm pregrasp and bounded contact planning/control.
 
-This module extracts the calibrated, non-contact first phase from
-``manual_dual_arm_pregrasp.py``.  It deliberately stops with both grippers open
-and never performs the inward grasp, squeeze, or lift motions.
+This module extracts the calibrated first phases from
+``manual_dual_arm_pregrasp.py``.  ``OpenPregraspController`` stops outside the
+box; ``ContactGraspController`` moves inward to the calibrated bilateral
+contact pose.  Neither controller performs compliant squeeze or lift motions.
 """
 
 from __future__ import annotations
@@ -21,12 +22,19 @@ PREGRASP_BACKOFF_X = 0.08
 SIDE_CLEARANCE = 0.145
 HAND_Z_OFFSET = 0.02
 GRIPPER_OPEN = 1.0
+GRASP_BACKOFF_X = -0.02
+GRASP_INITIAL_PRELOAD = 0.002
+BOX_HALF_EXTENTS_BY_ORIENTATION = {
+    "yaw0": np.array([0.12, 0.08], dtype=float),
+    "yaw90": np.array([0.08, 0.12], dtype=float),
+}
 SPINE_REFERENCE_Z = 1.32163718
 SPINE_MIN = -0.04
 SPINE_MAX = 0.87
 HEAD_TARGET = (0.0, 0.45)
 
 FEEDBACK_POS_TOL = 0.03
+GRASP_CONTACT_POS_TOL = 0.14
 FEEDBACK_VEL_TOL = 0.01
 FEEDBACK_STABLE_TIME = 0.50
 COMMAND_RATE_PER_S = 1.20
@@ -140,8 +148,26 @@ def _world_to_base(
     )
 
 
+def _oriented_grasp_half_width(orientation: str, robot_yaw: float) -> float:
+    """Project a calibrated world-aligned box onto the robot lateral axis."""
+
+    if orientation not in BOX_HALF_EXTENTS_BY_ORIENTATION:
+        raise PregraspInputError(
+            f"unsupported box orientation {orientation!r}; expected yaw0 or yaw90"
+        )
+    half_extents = BOX_HALF_EXTENTS_BY_ORIENTATION[orientation]
+    base_y_world = np.array(
+        [-math.sin(float(robot_yaw)), math.cos(float(robot_yaw))],
+        dtype=float,
+    )
+    lateral_half_extent = float(np.dot(np.abs(base_y_world), half_extents))
+    return max(lateral_half_extent - GRASP_INITIAL_PRELOAD, 0.01)
+
+
 class OpenPregraspController:
     """Plan and ramp one open dual-arm pose using measured joint feedback."""
+
+    ARM_POSITION_TOL = FEEDBACK_POS_TOL
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
         self._kdl = kdl or MMK2Kdl()
@@ -172,24 +198,45 @@ class OpenPregraspController:
         odometry: Any,
         joint_states: Any,
     ) -> ArmCommand:
+        pregrasp_half_width = BOX_WIDTH_Y * 0.5 + SIDE_CLEARANCE
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=PREGRASP_BACKOFF_X,
+            half_width=pregrasp_half_width,
+        )
+
+    def _plan_pose(
+        self,
+        target_world: tuple[float, float, float],
+        odometry: Any,
+        joint_states: Any,
+        *,
+        center_backoff_x: float,
+        half_width: float,
+    ) -> ArmCommand:
         if not all(math.isfinite(float(value)) for value in target_world):
             raise PregraspInputError("target_world contains non-finite values")
+        if not math.isfinite(float(center_backoff_x)):
+            raise PregraspInputError("center_backoff_x is non-finite")
+        if not math.isfinite(float(half_width)) or float(half_width) <= 0.0:
+            raise PregraspInputError("half_width must be finite and positive")
         positions, _velocities = _joint_maps(joint_states)
         robot_pose = _odometry_pose(odometry)
         box_center_base = _world_to_base(target_world, robot_pose)
         self._target_base = tuple(float(value) for value in box_center_base)
 
-        pregrasp_half_width = BOX_WIDTH_Y * 0.5 + SIDE_CLEARANCE
         arm_center_base = box_center_base + np.array(
-            [-PREGRASP_BACKOFF_X, 0.0, HAND_Z_OFFSET],
+            [-float(center_backoff_x), 0.0, HAND_Z_OFFSET],
             dtype=float,
         )
         left_target = arm_center_base + np.array(
-            [0.0, pregrasp_half_width, 0.0],
+            [0.0, float(half_width), 0.0],
             dtype=float,
         )
         right_target = arm_center_base + np.array(
-            [0.0, -pregrasp_half_width, 0.0],
+            [0.0, -float(half_width), 0.0],
             dtype=float,
         )
         slide_target = float(
@@ -216,13 +263,13 @@ class OpenPregraspController:
         )
         if solutions is None or len(solutions) == 0:
             raise PregraspPlanningError(
-                "open-pregrasp IK failed for target_base="
+                "dual-arm IK failed for target_base="
                 f"{np.round(box_center_base, 3).tolist()}"
             )
         joints = np.asarray(solutions[0], dtype=float)
         if joints.shape != (13,) or not np.all(np.isfinite(joints)):
             raise PregraspPlanningError(
-                f"open-pregrasp IK returned invalid shape/value: {joints.shape}"
+                f"dual-arm IK returned invalid shape/value: {joints.shape}"
             )
 
         self._target_vector = np.array(
@@ -316,8 +363,8 @@ class OpenPregraspController:
         max_velocity = float(np.max(np.abs(measured_velocity)))
         stable_now = (
             slide_error <= FEEDBACK_POS_TOL
-            and left_error <= FEEDBACK_POS_TOL
-            and right_error <= FEEDBACK_POS_TOL
+            and left_error <= self.ARM_POSITION_TOL
+            and right_error <= self.ARM_POSITION_TOL
             and command_error <= FEEDBACK_POS_TOL
             and max_velocity <= FEEDBACK_VEL_TOL
         )
@@ -330,6 +377,7 @@ class OpenPregraspController:
             self._stable_since_s = None
         detail = (
             f"target_base={tuple(round(value, 3) for value in self._target_base)}; "
+            f"arm_tol={self.ARM_POSITION_TOL:.3f}, "
             f"slide_err={slide_error:.3f}, left_err={left_error:.3f}, "
             f"right_err={right_error:.3f}, cmd_err={command_error:.3f}, "
             f"max_vel={max_velocity:.3f}"
@@ -350,7 +398,53 @@ class OpenPregraspController:
         )
 
 
+class ContactGraspController(OpenPregraspController):
+    """Move both open grippers inward to the calibrated task contact pose."""
+
+    ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
+
+    def __init__(self, kdl: MMK2Kdl | None = None) -> None:
+        super().__init__(kdl=kdl)
+        self._half_width: float | None = None
+        self._orientation: str | None = None
+
+    @property
+    def half_width(self) -> float | None:
+        return self._half_width
+
+    @property
+    def orientation(self) -> str | None:
+        return self._orientation
+
+    def reset(self) -> None:
+        super().reset()
+        self._half_width = None
+        self._orientation = None
+
+    def plan(
+        self,
+        target_world: tuple[float, float, float],
+        orientation: str,
+        odometry: Any,
+        joint_states: Any,
+    ) -> ArmCommand:
+        robot_pose = _odometry_pose(odometry)
+        self._orientation = str(orientation)
+        self._half_width = _oriented_grasp_half_width(
+            self._orientation,
+            robot_pose[2],
+        )
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=GRASP_BACKOFF_X,
+            half_width=self._half_width,
+        )
+
+
 __all__ = [
+    "ContactGraspController",
     "OpenPregraspController",
     "PregraspInputError",
     "PregraspPlanningError",

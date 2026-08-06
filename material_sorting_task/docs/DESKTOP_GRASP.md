@@ -79,6 +79,11 @@ For formal-Client, non-contact integration testing, use
 That mode keeps all base and arm publisher ownership inside `client_task.py`
 and stops before the inward grasp.
 
+For the next bounded integration step, use
+`MATERIAL_EXECUTION_MODE=contact_only`. It calls the extracted calibrated
+desktop-grasp IK from the same formal Client, freezes when the Server reports
+stable bilateral target contact, and stops before compliant squeeze or lift.
+
 For separate terminals, launch the same components manually:
 
 ```bash

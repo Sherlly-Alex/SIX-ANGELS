@@ -78,6 +78,7 @@ class CompetitionClient(Node):
         self.grasp_confirmed = False
         self.unsafe_collision = False
         self._last_wait_log_ns = 0
+        self._last_progress_log_ns = 0
         self._last_controller_serial = -1
 
         self.execution_mode = (
@@ -175,6 +176,12 @@ class CompetitionClient(Node):
             self.get_logger().warning(
                 "pregrasp_only enables task-1 base navigation and real dual-arm "
                 "open pregrasp, then holds and blocks before inward grasp contact"
+            )
+        elif self.execution_mode == "contact_only":
+            self.get_logger().warning(
+                "contact_only enables task-1 navigation, open pregrasp and "
+                "bilateral target contact, then holds and blocks before "
+                "squeeze or lift"
             )
         else:
             self.get_logger().info(
@@ -382,7 +389,11 @@ class CompetitionClient(Node):
             missing.append("odometry")
         if not self.joints_received:
             missing.append("joint_states")
-        if self.execution_mode in {"nav_only", "pregrasp_only"} and self.instructions:
+        if self.execution_mode in {
+            "nav_only",
+            "pregrasp_only",
+            "contact_only",
+        } and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()
             )
@@ -460,6 +471,17 @@ class CompetitionClient(Node):
             else:
                 self.get_logger().info(line)
             self._last_controller_serial = snapshot.transition_serial
+            self._last_progress_log_ns = int(now_s * 1e9)
+        elif (
+            snapshot.state is ControllerState.EXECUTING_STAGE
+            and (snapshot.controls_base or snapshot.controls_arm)
+            and int(now_s * 1e9) - self._last_progress_log_ns >= 2_000_000_000
+        ):
+            stage = snapshot.stage.value if snapshot.stage is not None else "-"
+            self.get_logger().info(
+                f"progress task={snapshot.task_id} stage={stage}: {snapshot.message}"
+            )
+            self._last_progress_log_ns = int(now_s * 1e9)
 
         if snapshot.state is ControllerState.FINISHED:
             self.phase = ClientPhase.FINISHED

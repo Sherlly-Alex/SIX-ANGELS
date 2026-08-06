@@ -7,10 +7,10 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
-和得分真值。任务 1 已提供显式 `nav_only` 底盘实动模式，以及 `pregrasp_only` 开放
-预抓取模式：后者会从视觉世界坐标导航到随机桌边目标，让两只张开的机械臂运动到目标
-两侧并保持，然后在产生夹持接触前安全阻塞。真正夹持、抬升、搬运和放置以及任务 2/3
-正式执行器仍未开放，不会把空动作误判为成功。
+和得分真值。任务 1 已提供显式 `nav_only` 底盘实动、`pregrasp_only` 开放预抓取以及
+`contact_only` 双侧接触模式：最后一种会从视觉世界坐标导航到随机桌边目标，调用桌面
+抓取标定逆解，在 Server 确认双臂同时接触目标后保持。柔顺挤压、抬升、搬运和放置以及
+任务 2/3 正式执行器仍未开放，不会把空动作误判为成功。
 
 ## 目录
 
@@ -112,6 +112,23 @@ bash scripts/run_client.sh
 该模式会真实移动底盘、升降轴、头部和双臂，但不会执行向内合拢、柔顺挤压或抬升。
 Server 的 `/material/unsafe_collision` 会让执行器立即停止推进并保持最后的机械臂命令。
 测试期间不得同时运行 `run_desktop_grasp.sh` 或其他机械臂控制节点。
+
+### 任务 1 双侧接触测试
+
+`contact_only` 继续调用桌面抓取模块的标定逆解：完成开放预抓取后，按照任务 1
+货源槽位的固定 `yaw0` 方向让两个张开的夹爪缓慢向内移动。Server 的
+`/material/grasp_confirmed` 必须连续为真 0.30 秒；首次检测到双侧接触时会立即冻结
+当前命令，确认后保持接触姿态，并在柔顺挤压和抬升前阻塞。
+
+```bash
+MATERIAL_EXECUTION_MODE=contact_only \
+MATERIAL_DETECT_BACKEND=yolo \
+bash scripts/run_client.sh
+```
+
+该模式会真实接触目标方块，但不会挤压或抬升。检测结果摘要默认每 5 秒输出一次；
+可用 `MATERIAL_DETECTION_LOG_PERIOD=0` 完全关闭摘要，或设置其他秒数。状态转换、
+接触确认、碰撞和错误日志不受影响。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 

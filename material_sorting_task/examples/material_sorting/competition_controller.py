@@ -215,10 +215,7 @@ class CompetitionController:
                 self._arm_command = result.arm_command
             if result.status is StageStatus.RUNNING:
                 if result.message:
-                    message_changed = result.message != self._message
                     self._message = result.message
-                    if (result.controls_base or result.controls_arm) and message_changed:
-                        self._transition_serial += 1
                 return self.snapshot()
             if result.status is StageStatus.BLOCKED:
                 executor.cancel(result.message)

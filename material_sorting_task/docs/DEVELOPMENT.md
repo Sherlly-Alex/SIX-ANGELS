@@ -28,8 +28,9 @@ Server referee before retrying or advancing a scored task. The explicit
 `nav_only` connects stable world-frame detections to task 1 A* navigation.
 `pregrasp_only` additionally moves both open arms to the calibrated non-contact
 pregrasp pose using the same long-lived Client and keeps the last commanded pose
-across the deliberate block. The task 1/3 standalone desktop grasp executor
-still has no grasp result action/status. Inward grasp, Server-confirmed lift,
-transport, placement, task 2 shelf grasp, recovery, and post-grasp controller
-handoff still need to be implemented and validated in the official Client
-container.
+across the deliberate block. `contact_only` reuses the desktop-grasp calibrated
+contact IK and freezes on stable bilateral `/material/grasp_confirmed` feedback.
+The task 1/3 standalone desktop grasp executor still has no grasp result
+action/status. Compliant squeeze, Server-confirmed lift, transport, placement,
+task 2 shelf grasp, recovery, and post-grasp controller handoff still need to be
+implemented and validated in the official Client container.

@@ -18,6 +18,7 @@ from executors.base import (
     TaskStage,
 )
 from desktop_grasp.pregrasp_core import (
+    ContactGraspController,
     OpenPregraspController,
     PregraspInputError,
     PregraspPlanningError,
@@ -381,5 +382,171 @@ class Task1PregraspExecutor(Task1NavigationExecutor):
             )
         return StageResult.running(
             f"task 1 waiting for pregrasp feedback: {detail}",
+            arm_command=self._held_arm_command,
+        )
+
+
+class Task1ContactExecutor(Task1PregraspExecutor):
+    """Navigate, pregrasp, establish bilateral contact, then hold without lift."""
+
+    name = "task1_contact_only"
+
+    # Task 1 always picks from the calibrated table source slot.  This is more
+    # reliable than the bbox yaw, which becomes noisy as the arms occlude the
+    # target during approach.
+    SOURCE_ORIENTATION = "yaw0"
+    CONTACT_CONFIRM_TIME_S = 0.30
+    CONTACT_TIMEOUT_S = 15.0
+
+    def __init__(
+        self,
+        pregrasp_controller: OpenPregraspController | None = None,
+        contact_controller: ContactGraspController | None = None,
+    ) -> None:
+        super().__init__(pregrasp_controller=pregrasp_controller)
+        self._contact = contact_controller or ContactGraspController()
+        self._contact_since_s: float | None = None
+
+    def reset(self) -> None:
+        super().reset()
+        self._contact.reset()
+        self._contact_since_s = None
+
+    def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
+        super().enter_stage(stage, context)
+        if stage is TaskStage.GRASP:
+            self._contact.reset()
+            self._contact_since_s = None
+
+    def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
+        if stage is TaskStage.GRASP:
+            if stage is not self.active_stage:
+                return StageResult.blocked(
+                    f"task 1 contact stage mismatch: active={self.active_stage}",
+                    arm_command=self._held_arm_command,
+                )
+            if context.unsafe_collision:
+                return StageResult.blocked(
+                    "task 1 contact approach stopped because Server reported "
+                    "an unsafe collision",
+                    arm_command=self._held_arm_command,
+                )
+            return self._tick_contact(context)
+
+        if stage is TaskStage.LIFT:
+            if stage is not self.active_stage:
+                return StageResult.blocked(
+                    f"task 1 lift stage mismatch: active={self.active_stage}",
+                    arm_command=self._held_arm_command,
+                )
+            return StageResult.blocked(
+                "task 1 bilateral contact is confirmed and being held; "
+                "squeeze, lift and transport are disabled in contact_only mode",
+                arm_command=self._held_arm_command,
+            )
+
+        return super().tick(stage, context)
+
+    def cancel(self, reason: str) -> None:
+        super().cancel(reason)
+        self._contact.reset()
+        self._contact_since_s = None
+
+    def _tick_contact(self, context: ExecutionContext) -> StageResult:
+        if self._locked_target_world is None:
+            return StageResult.blocked(
+                "task 1 contact approach has no locked target",
+                arm_command=self._held_arm_command,
+            )
+
+        now_s = float(context.now_s)
+        # Once bilateral contact appears, freeze the last command instead of
+        # continuing toward the unconstrained IK solution.  A short stable
+        # confirmation rejects single-frame contact noise.  If contact drops,
+        # resume the bounded inward ramp from the same command.
+        if self._contact_since_s is not None:
+            if context.grasp_confirmed:
+                contact_age_s = max(0.0, now_s - self._contact_since_s)
+                if contact_age_s >= self.CONTACT_CONFIRM_TIME_S:
+                    return StageResult.succeeded(
+                        "task 1 Server confirmed stable bilateral target contact; "
+                        "holding before squeeze and lift",
+                        arm_command=self._held_arm_command,
+                    )
+                return StageResult.running(
+                    "task 1 bilateral contact detected; freezing command for "
+                    f"confirmation ({contact_age_s:.2f}/"
+                    f"{self.CONTACT_CONFIRM_TIME_S:.2f}s)",
+                    arm_command=self._held_arm_command,
+                )
+            self._contact_since_s = None
+
+        if not self._contact.planned:
+            try:
+                self._held_arm_command = self._contact.plan(
+                    self._locked_target_world,
+                    self.SOURCE_ORIENTATION,
+                    context.odometry,
+                    context.joint_states,
+                )
+            except PregraspInputError as exc:
+                return self._wait_for_contact_inputs(context, str(exc))
+            except PregraspPlanningError as exc:
+                return StageResult.blocked(
+                    f"task 1 contact-pose planning failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+
+        if context.grasp_confirmed:
+            self._contact_since_s = now_s
+            return StageResult.running(
+                "task 1 Server detected bilateral target contact; "
+                "freezing the current open-gripper command",
+                arm_command=self._held_arm_command,
+            )
+
+        try:
+            command, pose_settled, detail = self._contact.update(
+                now_s,
+                context.joint_states,
+            )
+        except PregraspInputError as exc:
+            return self._wait_for_contact_inputs(context, str(exc))
+        except PregraspPlanningError as exc:
+            return StageResult.blocked(
+                f"task 1 contact-pose control failed: {exc}",
+                arm_command=self._held_arm_command,
+            )
+        self._held_arm_command = command
+
+        elapsed_s = max(0.0, now_s - self._stage_started_s)
+        if elapsed_s >= self.CONTACT_TIMEOUT_S:
+            return StageResult.blocked(
+                "task 1 contact approach timed out without bilateral Server "
+                f"confirmation after {elapsed_s:.1f}s: {detail}",
+                arm_command=command,
+            )
+        settled_text = "contact pose settled; " if pose_settled else ""
+        return StageResult.running(
+            "task 1 moving both open grippers inward; "
+            f"calibrated_orientation={self.SOURCE_ORIENTATION}, "
+            f"half_width={self._contact.half_width:.3f}; "
+            f"{settled_text}grasp_confirmed=false; {detail}",
+            arm_command=command,
+        )
+
+    def _wait_for_contact_inputs(
+        self,
+        context: ExecutionContext,
+        detail: str,
+    ) -> StageResult:
+        elapsed_s = max(0.0, float(context.now_s) - self._stage_started_s)
+        if elapsed_s >= self.CONTACT_TIMEOUT_S:
+            return StageResult.blocked(
+                f"task 1 timed out waiting for contact feedback inputs: {detail}",
+                arm_command=self._held_arm_command,
+            )
+        return StageResult.running(
+            f"task 1 waiting for contact feedback inputs: {detail}",
             arm_command=self._held_arm_command,
         )

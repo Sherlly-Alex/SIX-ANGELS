@@ -6,7 +6,10 @@ import unittest
 
 import numpy as np
 
-from desktop_grasp.pregrasp_core import OpenPregraspController
+from desktop_grasp.pregrasp_core import (
+    ContactGraspController,
+    OpenPregraspController,
+)
 from executors.base import (
     ArmCommand,
     ExecutionContext,
@@ -14,7 +17,7 @@ from executors.base import (
     TargetObservation,
     TaskStage,
 )
-from executors.task1 import Task1PregraspExecutor
+from executors.task1 import Task1ContactExecutor, Task1PregraspExecutor
 from navigation.navigation_types import NavigationStatus, VelocityCommand
 
 
@@ -67,6 +70,29 @@ class FakePregraspController:
     def update(self, now_s, joint_states):
         self.update_count += 1
         return ARM_COMMAND, self.update_count >= 2, "fake feedback"
+
+
+class FakeContactController:
+    def __init__(self) -> None:
+        self.planned = False
+        self.half_width = 0.118
+        self.plan_target = None
+        self.plan_orientation = None
+        self.update_count = 0
+
+    def reset(self) -> None:
+        self.planned = False
+        self.update_count = 0
+
+    def plan(self, target_world, orientation, odometry, joint_states):
+        self.plan_target = target_world
+        self.plan_orientation = orientation
+        self.planned = True
+        return ARM_COMMAND
+
+    def update(self, now_s, joint_states):
+        self.update_count += 1
+        return ARM_COMMAND, self.update_count >= 2, "fake contact feedback"
 
 
 class FakeKdl:
@@ -125,7 +151,15 @@ def joint_states(*, slide: float = 0.0):
     )
 
 
-def context(now_s: float, pose, joints=None, *, unsafe_collision=False):
+def context(
+    now_s: float,
+    pose,
+    joints=None,
+    *,
+    unsafe_collision=False,
+    grasp_confirmed=False,
+    target_orientation="yaw90",
+):
     return ExecutionContext(
         now_s=now_s,
         instruction={
@@ -143,10 +177,11 @@ def context(now_s: float, pose, joints=None, *, unsafe_collision=False):
                 color="brown",
                 position_world=(-0.18, 2.20, 0.851),
                 received_at_s=now_s,
-                orientation="yaw0",
+                orientation=target_orientation,
                 score=0.9,
             )
         },
+        grasp_confirmed=grasp_confirmed,
         unsafe_collision=unsafe_collision,
     )
 
@@ -169,6 +204,22 @@ class OpenPregraspControllerTests(unittest.TestCase):
         self.assertAlmostEqual(kdl.left[1, 3], 0.225, places=6)
         self.assertAlmostEqual(kdl.right[1, 3], -0.225, places=6)
         self.assertAlmostEqual(kdl.left[2, 3], 0.854, places=6)
+
+    def test_contact_pose_uses_calibrated_task1_lateral_width(self) -> None:
+        kdl = FakeKdl()
+        controller = ContactGraspController(kdl=kdl)
+
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.64, math.pi / 2.0),
+            joint_states(),
+        )
+
+        self.assertAlmostEqual(controller.half_width, 0.118, places=6)
+        self.assertAlmostEqual(kdl.left[0, 3], 0.58, places=6)
+        self.assertAlmostEqual(kdl.left[1, 3], 0.118, places=6)
+        self.assertAlmostEqual(kdl.right[1, 3], -0.118, places=6)
 
 
 class Task1PregraspExecutorTests(unittest.TestCase):
@@ -223,6 +274,129 @@ class Task1PregraspExecutorTests(unittest.TestCase):
 
         self.assertEqual(result.status, StageStatus.BLOCKED)
         self.assertIn("unsafe collision", result.message)
+
+
+class Task1ContactExecutorTests(unittest.TestCase):
+    def _reach_contact_stage(self):
+        pregrasp = FakePregraspController()
+        contact_controller = FakeContactController()
+        executor = Task1ContactExecutor(
+            pregrasp_controller=pregrasp,
+            contact_controller=contact_controller,
+        )
+        executor._navigation = FakeNavigationController()
+        initial = context(0.0, odometry(-0.70, 0.55, math.pi / 2.0))
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
+        executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
+        at_goal = context(0.05, odometry(-0.18, 1.64, math.pi / 2.0))
+        self.assertEqual(
+            executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.ACQUIRE_TARGET, at_goal)
+        self.assertEqual(
+            executor.tick(TaskStage.ACQUIRE_TARGET, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.ALIGN_FOR_PICK, at_goal)
+        executor.tick(TaskStage.ALIGN_FOR_PICK, at_goal)
+        self.assertEqual(
+            executor.tick(TaskStage.ALIGN_FOR_PICK, at_goal).status,
+            StageStatus.SUCCEEDED,
+        )
+        executor.enter_stage(TaskStage.GRASP, at_goal)
+        return executor, contact_controller, at_goal
+
+    def test_freezes_on_stable_server_contact_and_blocks_before_lift(self) -> None:
+        executor, contact_controller, at_goal = self._reach_contact_stage()
+
+        approaching = executor.tick(TaskStage.GRASP, at_goal)
+        self.assertEqual(approaching.status, StageStatus.RUNNING)
+        self.assertEqual(contact_controller.plan_orientation, "yaw0")
+        self.assertEqual(contact_controller.plan_target[2], 0.834)
+        updates_before_contact = contact_controller.update_count
+
+        first_contact = executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.10,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                grasp_confirmed=True,
+            ),
+        )
+        self.assertEqual(first_contact.status, StageStatus.RUNNING)
+        updates_at_contact = contact_controller.update_count
+        self.assertEqual(updates_at_contact, updates_before_contact)
+
+        confirming = executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.25,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                grasp_confirmed=True,
+            ),
+        )
+        self.assertEqual(confirming.status, StageStatus.RUNNING)
+        self.assertEqual(contact_controller.update_count, updates_at_contact)
+
+        confirmed = executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.41,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                grasp_confirmed=True,
+            ),
+        )
+        self.assertEqual(confirmed.status, StageStatus.SUCCEEDED)
+        self.assertEqual(confirmed.arm_command, ARM_COMMAND)
+
+        executor.enter_stage(TaskStage.LIFT, at_goal)
+        blocked = executor.tick(TaskStage.LIFT, at_goal)
+        self.assertEqual(blocked.status, StageStatus.BLOCKED)
+        self.assertIn("lift", blocked.message)
+        self.assertEqual(blocked.arm_command, ARM_COMMAND)
+
+    def test_dropped_contact_resumes_bounded_inward_motion(self) -> None:
+        executor, contact_controller, at_goal = self._reach_contact_stage()
+        executor.tick(TaskStage.GRASP, at_goal)
+        executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.10,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                grasp_confirmed=True,
+            ),
+        )
+        updates_at_contact = contact_controller.update_count
+
+        resumed = executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.20,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                grasp_confirmed=False,
+            ),
+        )
+
+        self.assertEqual(resumed.status, StageStatus.RUNNING)
+        self.assertGreater(contact_controller.update_count, updates_at_contact)
+
+    def test_unsafe_structure_collision_holds_contact_command(self) -> None:
+        executor, _contact_controller, at_goal = self._reach_contact_stage()
+        executor.tick(TaskStage.GRASP, at_goal)
+
+        result = executor.tick(
+            TaskStage.GRASP,
+            context(
+                0.10,
+                odometry(-0.18, 1.64, math.pi / 2.0),
+                unsafe_collision=True,
+            ),
+        )
+
+        self.assertEqual(result.status, StageStatus.BLOCKED)
+        self.assertIn("unsafe collision", result.message)
+        self.assertEqual(result.arm_command, ARM_COMMAND)
 
 
 if __name__ == "__main__":

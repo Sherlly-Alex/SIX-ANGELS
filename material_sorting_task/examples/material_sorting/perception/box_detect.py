@@ -75,11 +75,13 @@ def render_fk_xml():
 class BoxDetectNode(Node):
     def __init__(self, backend="yolo", checkpoint=DEFAULT_CKPT, conf_thresh=0.65,
                  pub_res_img=True,
-                 center_compensation_scale=DEFAULT_CENTER_COMPENSATION_SCALE):
+                 center_compensation_scale=DEFAULT_CENTER_COMPENSATION_SCALE,
+                 detection_log_period=1.0):
         super().__init__("material_box_detect")
         self.bridge = CvBridge()
         self.pub_res_img = pub_res_img
         self.center_compensation_scale = max(0.0, float(center_compensation_scale))
+        self.detection_log_period = max(0.0, float(detection_log_period))
 
         self.K = None
         self._depth_msg = None
@@ -104,7 +106,8 @@ class BoxDetectNode(Node):
         self.get_logger().info(
             f"material_box_detect up; backend={backend}; checkpoint={checkpoint}; "
             f"conf={conf_thresh:.2f}; center_compensation_scale="
-            f"{self.center_compensation_scale:.2f}"
+            f"{self.center_compensation_scale:.2f}; detection_log_period="
+            f"{self.detection_log_period:.1f}s"
         )
 
         if backend != "gt_direct":
@@ -470,7 +473,10 @@ class BoxDetectNode(Node):
                 "orientation": r.get("orientation")}
                for r in best_by_class.values()]
 
-        should_log_detections = now_t - self.last_detection_log_t >= 1.0
+        should_log_detections = (
+            self.detection_log_period > 0.0
+            and now_t - self.last_detection_log_t >= self.detection_log_period
+        )
         for r in best_by_class.values():
             if self.pub_res_img:
                 u, v, w, h = r["bbox"]
@@ -563,6 +569,12 @@ def main():
                         default=DEFAULT_CENTER_COMPENSATION_SCALE,
                         help="fallback surface-to-center scale when RGB-D mask fitting fails")
     parser.add_argument("--no-result-image", action="store_true")
+    parser.add_argument(
+        "--detection-log-period",
+        type=float,
+        default=1.0,
+        help="seconds between detection summaries; 0 disables them",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -572,6 +584,7 @@ def main():
         conf_thresh=args.conf,
         pub_res_img=not args.no_result_image,
         center_compensation_scale=args.center_compensation_scale,
+        detection_log_period=args.detection_log_period,
     )
     try:
         rclpy.spin(node)
@@ -590,6 +603,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

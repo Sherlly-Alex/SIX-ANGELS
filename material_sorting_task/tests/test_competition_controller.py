@@ -65,6 +65,13 @@ def run_until(
 
 
 class CompetitionControllerTests(unittest.TestCase):
+    def test_contact_only_builds_bounded_task1_executor(self) -> None:
+        executors = build_task_executors("contact_only")
+
+        self.assertEqual(executors[1].name, "task1_contact_only")
+        self.assertEqual(executors[2].task_id, 2)
+        self.assertEqual(executors[3].task_id, 3)
+
     def test_last_arm_command_persists_through_safe_hold(self) -> None:
         command = ArmCommand(
             spine_position=0.4,
