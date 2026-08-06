@@ -14,7 +14,11 @@ from executors.transfer_support import (
     world_to_base,
 )
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
-from shelf.manipulation import ReleaseSpreadController, SlideHoldController
+from shelf.manipulation import (
+    ArmRetractController,
+    ReleaseSpreadController,
+    SlideHoldController,
+)
 from shelf.state_tracker import ShelfState, ShelfStateTracker
 from shelf.task_memory import CompetitionTaskMemory
 
@@ -43,6 +47,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     SHELF_SCAN_PITCHES = (0.00, 0.08, 0.16)
     SHELF_SCAN_PITCH_DWELL_S = 3.0
     PLACE_TIMEOUT_S = 25.0
+    ARM_RETRACT_TIMEOUT_S = 15.0
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         super().__init__()
@@ -51,6 +56,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
         self._release = ReleaseSpreadController()
+        self._arm_retract = ArmRetractController()
         self._shelf_state: ShelfState | None = None
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
@@ -68,6 +74,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._arm_retract.reset()
         self._held_center_base = None
         self._place_world = None
         self._shelf_scan_stand = None
@@ -101,6 +108,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             self._phase = "verify"
         elif stage is TaskStage.RETURN_TO_END:
             self._transfer.reset()
+            self._arm_retract.reset()
             self._phase = "retreat_shelf"
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
@@ -160,6 +168,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._arm_retract.reset()
 
     def _capture_held_center(self, context: ExecutionContext) -> None:
         if self._locked_target_world is None:
@@ -545,9 +554,54 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "navigate_end"
+            # The release IK pose is still extended into the shelf.  Retreat
+            # first, then retract the arms, and only then allow base navigation.
+            self._phase = "retract_arms"
             self._motion_started = False
             self._transfer.reset()
+
+        if self._phase == "retract_arms":
+            if self._held_arm_command is None:
+                return StageResult.blocked(
+                    "task 1 cannot retract arms without the release command"
+                )
+            if not self._arm_retract.planned:
+                try:
+                    self._held_arm_command = self._arm_retract.plan(
+                        self._held_arm_command,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"task 1 safe arm retraction planning failed: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+            try:
+                command, reached, detail = self._arm_retract.update(
+                    context.now_s,
+                    context.joint_states,
+                )
+            except (PregraspInputError, PregraspPlanningError) as exc:
+                return StageResult.blocked(
+                    f"task 1 safe arm retraction control failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+            self._held_arm_command = command
+            elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+            if reached:
+                self._phase = "navigate_end"
+                self._motion_started = False
+                self._transfer.reset()
+            elif elapsed >= self.ARM_RETRACT_TIMEOUT_S:
+                return StageResult.blocked(
+                    f"task 1 safe arm retraction timed out after {elapsed:.1f}s: {detail}",
+                    arm_command=command,
+                )
+            else:
+                return StageResult.running(
+                    f"task 1 retracting arms after shelf retreat; {detail}",
+                    arm_command=command,
+                )
 
         if self._phase == "navigate_end":
             if not self._motion_started:

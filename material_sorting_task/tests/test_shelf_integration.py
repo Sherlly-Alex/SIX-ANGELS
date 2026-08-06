@@ -4,6 +4,7 @@ import math
 import unittest
 from types import SimpleNamespace
 
+from control_types import ArmCommand
 from executors import build_task_executors
 from executors.base import TargetObservation
 from executors.task1_full import (
@@ -14,6 +15,7 @@ from executors.task1_full import (
 from executors.task2 import Task2IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
 from navigation.navigation_types import NavigationStatus
+from shelf.manipulation import ArmRetractController
 from shelf.state_tracker import ShelfStateTracker
 
 
@@ -165,6 +167,44 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(status, NavigationStatus.GOAL_REACHED)
         self.assertEqual(command, (0.0, 0.0))
 
+    def test_arm_retract_targets_neutral_posture_and_waits_for_stability(self) -> None:
+        controller = ArmRetractController()
+        hold = ArmCommand(
+            spine_position=0.14,
+            head_positions=(0.12, 0.20),
+            left_arm_positions=(0.4, 0.3, 0.2, 0.1, -0.1, -0.2),
+            left_gripper_position=1.0,
+            right_arm_positions=(-0.4, -0.3, -0.2, -0.1, 0.1, 0.2),
+            right_gripper_position=1.0,
+        )
+        feedback = _arm_joint_state(
+            slide=0.14,
+            head=(0.12, 0.20),
+            left=hold.left_arm_positions,
+            right=hold.right_arm_positions,
+        )
+        command = controller.plan(hold, feedback)
+        self.assertAlmostEqual(command.spine_position, 0.14, places=6)
+        self.assertEqual(command.left_arm_positions, hold.left_arm_positions)
+
+        command, reached, detail = controller.update(0.0, feedback)
+        self.assertFalse(reached)
+        self.assertIn("transport retract", detail)
+        self.assertLess(max(abs(value) for value in command.left_arm_positions), 0.4)
+
+        neutral = _arm_joint_state(
+            slide=0.10,
+            head=(0.12, 0.20),
+            left=(0.0,) * 6,
+            right=(0.0,) * 6,
+        )
+        _command, reached, _detail = controller.update(0.10, neutral)
+        self.assertFalse(reached)
+        _command, reached, _detail = controller.update(0.70, neutral)
+        self.assertFalse(reached)
+        _command, reached, _detail = controller.update(1.30, neutral)
+        self.assertTrue(reached)
+
 
 def _odom(x: float, y: float, yaw: float):
     half = 0.5 * yaw
@@ -180,6 +220,25 @@ def _odom(x: float, y: float, yaw: float):
                 ),
             )
         )
+    )
+
+
+def _arm_joint_state(*, slide: float, head, left, right):
+    names = [
+        "slide_joint",
+        "head_yaw_joint",
+        "head_pitch_joint",
+        *(f"left_arm_joint{index}" for index in range(1, 7)),
+        "left_arm_eef_gripper_joint",
+        *(f"right_arm_joint{index}" for index in range(1, 7)),
+        "right_arm_eef_gripper_joint",
+    ]
+    positions = [slide, *head, *left, 1.0, *right, 1.0]
+    return SimpleNamespace(
+        name=names,
+        position=positions,
+        velocity=[0.0] * len(names),
+        effort=[0.0] * len(names),
     )
 
 

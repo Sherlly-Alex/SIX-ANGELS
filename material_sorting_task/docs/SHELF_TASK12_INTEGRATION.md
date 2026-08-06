@@ -28,7 +28,8 @@ Implemented flow:
    a bounded local motion rotates toward the lateral direction, moves only
    along the shelf row, and restores the shelf-facing yaw before entering the
    recognized empty layer in a straight line. It then lowers to the official
-   board height, spreads both arms, retreats, and returns to the end zone.
+   board height, spreads both arms, retreats, retracts to the neutral
+   transport posture, and returns to the end zone.
 6. The formal `CompetitionController` waits for Server referee progression.
 7. Task 2 verifies that its instruction color matches the stored shelf result,
    fuses live lateral detection with the calibrated layer center, performs a
