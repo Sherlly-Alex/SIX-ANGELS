@@ -19,7 +19,9 @@ Implemented flow:
    with the carried center about 0.75 m in front of the shelf so the lower
    packaging box has room to remain visible. Final placement uses a separate
    closer straight approach after semantic fusion.
-4. A result is accepted only when one colored shelf box and the white packaging
+4. Shelf observations are fused from the moment the shelf enters view during
+   task-1 transport and are retained at the observation stand. A result is
+   accepted only when one colored shelf box and the white packaging
    obstacle vote for two distinct layers in L1-L3. The carried task-1 color is
    ignored. The remaining unique layer is the task-1 placement target.
 5. Placement preserves the grasp while changing the slide, completes lateral

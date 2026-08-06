@@ -15,7 +15,7 @@ from executors.transfer_support import (
 )
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from shelf.manipulation import ReleaseSpreadController, SlideHoldController
-from shelf.state_tracker import ShelfStateTracker
+from shelf.state_tracker import ShelfState, ShelfStateTracker
 from shelf.task_memory import CompetitionTaskMemory
 
 
@@ -51,6 +51,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
         self._release = ReleaseSpreadController()
+        self._shelf_state: ShelfState | None = None
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
         self._shelf_scan_stand: tuple[float, float] | None = None
@@ -63,6 +64,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     def reset(self) -> None:
         super().reset()
         self._shelf_tracker.reset()
+        self._shelf_state = None
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
@@ -82,9 +84,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         if stage is TaskStage.TRANSPORT:
             self._transfer.reset()
+            # Begin fusing shelf detections as soon as the shelf enters the
+            # camera view during transport.
+            self._shelf_tracker.reset()
+            self._shelf_state = None
             self._phase = "retreat_table"
         elif stage is TaskStage.ALIGN_FOR_PLACE:
-            self._shelf_tracker.reset()
             self._slide_hold.reset()
             self._transfer.reset()
             self._phase = "scan_shelf"
@@ -172,6 +177,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     def _tick_transport(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 1 transport has no stable held-object state")
+        # Perception runs continuously, but the shelf tracker must also be
+        # updated during transport while the shelf first comes into view.
+        self._update_shelf_state(context)
         if self._phase == "retreat_table":
             if not self._motion_started:
                 if not self._transfer.begin_retreat(context.odometry, self.TABLE_RETREAT_M):
@@ -231,7 +239,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
             else:
                 return StageResult.running(
-                    f"task 1 moving to the safe shelf turn point; {detail}",
+                    f"task 1 moving to the safe shelf turn point; {detail}; "
+                    f"{self._shelf_scan_detail()}",
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
@@ -268,11 +277,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             pitch = self.SHELF_SCAN_PITCHES[pitch_index]
             self._held_arm_command = _with_head_pitch(self._held_arm_command, pitch)
-            state = self._shelf_tracker.update(
-                context.target_observations,
-                now_s=context.now_s,
-                carried_class_id=self._memory.task1_color,
-            )
+            state = self._shelf_state or self._update_shelf_state(context)
             if state is None:
                 if scan_elapsed >= self.SHELF_SCAN_TIMEOUT_S:
                     return StageResult.blocked(
@@ -384,6 +389,25 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         return StageResult.blocked(
             f"task 1 invalid shelf-alignment phase {self._phase!r}",
             arm_command=self._held_arm_command,
+        )
+
+    def _update_shelf_state(self, context: ExecutionContext) -> ShelfState | None:
+        """Fuse shelf observations during transport and the scan stage."""
+
+        state = self._shelf_tracker.update(
+            context.target_observations,
+            now_s=context.now_s,
+            carried_class_id=self._memory.task1_color,
+        )
+        if state is not None:
+            self._shelf_state = state
+        return state
+
+    def _shelf_scan_detail(self) -> str:
+        status = "ready" if self._shelf_state is not None else "collecting"
+        return (
+            f"shelf_frames={self._shelf_tracker.frames_used}; "
+            f"shelf_state={status}"
         )
 
     def _tick_straight_advance(
