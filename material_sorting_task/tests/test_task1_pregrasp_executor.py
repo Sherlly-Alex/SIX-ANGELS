@@ -228,9 +228,18 @@ class OpenPregraspControllerTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(controller.half_width, 0.118, places=6)
+        self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.14, places=6)
         self.assertAlmostEqual(kdl.left[0, 3], 0.58, places=6)
         self.assertAlmostEqual(kdl.left[1, 3], 0.118, places=6)
         self.assertAlmostEqual(kdl.right[1, 3], -0.118, places=6)
+
+        controller.tighten(
+            (-0.18, 2.20, 0.834),
+            0.001,
+            odometry(-0.18, 1.64, math.pi / 2.0),
+            joint_states(),
+        )
+        self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
 
 
 class Task1PregraspExecutorTests(unittest.TestCase):

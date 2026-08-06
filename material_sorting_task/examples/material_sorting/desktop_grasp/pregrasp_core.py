@@ -35,6 +35,7 @@ HEAD_TARGET = (0.0, 0.45)
 
 FEEDBACK_POS_TOL = 0.03
 GRASP_CONTACT_POS_TOL = 0.14
+SQUEEZE_CONTACT_POS_TOL = 0.24
 FEEDBACK_VEL_TOL = 0.01
 FEEDBACK_STABLE_TIME = 0.50
 COMMAND_RATE_PER_S = 1.20
@@ -405,6 +406,7 @@ class ContactGraspController(OpenPregraspController):
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
         super().__init__(kdl=kdl)
+        self.ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
         self._half_width: float | None = None
         self._orientation: str | None = None
 
@@ -418,6 +420,7 @@ class ContactGraspController(OpenPregraspController):
 
     def reset(self) -> None:
         super().reset()
+        self.ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
         self._half_width = None
         self._orientation = None
 
@@ -461,6 +464,11 @@ class ContactGraspController(OpenPregraspController):
             self._orientation,
             robot_pose[2],
         )
+        # Once inward search begins, physical box contact can prevent the
+        # unconstrained IK joint target from being reached exactly.  Reuse the
+        # standalone desktop grasp's bounded-contact tolerance so all four
+        # millimeter steps remain reachable as state-machine transitions.
+        self.ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
         self._half_width = max(nominal_half_width - offset, 0.01)
         return self._plan_pose(
             target_world,
