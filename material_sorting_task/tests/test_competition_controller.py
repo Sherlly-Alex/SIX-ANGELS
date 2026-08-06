@@ -8,7 +8,7 @@ from competition_controller import (
     ExecutionContext,
 )
 from executors import build_task_executors
-from executors.base import TASK_STAGE_SEQUENCE, StageResult
+from executors.base import TASK_STAGE_SEQUENCE, ArmCommand, StageResult
 
 
 TASKS = [
@@ -65,6 +65,48 @@ def run_until(
 
 
 class CompetitionControllerTests(unittest.TestCase):
+    def test_last_arm_command_persists_through_safe_hold(self) -> None:
+        command = ArmCommand(
+            spine_position=0.4,
+            head_positions=(0.0, 0.45),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=1.0,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=1.0,
+        )
+
+        class ArmExecutor:
+            task_id = 1
+            name = "arm"
+
+            def reset(self) -> None:
+                pass
+
+            def enter_stage(self, stage, execution_context) -> None:
+                pass
+
+            def tick(self, stage, execution_context):
+                return StageResult.running(arm_command=command)
+
+            def cancel(self, reason: str) -> None:
+                pass
+
+        executors = build_task_executors("stub")
+        executors[1] = ArmExecutor()
+        controller = CompetitionController(executors, referee_driven=True)
+        controller.configure(TASKS)
+        controller.set_inputs_ready(True)
+        for _ in range(4):
+            snapshot = controller.tick(context(controller, task_ordinal=1))
+
+        self.assertTrue(snapshot.controls_arm)
+        self.assertEqual(snapshot.arm_command, command)
+        controller.stop("test safe hold")
+        held = controller.snapshot()
+        self.assertEqual(held.state, ControllerState.SAFE_HOLD)
+        self.assertTrue(held.controls_arm)
+        self.assertEqual(held.arm_command, command)
+
     def test_executor_exception_enters_safe_hold_and_clears_command(self) -> None:
         class BrokenExecutor:
             task_id = 1

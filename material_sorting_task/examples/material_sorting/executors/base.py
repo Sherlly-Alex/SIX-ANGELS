@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Protocol
 
+from control_types import ArmCommand
+
 
 class TaskStage(Enum):
     """Ordered stages shared by all three competition tasks."""
@@ -47,6 +49,8 @@ class TargetObservation:
     color: str
     position_world: tuple[float, float, float]
     received_at_s: float
+    orientation: str | None = None
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,8 @@ class ExecutionContext:
     referee_gameinfo: Mapping[str, Any] = field(default_factory=dict)
     referee_taskinfo: str = ""
     score: int = 0
+    grasp_confirmed: bool = False
+    unsafe_collision: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,6 +86,8 @@ class StageResult:
     controls_base: bool = False
     base_linear_x: float = 0.0
     base_angular_z: float = 0.0
+    controls_arm: bool = False
+    arm_command: ArmCommand | None = None
 
     @classmethod
     def running(
@@ -87,29 +95,56 @@ class StageResult:
         message: str = "",
         *,
         base_command: tuple[float, float] | None = None,
+        arm_command: ArmCommand | None = None,
     ) -> "StageResult":
-        if base_command is None:
-            return cls(StageStatus.RUNNING, message, False, 0.0, 0.0)
-        linear_x, angular_z = base_command
+        linear_x, angular_z = (0.0, 0.0) if base_command is None else base_command
         return cls(
             StageStatus.RUNNING,
             message,
-            True,
+            base_command is not None,
             float(linear_x),
             float(angular_z),
+            arm_command is not None,
+            arm_command,
         )
 
     @classmethod
-    def succeeded(cls, message: str = "") -> "StageResult":
-        return cls(StageStatus.SUCCEEDED, message, False, 0.0, 0.0)
+    def succeeded(
+        cls,
+        message: str = "",
+        *,
+        arm_command: ArmCommand | None = None,
+    ) -> "StageResult":
+        return cls(
+            StageStatus.SUCCEEDED,
+            message,
+            False,
+            0.0,
+            0.0,
+            arm_command is not None,
+            arm_command,
+        )
 
     @classmethod
     def failed(cls, message: str) -> "StageResult":
         return cls(StageStatus.FAILED, message, False, 0.0, 0.0)
 
     @classmethod
-    def blocked(cls, message: str) -> "StageResult":
-        return cls(StageStatus.BLOCKED, message, False, 0.0, 0.0)
+    def blocked(
+        cls,
+        message: str,
+        *,
+        arm_command: ArmCommand | None = None,
+    ) -> "StageResult":
+        return cls(
+            StageStatus.BLOCKED,
+            message,
+            False,
+            0.0,
+            0.0,
+            arm_command is not None,
+            arm_command,
+        )
 
 
 class TaskExecutor(Protocol):

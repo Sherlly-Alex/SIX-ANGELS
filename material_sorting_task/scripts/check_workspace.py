@@ -12,6 +12,7 @@ TASK = ROOT / "examples" / "material_sorting"
 REQUIRED = (
     TASK / "client_task.py",
     TASK / "competition_controller.py",
+    TASK / "control_types.py",
     TASK / "instruction_parser.py",
     TASK / "task_orchestration.py",
     TASK / "executors" / "__init__.py",
@@ -29,6 +30,7 @@ REQUIRED = (
     TASK / "desktop_grasp" / "manual_dual_arm_to_shelf.py",
     TASK / "desktop_grasp" / "semantic_target_locator.py",
     TASK / "desktop_grasp" / "target_metadata.py",
+    TASK / "desktop_grasp" / "pregrasp_core.py",
     ROOT / "scripts" / "run_client.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
 )

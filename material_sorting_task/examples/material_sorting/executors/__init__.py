@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from executors.base import TaskExecutor
 from executors.dry_run import DryRunTaskExecutor
-from executors.task1 import Task1Executor, Task1NavigationExecutor
+from executors.task1 import (
+    Task1Executor,
+    Task1NavigationExecutor,
+    Task1PregraspExecutor,
+)
 from executors.task2 import Task2Executor
 from executors.task3 import Task3Executor
 
-EXECUTION_MODES = ("stub", "dry_run", "nav_only")
+EXECUTION_MODES = ("stub", "dry_run", "nav_only", "pregrasp_only")
 
 
 def build_task_executors(
@@ -28,6 +32,12 @@ def build_task_executors(
     if normalized == "nav_only":
         return {
             1: Task1NavigationExecutor(),
+            2: Task2Executor(),
+            3: Task3Executor(),
+        }
+    if normalized == "pregrasp_only":
+        return {
+            1: Task1PregraspExecutor(),
             2: Task2Executor(),
             3: Task3Executor(),
         }

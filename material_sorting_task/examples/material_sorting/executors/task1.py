@@ -11,10 +11,16 @@ from __future__ import annotations
 import math
 
 from executors.base import (
+    ArmCommand,
     ExecutionContext,
     PlaceholderTaskExecutor,
     StageResult,
     TaskStage,
+)
+from desktop_grasp.pregrasp_core import (
+    OpenPregraspController,
+    PregraspInputError,
+    PregraspPlanningError,
 )
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import (
@@ -65,6 +71,8 @@ class Task1NavigationExecutor:
         self._goal: NavigationGoal | None = None
         self._stage_started_s = 0.0
         self._last_tick_s: float | None = None
+        self._locked_target_world: tuple[float, float, float] | None = None
+        self._locked_target_orientation: str | None = None
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -76,6 +84,8 @@ class Task1NavigationExecutor:
         self._goal = None
         self._stage_started_s = 0.0
         self._last_tick_s = None
+        self._locked_target_world = None
+        self._locked_target_orientation = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         self.active_stage = stage
@@ -142,6 +152,10 @@ class Task1NavigationExecutor:
                 segment=NavigationSegment.NAV_TABLE,
                 source_tag="perception_derived",
             )
+            self._locked_target_world = tuple(
+                float(value) for value in observation.position_world
+            )
+            self._locked_target_orientation = observation.orientation
             if not self._navigation.set_goal(self._goal, robot_x, robot_y):
                 return StageResult.blocked(
                     "task 1 could not plan a collision-free path to "
@@ -223,3 +237,149 @@ class Task1NavigationExecutor:
         if not all(math.isfinite(v) for v in (x, y, yaw)):
             return None
         return x, y, yaw
+
+
+class Task1PregraspExecutor(Task1NavigationExecutor):
+    """Navigate, move both open arms around the target, then hold safely."""
+
+    name = "task1_open_pregrasp_only"
+
+    TABLE_BOX_CENTER_Z_M = 0.834
+    PREGRASP_TIMEOUT_S = 25.0
+
+    def __init__(
+        self,
+        pregrasp_controller: OpenPregraspController | None = None,
+    ) -> None:
+        super().__init__()
+        self._pregrasp = pregrasp_controller or OpenPregraspController()
+        self._held_arm_command: ArmCommand | None = None
+
+    @property
+    def arm_command(self) -> ArmCommand | None:
+        return self._held_arm_command
+
+    def reset(self) -> None:
+        super().reset()
+        self._pregrasp.reset()
+        self._held_arm_command = None
+
+    def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
+        super().enter_stage(stage, context)
+        if stage is TaskStage.ALIGN_FOR_PICK:
+            self._pregrasp.reset()
+
+    def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
+        if stage is TaskStage.NAVIGATE_TO_PICK:
+            return super().tick(stage, context)
+        if stage is not self.active_stage:
+            return StageResult.blocked(
+                f"task 1 pregrasp stage mismatch: active={self.active_stage}, "
+                f"requested={stage}",
+                arm_command=self._held_arm_command,
+            )
+        if context.unsafe_collision:
+            return StageResult.blocked(
+                "task 1 pregrasp stopped because Server reported an unsafe collision",
+                arm_command=self._held_arm_command,
+            )
+
+        if stage is TaskStage.ACQUIRE_TARGET:
+            if self._locked_target_world is None:
+                return StageResult.blocked(
+                    "task 1 cannot pregrasp because navigation did not lock a target"
+                )
+            # Table-side source boxes share a calibrated center height.  Keep
+            # perception-derived X/Y and remove RGB-D top/surface Z noise.
+            self._locked_target_world = (
+                self._locked_target_world[0],
+                self._locked_target_world[1],
+                self.TABLE_BOX_CENTER_Z_M,
+            )
+            orientation = self._locked_target_orientation or "yaw0"
+            return StageResult.succeeded(
+                "task 1 target locked for open pregrasp at "
+                f"{tuple(round(value, 3) for value in self._locked_target_world)}; "
+                f"orientation={orientation}"
+            )
+
+        if stage is TaskStage.ALIGN_FOR_PICK:
+            return self._tick_open_pregrasp(context)
+
+        if stage is TaskStage.GRASP:
+            return StageResult.blocked(
+                "task 1 open pregrasp reached and is being held; "
+                "inward grasp, squeeze and lift are disabled in pregrasp_only mode",
+                arm_command=self._held_arm_command,
+            )
+
+        return StageResult.blocked(
+            "task 1 pregrasp_only does not implement " f"stage={stage.value}",
+            arm_command=self._held_arm_command,
+        )
+
+    def cancel(self, reason: str) -> None:
+        # Keep the last ArmCommand in the top-level controller.  Resetting this
+        # executor must not replace the open pregrasp with measured joints.
+        super().cancel(reason)
+        self._pregrasp.reset()
+
+    def _tick_open_pregrasp(self, context: ExecutionContext) -> StageResult:
+        if self._locked_target_world is None:
+            return StageResult.blocked("task 1 open pregrasp has no locked target")
+        if not self._pregrasp.planned:
+            try:
+                self._held_arm_command = self._pregrasp.plan(
+                    self._locked_target_world,
+                    context.odometry,
+                    context.joint_states,
+                )
+            except PregraspInputError as exc:
+                return self._wait_for_pregrasp_inputs(context, str(exc))
+            except PregraspPlanningError as exc:
+                return StageResult.blocked(f"task 1 open-pregrasp planning failed: {exc}")
+
+        try:
+            command, reached, detail = self._pregrasp.update(
+                context.now_s,
+                context.joint_states,
+            )
+        except PregraspInputError as exc:
+            return self._wait_for_pregrasp_inputs(context, str(exc))
+        except PregraspPlanningError as exc:
+            return StageResult.blocked(
+                f"task 1 open-pregrasp control failed: {exc}",
+                arm_command=self._held_arm_command,
+            )
+        self._held_arm_command = command
+        if reached:
+            return StageResult.succeeded(
+                "task 1 both open arms reached the non-contact pregrasp pose",
+                arm_command=command,
+            )
+        elapsed_s = max(0.0, float(context.now_s) - self._stage_started_s)
+        if elapsed_s >= self.PREGRASP_TIMEOUT_S:
+            return StageResult.blocked(
+                f"task 1 open pregrasp timed out after {elapsed_s:.1f}s: {detail}",
+                arm_command=command,
+            )
+        return StageResult.running(
+            f"task 1 moving both open arms to pregrasp; {detail}",
+            arm_command=command,
+        )
+
+    def _wait_for_pregrasp_inputs(
+        self,
+        context: ExecutionContext,
+        detail: str,
+    ) -> StageResult:
+        elapsed_s = max(0.0, float(context.now_s) - self._stage_started_s)
+        if elapsed_s >= self.PREGRASP_TIMEOUT_S:
+            return StageResult.blocked(
+                f"task 1 timed out waiting for pregrasp feedback: {detail}",
+                arm_command=self._held_arm_command,
+            )
+        return StageResult.running(
+            f"task 1 waiting for pregrasp feedback: {detail}",
+            arm_command=self._held_arm_command,
+        )

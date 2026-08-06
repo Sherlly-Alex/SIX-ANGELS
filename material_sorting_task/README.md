@@ -7,9 +7,10 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
-和得分真值。任务 1 已提供显式 `nav_only` 实动模式，可从视觉世界坐标导航到随机桌边
-目标并在机械臂动作前停车；任务 1 后续动作及任务 2/3 正式执行器仍安全阻塞，不会把空
-动作误判为成功。
+和得分真值。任务 1 已提供显式 `nav_only` 底盘实动模式，以及 `pregrasp_only` 开放
+预抓取模式：后者会从视觉世界坐标导航到随机桌边目标，让两只张开的机械臂运动到目标
+两侧并保持，然后在产生夹持接触前安全阻塞。真正夹持、抬升、搬运和放置以及任务 2/3
+正式执行器仍未开放，不会把空动作误判为成功。
 
 ## 目录
 
@@ -95,6 +96,22 @@ bash scripts/run_client.sh
 该模式会真实发布 `/cmd_vel`。测试前必须确认只有一个 Client 在运行，并使用新启动的
 Server；速度在执行器和 ROS 发布入口处被双重限制为不超过 0.20/0.22 m/s 和
 0.65/0.70 rad/s。此模式不会完成或结算任务，测试后需重启 Server 恢复初始场景。
+
+### 任务 1 开放预抓取测试
+
+`pregrasp_only` 包含完整的 `nav_only` 路径。导航到位后，它使用当前 `/joint_states`、
+目标世界坐标和双臂 IK，让两个夹爪保持完全张开并运动到方块两侧；到位后持续发布最后
+的升降轴、头部和双臂位置命令，并在向内夹取前阻塞：
+
+```bash
+MATERIAL_EXECUTION_MODE=pregrasp_only \
+MATERIAL_DETECT_BACKEND=yolo \
+bash scripts/run_client.sh
+```
+
+该模式会真实移动底盘、升降轴、头部和双臂，但不会执行向内合拢、柔顺挤压或抬升。
+Server 的 `/material/unsafe_collision` 会让执行器立即停止推进并保持最后的机械臂命令。
+测试期间不得同时运行 `run_desktop_grasp.sh` 或其他机械臂控制节点。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 

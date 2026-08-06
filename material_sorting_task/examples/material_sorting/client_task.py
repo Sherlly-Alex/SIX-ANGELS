@@ -20,7 +20,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Bool, Float64MultiArray, Int32, String
 from vision_msgs.msg import Detection3DArray
 
 from competition_controller import (
@@ -29,7 +29,8 @@ from competition_controller import (
     ExecutionContext,
 )
 from executors import build_task_executors
-from executors.base import TargetObservation
+from executors.base import ArmCommand, TargetObservation
+from desktop_grasp.target_metadata import dominant_orientation, infer_box_orientation
 from instruction_parser import (
     InstructionParseError,
     InstructionValidationError,
@@ -69,7 +70,13 @@ class CompetitionClient(Node):
             str,
             deque[tuple[float, float, float]],
         ] = {}
+        self._target_orientation_histories: dict[
+            str,
+            deque[str | None],
+        ] = {}
         self.target_observations: dict[str, TargetObservation] = {}
+        self.grasp_confirmed = False
+        self.unsafe_collision = False
         self._last_wait_log_ns = 0
         self._last_controller_serial = -1
 
@@ -96,6 +103,26 @@ class CompetitionClient(Node):
         )
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
+        self.spine_pub = self.create_publisher(
+            Float64MultiArray,
+            "/spine_forward_position_controller/commands",
+            5,
+        )
+        self.head_pub = self.create_publisher(
+            Float64MultiArray,
+            "/head_forward_position_controller/commands",
+            5,
+        )
+        self.left_arm_pub = self.create_publisher(
+            Float64MultiArray,
+            "/left_arm_forward_position_controller/commands",
+            5,
+        )
+        self.right_arm_pub = self.create_publisher(
+            Float64MultiArray,
+            "/right_arm_forward_position_controller/commands",
+            5,
+        )
         self.create_subscription(
             String, "/material/instruction", self._instruction_cb, 5
         )
@@ -106,6 +133,18 @@ class CompetitionClient(Node):
             String, "/referee/gameinfo", self._gameinfo_cb, 5
         )
         self.create_subscription(Int32, "/referee/score", self._score_cb, 5)
+        self.create_subscription(
+            Bool,
+            "/material/grasp_confirmed",
+            self._grasp_confirmed_cb,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            "/material/unsafe_collision",
+            self._unsafe_collision_cb,
+            10,
+        )
         self.create_subscription(
             Odometry, "/slamware_ros_sdk_server_node/odom", self._odom_cb, 10
         )
@@ -131,6 +170,11 @@ class CompetitionClient(Node):
             self.get_logger().warning(
                 "nav_only enables real task-1 base motion to the detected table-side "
                 "pick stand, then stops and blocks before arm motion"
+            )
+        elif self.execution_mode == "pregrasp_only":
+            self.get_logger().warning(
+                "pregrasp_only enables task-1 base navigation and real dual-arm "
+                "open pregrasp, then holds and blocks before inward grasp contact"
             )
         else:
             self.get_logger().info(
@@ -180,6 +224,12 @@ class CompetitionClient(Node):
     def _score_cb(self, msg: Int32) -> None:
         self.score = int(msg.data)
 
+    def _grasp_confirmed_cb(self, msg: Bool) -> None:
+        self.grasp_confirmed = bool(msg.data)
+
+    def _unsafe_collision_cb(self, msg: Bool) -> None:
+        self.unsafe_collision = bool(msg.data)
+
     def _odom_cb(self, msg: Odometry) -> None:
         self.latest_odometry = msg
         self.odom_received = True
@@ -194,8 +244,12 @@ class CompetitionClient(Node):
             try:
                 if not detection.results:
                     continue
-                result = detection.results[0]
+                result = max(
+                    detection.results,
+                    key=lambda item: float(item.hypothesis.score),
+                )
                 color = str(result.hypothesis.class_id).strip().lower()
+                score = float(result.hypothesis.score)
                 position = result.pose.pose.position
                 point = (
                     float(position.x),
@@ -212,6 +266,25 @@ class CompetitionClient(Node):
                 continue
             history = self._target_histories.setdefault(color, deque(maxlen=7))
             history.append(point)
+            try:
+                bbox_orientation = detection.bbox.center.orientation
+                orientation = infer_box_orientation(
+                    detection.bbox.size.x,
+                    detection.bbox.size.y,
+                    bbox_orientation.z,
+                    bbox_orientation.w,
+                )
+            except (AttributeError, TypeError, ValueError):
+                # Position-only detections are still useful for navigation.
+                # A missing/malformed bbox orientation must not interrupt the
+                # ROS callback; the pregrasp planner will use its safe yaw-0
+                # fallback for that observation.
+                orientation = None
+            orientation_history = self._target_orientation_histories.setdefault(
+                color,
+                deque(maxlen=7),
+            )
+            orientation_history.append(orientation)
             if len(history) < 3:
                 continue
             samples = tuple(history)
@@ -223,6 +296,8 @@ class CompetitionClient(Node):
                 color=color,
                 position_world=stable_position,
                 received_at_s=received_at_s,
+                orientation=dominant_orientation(orientation_history),
+                score=score,
             )
 
     def _publish_base_command(self, linear_x: float, angular_z: float) -> None:
@@ -253,6 +328,52 @@ class CompetitionClient(Node):
     def _publish_stop(self) -> None:
         self._publish_base_command(0.0, 0.0)
 
+    def _publish_arm_command(self, command: ArmCommand) -> None:
+        if not rclpy.ok():
+            return
+        values = (
+            command.spine_position,
+            *command.head_positions,
+            *command.left_arm_positions,
+            command.left_gripper_position,
+            *command.right_arm_positions,
+            command.right_gripper_position,
+        )
+        if len(command.head_positions) != 2:
+            raise ValueError("ArmCommand head_positions must contain 2 values")
+        if len(command.left_arm_positions) != 6:
+            raise ValueError("ArmCommand left_arm_positions must contain 6 values")
+        if len(command.right_arm_positions) != 6:
+            raise ValueError("ArmCommand right_arm_positions must contain 6 values")
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("ArmCommand contains non-finite values")
+        try:
+            self.spine_pub.publish(
+                Float64MultiArray(data=[float(command.spine_position)])
+            )
+            self.head_pub.publish(
+                Float64MultiArray(data=[float(value) for value in command.head_positions])
+            )
+            self.left_arm_pub.publish(
+                Float64MultiArray(
+                    data=[
+                        *[float(value) for value in command.left_arm_positions],
+                        float(command.left_gripper_position),
+                    ]
+                )
+            )
+            self.right_arm_pub.publish(
+                Float64MultiArray(
+                    data=[
+                        *[float(value) for value in command.right_arm_positions],
+                        float(command.right_gripper_position),
+                    ]
+                )
+            )
+        except Exception:
+            if rclpy.ok():
+                raise
+
     def _missing_inputs(self) -> list[str]:
         missing = []
         if len(self.instructions) != 3:
@@ -261,7 +382,7 @@ class CompetitionClient(Node):
             missing.append("odometry")
         if not self.joints_received:
             missing.append("joint_states")
-        if self.execution_mode == "nav_only" and self.instructions:
+        if self.execution_mode in {"nav_only", "pregrasp_only"} and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()
             )
@@ -273,6 +394,9 @@ class CompetitionClient(Node):
         """Feed ROS observations into the non-blocking competition controller."""
         if self.phase in (ClientPhase.SAFE_HOLD, ClientPhase.FINISHED):
             self._publish_stop()
+            snapshot = self.controller.snapshot()
+            if snapshot.controls_arm and snapshot.arm_command is not None:
+                self._publish_arm_command(snapshot.arm_command)
             return
 
         missing = self._missing_inputs()
@@ -309,6 +433,8 @@ class CompetitionClient(Node):
                 referee_gameinfo=self.referee_gameinfo,
                 referee_taskinfo=self.referee_taskinfo,
                 score=self.score,
+                grasp_confirmed=self.grasp_confirmed,
+                unsafe_collision=self.unsafe_collision,
             )
         )
 
@@ -319,6 +445,8 @@ class CompetitionClient(Node):
             )
         else:
             self._publish_stop()
+        if snapshot.controls_arm and snapshot.arm_command is not None:
+            self._publish_arm_command(snapshot.arm_command)
 
         if snapshot.transition_serial != self._last_controller_serial:
             stage = snapshot.stage.value if snapshot.stage is not None else "-"
@@ -344,6 +472,9 @@ class CompetitionClient(Node):
         self.controller.stop("client shutdown")
         self.phase = ClientPhase.SAFE_HOLD
         self._publish_stop()
+        snapshot = self.controller.snapshot()
+        if snapshot.controls_arm and snapshot.arm_command is not None:
+            self._publish_arm_command(snapshot.arm_command)
 
 
 def main() -> None:

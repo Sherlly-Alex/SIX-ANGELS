@@ -74,6 +74,11 @@ The helper starts one YOLO perception node, one semantic locator, and one
 single-run grasp executor. Do not run `scripts/run_client.sh` at the same time:
 both `client_task.py` and the grasp executor own `/cmd_vel`.
 
+For formal-Client, non-contact integration testing, use
+`MATERIAL_EXECUTION_MODE=pregrasp_only` with `scripts/run_client.sh` instead.
+That mode keeps all base and arm publisher ownership inside `client_task.py`
+and stops before the inward grasp.
+
 For separate terminals, launch the same components manually:
 
 ```bash

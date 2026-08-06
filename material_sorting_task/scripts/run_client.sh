@@ -29,7 +29,7 @@ cd "$TASK_DIR"
 # mixed incompatible Client files from different revisions.
 echo "checking Client module consistency..."
 python3 -c \
-  'from client_task import CompetitionClient; from executors.base import TargetObservation'
+  'from client_task import CompetitionClient; from control_types import ArmCommand; from desktop_grasp.pregrasp_core import OpenPregraspController; from executors.base import TargetObservation'
 
 python3 perception/box_detect.py \
   --backend "$BACKEND" \

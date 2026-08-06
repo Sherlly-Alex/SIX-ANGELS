@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 
 from executors.base import (
     TASK_STAGE_SEQUENCE,
+    ArmCommand,
     ExecutionContext,
     StageStatus,
     TaskExecutor,
@@ -43,6 +44,8 @@ class ControllerSnapshot:
     controls_base: bool
     base_linear_x: float
     base_angular_z: float
+    controls_arm: bool
+    arm_command: ArmCommand | None
     message: str
     transition_serial: int
 
@@ -74,6 +77,7 @@ class CompetitionController:
         self._controls_base = False
         self._base_linear_x = 0.0
         self._base_angular_z = 0.0
+        self._arm_command: ArmCommand | None = None
         self._message = "waiting for validated instructions and robot inputs"
         self._transition_serial = 0
         self._wait_referee_attempts_completed = 0
@@ -120,6 +124,7 @@ class CompetitionController:
         self.attempt = 1
         self.stage_index = 0
         self._stage_entered = False
+        self._arm_command = None
         self._transition(
             ControllerState.WAITING_FOR_INPUTS,
             "three validated task instructions configured",
@@ -201,11 +206,18 @@ class CompetitionController:
             self._base_angular_z = (
                 float(result.base_angular_z) if self._controls_base else 0.0
             )
+            if result.controls_arm:
+                if result.arm_command is None:
+                    self.stop(
+                        f"task {self.task_id} returned controls_arm without an ArmCommand"
+                    )
+                    return self.snapshot()
+                self._arm_command = result.arm_command
             if result.status is StageStatus.RUNNING:
                 if result.message:
                     message_changed = result.message != self._message
                     self._message = result.message
-                    if result.controls_base and message_changed:
+                    if (result.controls_base or result.controls_arm) and message_changed:
                         self._transition_serial += 1
                 return self.snapshot()
             if result.status is StageStatus.BLOCKED:
@@ -265,6 +277,8 @@ class CompetitionController:
             controls_base=self._controls_base,
             base_linear_x=self._base_linear_x,
             base_angular_z=self._base_angular_z,
+            controls_arm=self._arm_command is not None,
+            arm_command=self._arm_command,
             message=self._message,
             transition_serial=self._transition_serial,
         )

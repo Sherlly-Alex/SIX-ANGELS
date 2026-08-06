@@ -25,9 +25,11 @@
 
 The formal Client now owns a long-lived three-task controller and waits for the
 Server referee before retrying or advancing a scored task. The explicit
-`nav_only` mode connects stable world-frame detections to task 1 A* navigation,
-then fail-closes before arm motion. The task 1/3 desktop grasp executor remains
-a separately launched, single-run module and does not publish a grasp result
-action/status. Task 1 arm handoff plus task 2 shelf grasp, transport, placement,
-recovery, and safe controller handoff still need to be implemented and
-validated in the official Client container.
+`nav_only` connects stable world-frame detections to task 1 A* navigation.
+`pregrasp_only` additionally moves both open arms to the calibrated non-contact
+pregrasp pose using the same long-lived Client and keeps the last commanded pose
+across the deliberate block. The task 1/3 standalone desktop grasp executor
+still has no grasp result action/status. Inward grasp, Server-confirmed lift,
+transport, placement, task 2 shelf grasp, recovery, and post-grasp controller
+handoff still need to be implemented and validated in the official Client
+container.
