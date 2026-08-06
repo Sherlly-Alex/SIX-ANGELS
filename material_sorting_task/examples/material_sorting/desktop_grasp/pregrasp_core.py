@@ -34,7 +34,6 @@ SPINE_MAX = 0.87
 HEAD_TARGET = (0.0, 0.45)
 
 FEEDBACK_POS_TOL = 0.03
-GRASP_CONTACT_POS_TOL = 0.14
 SQUEEZE_CONTACT_POS_TOL = 0.24
 FEEDBACK_VEL_TOL = 0.01
 FEEDBACK_STABLE_TIME = 0.50
@@ -402,11 +401,15 @@ class OpenPregraspController:
 class ContactGraspController(OpenPregraspController):
     """Move both open grippers inward to the calibrated task contact pose."""
 
-    ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
+    # Contact with the box can stop the measured joints before they reach the
+    # unconstrained IK solution.  This tolerance does not declare success; it
+    # only permits the hard-bounded inward search to advance.  Server bilateral
+    # contact remains the sole success condition.
+    ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
         super().__init__(kdl=kdl)
-        self.ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
+        self.ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
         self._half_width: float | None = None
         self._orientation: str | None = None
 
@@ -420,7 +423,7 @@ class ContactGraspController(OpenPregraspController):
 
     def reset(self) -> None:
         super().reset()
-        self.ARM_POSITION_TOL = GRASP_CONTACT_POS_TOL
+        self.ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
         self._half_width = None
         self._orientation = None
 

@@ -143,7 +143,12 @@ def odometry(x: float, y: float, yaw: float):
     )
 
 
-def joint_states(*, slide: float = 0.0):
+def joint_states(
+    *,
+    slide: float = 0.0,
+    left_arm=None,
+    right_arm=None,
+):
     names = [
         "slide_joint",
         "head_yaw_joint",
@@ -153,7 +158,9 @@ def joint_states(*, slide: float = 0.0):
         *(f"right_arm_joint{index}" for index in range(1, 7)),
         "right_arm_eef_gripper_joint",
     ]
-    positions = [slide, 0.0, 0.0, *([0.0] * 6), 1.0, *([0.0] * 6), 1.0]
+    left = [0.0] * 6 if left_arm is None else list(left_arm)
+    right = [0.0] * 6 if right_arm is None else list(right_arm)
+    positions = [slide, 0.0, 0.0, *left, 1.0, *right, 1.0]
     return SimpleNamespace(
         name=names,
         position=positions,
@@ -228,7 +235,7 @@ class OpenPregraspControllerTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(controller.half_width, 0.118, places=6)
-        self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.14, places=6)
+        self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
         self.assertAlmostEqual(kdl.left[0, 3], 0.58, places=6)
         self.assertAlmostEqual(kdl.left[1, 3], 0.118, places=6)
         self.assertAlmostEqual(kdl.right[1, 3], -0.118, places=6)
@@ -240,6 +247,30 @@ class OpenPregraspControllerTests(unittest.TestCase):
             joint_states(),
         )
         self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
+
+    def test_contact_converges_when_box_blocks_joint_by_point_153_rad(self) -> None:
+        kdl = FakeKdl()
+        controller = ContactGraspController(kdl=kdl)
+        expected_slide = 1.32163718 - 0.854
+        blocked_feedback = joint_states(
+            slide=expected_slide,
+            right_arm=[0.153, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.64, math.pi / 2.0),
+            blocked_feedback,
+        )
+
+        reached = False
+        for tick in range(30):
+            _command, reached, _detail = controller.update(
+                tick * 0.05,
+                blocked_feedback,
+            )
+
+        self.assertTrue(reached)
 
 
 class Task1PregraspExecutorTests(unittest.TestCase):
