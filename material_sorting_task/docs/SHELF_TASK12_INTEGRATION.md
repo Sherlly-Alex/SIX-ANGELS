@@ -36,8 +36,8 @@ Implemented flow:
    still outside the shelf, then advances straight to the calibrated pick
    stand before the final pregrasp. It fuses live lateral detection with the
    calibrated layer center, performs a shelf grasp and bounded 0.08 m lift,
-   transports the box to the stored task-1 origin, releases it, and returns to
-   the end zone.
+   retreats the held shelf box farther clear of the shelf, transports it to
+   the stored task-1 origin, releases it, and returns to the end zone.
 
 Task 3 remains fail-closed.
 

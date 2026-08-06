@@ -58,7 +58,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     PREGRASP_TIMEOUT_S = 55.0
     SHELF_YAW = math.pi
     TABLE_YAW = math.pi / 2.0
-    SHELF_RETREAT_M = 0.32
+    # The held shelf box is still roughly 0.75 m in front of the base.  A
+    # 0.32 m retreat left its centre only about 0.15 m outside the shelf
+    # front, so the subsequent turn swept the box/arms into the shelf.  Back
+    # out farther while preserving the grasp before starting any navigation.
+    SHELF_RETREAT_M = 0.60
     TABLE_RETREAT_M = 0.35
     PLACE_CLEARANCE_M = 0.055
     PLACE_TIMEOUT_S = 25.0
