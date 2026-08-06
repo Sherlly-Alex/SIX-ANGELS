@@ -30,7 +30,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     # front before recognition had started.  Turn farther east, then derive a
     # scan stand from the measured held-object transform.
     SHELF_FRONT_X = -2.465
-    SHELF_SCAN_CENTER_CLEARANCE_M = 0.18
+    # The detector sees the yellow shelf box and packaging box at the safe
+    # turn point, but the packaging box becomes occluded after the carried
+    # object advances toward the shelf.  Scan near that turn point first;
+    # final placement still uses a separate, closer straight approach.
+    SHELF_SCAN_CENTER_CLEARANCE_M = 0.45
     SHELF_TURN_X = -1.30
     SHELF_OBSERVE_Y = 0.85
     SHELF_YAW = math.pi
