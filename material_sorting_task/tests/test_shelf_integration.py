@@ -281,6 +281,18 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(offset, 0.0)
         self.assertEqual(unchanged, (-2.679, 0.826, 1.139))
 
+    def test_task2_keeps_arms_retracted_until_final_grab_stand(self) -> None:
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+        context = ExecutionContext(
+            now_s=12.0,
+            instruction={"task": 2, "target_color": "yellow"},
+            task_index=2,
+            attempt=1,
+        )
+        executor.enter_stage(TaskStage.ALIGN_FOR_PICK, context)
+        self.assertEqual(executor._phase, "acquire_center")
+        self.assertFalse(executor._pregrasp.planned)
+
     def test_place_stand_preserves_held_object_transform(self) -> None:
         stand = stand_from_held_center(
             (-2.63, 0.778, 0.837),
