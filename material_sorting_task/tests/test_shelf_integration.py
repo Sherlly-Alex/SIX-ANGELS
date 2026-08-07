@@ -22,6 +22,7 @@ from shelf.manipulation import (
     ArmRetractController,
     HeldTransportController,
     ShelfOpenPregraspController,
+    SlideHoldController,
 )
 from shelf.state_tracker import ShelfStateTracker
 from shelf.target_center import StableTargetCenterTracker
@@ -189,6 +190,40 @@ class StableTargetCenterTrackerTests(unittest.TestCase):
         )
 
         self.assertEqual(tracker.sample_count, 1)
+
+
+class SlideHoldControllerTests(unittest.TestCase):
+    def test_arm_velocity_transients_do_not_block_slide_settle(self) -> None:
+        controller = SlideHoldController()
+        hold = ArmCommand(
+            spine_position=0.20,
+            head_positions=(0.0, 0.3),
+            left_arm_positions=(0.1,) * 6,
+            left_gripper_position=0.0,
+            right_arm_positions=(-0.1,) * 6,
+            right_gripper_position=0.0,
+        )
+        feedback = _arm_joint_state(
+            slide=0.20,
+            head=hold.head_positions,
+            left=hold.left_arm_positions,
+            right=hold.right_arm_positions,
+        )
+        # The slide is stationary, but the simulator reports arm-joint
+        # transients larger than FEEDBACK_VEL_TOL while the held pose settles.
+        feedback.velocity = [0.0] * len(feedback.name)
+        for index, name in enumerate(feedback.name):
+            if name.startswith(("left_arm_joint", "right_arm_joint")):
+                feedback.velocity[index] = 0.03
+
+        controller.plan(hold, 0.20, feedback)
+        _command, reached, detail = controller.update(0.0, feedback)
+        self.assertFalse(reached)
+        self.assertIn("slide_vel=0.000", detail)
+        _command, reached, _detail = controller.update(0.10, feedback)
+        self.assertFalse(reached)
+        _command, reached, _detail = controller.update(0.70, feedback)
+        self.assertTrue(reached)
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):

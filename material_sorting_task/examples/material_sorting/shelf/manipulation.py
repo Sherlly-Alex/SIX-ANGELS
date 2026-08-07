@@ -580,8 +580,16 @@ class SlideHoldController:
         left_error = float(np.max(np.abs(measured_left - self._target_vector[3:9])))
         right_error = float(np.max(np.abs(measured_right - self._target_vector[10:16])))
         command_error = abs(self._action_vector[0] - self._target_vector[0])
+        # This controller only commands the slide.  The arm joints are
+        # deliberately held at the previously commanded grasp pose, and the
+        # simulator can report small arm velocity transients while that pose
+        # is being maintained.  Including those unrelated velocities in the
+        # slide settle condition can make a correctly placed box time out
+        # indefinitely (the observed ``max_vel`` spikes came from the arms,
+        # while the slide error was already within tolerance).
+        slide_velocity = abs(velocities.get("slide_joint", 0.0))
         max_velocity = max(
-            abs(velocities.get("slide_joint", 0.0)),
+            slide_velocity,
             *(abs(velocities.get(f"left_arm_joint{index}", 0.0)) for index in range(1, 7)),
             *(abs(velocities.get(f"right_arm_joint{index}", 0.0)) for index in range(1, 7)),
         )
@@ -590,7 +598,7 @@ class SlideHoldController:
             and left_error <= LIFT_ARM_POSITION_TOL
             and right_error <= LIFT_ARM_POSITION_TOL
             and command_error <= FEEDBACK_POS_TOL
-            and max_velocity <= FEEDBACK_VEL_TOL
+            and slide_velocity <= FEEDBACK_VEL_TOL
         )
         reached = False
         if stable_now:
@@ -602,7 +610,8 @@ class SlideHoldController:
         detail = (
             f"slide_target={self._target_vector[0]:.3f}, slide_err={slide_error:.3f}, "
             f"left_err={left_error:.3f}, right_err={right_error:.3f}, "
-            f"cmd_err={command_error:.3f}, max_vel={max_velocity:.3f}"
+            f"cmd_err={command_error:.3f}, slide_vel={slide_velocity:.3f}, "
+            f"max_vel={max_velocity:.3f}"
         )
         return self.command(), reached, detail
 
