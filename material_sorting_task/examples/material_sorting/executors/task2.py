@@ -24,8 +24,10 @@ from executors.transfer_support import (
     stand_from_held_center,
     world_to_base,
 )
+from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from shelf.manipulation import (
+    HeldTransportController,
     ReleaseSpreadController,
     ShelfOpenPregraspController,
     SlideHoldController,
@@ -79,6 +81,16 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     TABLE_RETREAT_M = 0.35
     PLACE_CLEARANCE_M = 0.055
     PLACE_TIMEOUT_S = 25.0
+    TRANSPORT_COMPACT_TIMEOUT_S = 30.0
+    # After the shelf retreat, first shorten the forward arm/payload envelope
+    # without changing the bilateral preload.  The fixed corridor waypoint is
+    # clear of the shelf, table and both side walls for either randomized
+    # table source slot.  A second segment approaches the table from its south
+    # side, so the payload never sweeps through the east wall while turning.
+    TRANSPORT_CENTER_X_M = 0.46
+    TRANSPORT_CORRIDOR_X = -0.72
+    TRANSPORT_CORRIDOR_Y = 0.82
+    TABLE_APPROACH_Y = 1.35
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         # Eight centimetres clears the source board while keeping the box
@@ -92,6 +104,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._memory = memory
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
+        self._held_transport = HeldTransportController(
+            target_center_x_m=self.TRANSPORT_CENTER_X_M
+        )
+        self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
         self._target_center_tracker = StableTargetCenterTracker()
         self._held_center_base: tuple[float, float, float] | None = None
@@ -109,6 +125,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().reset()
         self._transfer.reset()
         self._slide_hold.reset()
+        self._held_transport.reset()
         self._release.reset()
         self._target_center_tracker.reset()
         self._held_center_base = None
@@ -157,7 +174,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         elif stage is TaskStage.TRANSPORT:
             self._transfer.reset()
             self._slide_hold.reset()
+            self._held_transport.reset()
             self._phase = "retreat_shelf"
+            self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.RETURN_TO_END:
             self._transfer.reset()
             self._phase = "retreat_table"
@@ -212,6 +231,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().cancel(reason)
         self._transfer.reset()
         self._slide_hold.reset()
+        self._held_transport.reset()
         self._release.reset()
         self._pregrasp.reset()
         self._staged_target_world = None
@@ -548,6 +568,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             # On MMK2 the slide coordinate is inverted: SPINE_MIN is the
             # physically highest pose and SPINE_MAX is the lowest pose.
             self._phase = "lift_for_table_transport"
+            self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
 
@@ -571,9 +592,119 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
             if result is not None:
                 return result
-            self._phase = "navigate_table_mid"
+            # Do not turn with the shelf-pick reach still extended.  Re-solve
+            # both arms through short IK waypoints while retaining exactly the
+            # last bilateral preload, gripper commands and maximum spine pose.
+            self._phase = "compact_transport_hold"
+            self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
+
+        if self._phase == "compact_transport_hold":
+            if not self._held_transport.planned:
+                try:
+                    self._held_arm_command = self._held_transport.plan(
+                        self._held_arm_command,
+                        self._held_center_base,
+                        self._held_half_width(),
+                    )
+                except (PregraspInputError, PregraspPlanningError, RuntimeError) as exc:
+                    return StageResult.blocked(
+                        f"task 2 could not plan the grasp-preserving transport pose: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+            try:
+                command, reached, detail = self._held_transport.update(
+                    context.now_s, context.joint_states
+                )
+            except (PregraspInputError, PregraspPlanningError) as exc:
+                return StageResult.blocked(
+                    f"task 2 grasp-preserving transport control failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+            self._held_arm_command = command
+            if not reached:
+                elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+                if elapsed >= self.TRANSPORT_COMPACT_TIMEOUT_S:
+                    return StageResult.blocked(
+                        "task 2 timed out while compacting the held-box "
+                        f"transport pose after {elapsed:.1f}s: {detail}",
+                        arm_command=command,
+                    )
+                return StageResult.running(
+                    "task 2 keeping bilateral preload while drawing the held "
+                    f"box into the transport envelope; {detail}",
+                    arm_command=command,
+                )
+            compact_center = self._held_transport.target_center_base
+            if compact_center is None:
+                return StageResult.blocked(
+                    "task 2 compact transport controller lost its held-box transform",
+                    arm_command=command,
+                )
+            self._held_center_base = compact_center
+            pose = odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "task 2 compact transport pose reached; waiting for odometry",
+                    arm_command=command,
+                )
+            envelope = self._carried_envelope.check_pose(
+                pose, self._held_center_base, self._held_half_width()
+            )
+            if not envelope.safe:
+                return StageResult.blocked(
+                    "task 2 compact transport pose is not clear for base motion: "
+                    + envelope.detail,
+                    arm_command=command,
+                )
+            self._phase = "navigate_transport_corridor"
+            self._motion_started = False
+            self._transfer.reset()
+
+        if self._phase == "navigate_transport_corridor":
+            if not self._motion_started:
+                pose = odometry_pose(context.odometry)
+                if pose is None:
+                    return StageResult.running(
+                        "task 2 waiting for odometry before the carried-box corridor",
+                        arm_command=self._held_arm_command,
+                    )
+                goal = NavigationGoal(
+                    x=self.TRANSPORT_CORRIDOR_X,
+                    y=self.TRANSPORT_CORRIDOR_Y,
+                    yaw=0.0,
+                    position_tolerance=0.08,
+                    yaw_tolerance=0.07,
+                    safety_radius=0.0,
+                    segment=NavigationSegment.NAV_TABLE,
+                    source_tag="task2_carried_box_corridor",
+                )
+                started, safety = self._begin_carried_navigation(
+                    goal, context, "shelf-to-corridor segment"
+                )
+                if not started:
+                    return StageResult.blocked(safety, arm_command=self._held_arm_command)
+                self._motion_started = True
+            status, command, detail = self._tick_carried_navigation(
+                context, "shelf-to-corridor segment"
+            )
+            if status is NavigationStatus.GOAL_REACHED:
+                self._phase = "navigate_table_mid"
+                self._motion_started = False
+                self._transfer.reset()
+            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                return StageResult.blocked(
+                    f"task 2 carried-box corridor navigation stopped safely: {detail}",
+                    arm_command=self._held_arm_command,
+                )
+            else:
+                return StageResult.running(
+                    "task 2 transporting the compact held box through the "
+                    f"central corridor; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
 
         if self._phase == "navigate_table_mid":
             if not self._motion_started:
@@ -582,26 +713,30 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
                 goal = NavigationGoal(
                     x=final_x,
-                    y=final_y - 0.35,
+                    y=min(self.TABLE_APPROACH_Y, final_y - 0.25),
                     yaw=self.TABLE_YAW,
                     position_tolerance=0.08,
                     yaw_tolerance=0.07,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_TABLE,
-                    source_tag="task1_origin_table_mid",
+                    source_tag="task2_carried_box_table_entry",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                started, safety = self._begin_carried_navigation(
+                    goal, context, "corridor-to-table-entry segment"
+                )
+                if not started:
                     return StageResult.blocked(
-                        "task 2 could not plan transport to task 1's original table point",
+                        safety,
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s
+            status, command, detail = self._tick_carried_navigation(
+                context, "corridor-to-table-entry segment"
             )
             if status is NavigationStatus.GOAL_REACHED:
                 return StageResult.succeeded(
-                    "task 2 reached the table placement approach while preserving grasp",
+                    "task 2 reached the table entry through two envelope-checked "
+                    "segments while preserving the compact bilateral grasp",
                     arm_command=self._held_arm_command,
                 )
             if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
@@ -618,6 +753,92 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             f"task 2 invalid transport phase {self._phase!r}",
             arm_command=self._held_arm_command,
         )
+
+    def _held_half_width(self) -> float:
+        half_width = self._contact.half_width
+        if half_width is None or not math.isfinite(float(half_width)):
+            raise RuntimeError("task 2 lost the bilateral grasp half-width")
+        if float(half_width) <= 0.0:
+            raise RuntimeError("task 2 bilateral grasp half-width is not positive")
+        return float(half_width)
+
+    def _begin_carried_navigation(
+        self,
+        goal: NavigationGoal,
+        context: ExecutionContext,
+        segment_name: str,
+    ) -> tuple[bool, str]:
+        """Plan one base segment and reject an unsafe swept payload path."""
+
+        if self._held_center_base is None:
+            return False, f"task 2 {segment_name} has no held-box transform"
+        pose = odometry_pose(context.odometry)
+        if pose is None:
+            return False, f"task 2 {segment_name} has no valid odometry"
+        try:
+            half_width = self._held_half_width()
+        except RuntimeError as exc:
+            return False, str(exc)
+        if not self._transfer.begin_navigation(goal, context.odometry):
+            return False, f"task 2 could not plan {segment_name}"
+        safety = self._carried_envelope.check_path(
+            pose,
+            self._transfer.navigation_path,
+            goal.yaw,
+            self._held_center_base,
+            half_width,
+        )
+        if not safety.safe:
+            self._transfer.reset()
+            return False, (
+                f"task 2 rejected {segment_name} before motion because the "
+                f"carried envelope is unsafe: {safety.detail}"
+            )
+        return True, safety.detail
+
+    def _tick_carried_navigation(
+        self,
+        context: ExecutionContext,
+        segment_name: str,
+    ) -> tuple[NavigationStatus, tuple[float, float], str]:
+        """Run one segment with a short-horizon arm/payload envelope guard."""
+
+        status, command, detail = self._transfer.tick_navigation(
+            context.odometry, context.now_s
+        )
+        pose = odometry_pose(context.odometry)
+        if pose is None:
+            return (
+                NavigationStatus.NAVIGATING,
+                (0.0, 0.0),
+                f"{segment_name} waiting for valid odometry",
+            )
+        if self._held_center_base is None:
+            self._transfer.reset()
+            return (
+                NavigationStatus.EMERGENCY_STOP,
+                (0.0, 0.0),
+                f"{segment_name} lost the held-box transform",
+            )
+        try:
+            half_width = self._held_half_width()
+        except RuntimeError as exc:
+            self._transfer.reset()
+            return NavigationStatus.EMERGENCY_STOP, (0.0, 0.0), str(exc)
+        safety = self._carried_envelope.check_command(
+            pose,
+            command,
+            self._held_center_base,
+            half_width,
+        )
+        if not safety.safe:
+            self._transfer.reset()
+            return (
+                NavigationStatus.EMERGENCY_STOP,
+                (0.0, 0.0),
+                f"{segment_name} envelope guard stopped motion: {safety.detail}",
+            )
+        return status, command, f"{detail}; {safety.detail}"
 
     def _tick_align_for_place(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
@@ -664,14 +885,17 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_TABLE,
                     source_tag="task1_origin_table_final",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                started, safety = self._begin_carried_navigation(
+                    goal, context, "table-entry-to-placement segment"
+                )
+                if not started:
                     return StageResult.blocked(
-                        "task 2 could not plan final table placement alignment",
+                        safety,
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s
+            status, command, detail = self._tick_carried_navigation(
+                context, "table-entry-to-placement segment"
             )
             if status is NavigationStatus.GOAL_REACHED:
                 return StageResult.succeeded(

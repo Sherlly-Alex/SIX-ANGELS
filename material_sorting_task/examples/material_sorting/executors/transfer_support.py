@@ -109,6 +109,10 @@ class TransferMotion:
     def goal(self) -> NavigationGoal | None:
         return self._goal
 
+    @property
+    def navigation_path(self) -> tuple[tuple[float, float], ...]:
+        return self._navigation.path
+
     def reset(self) -> None:
         self._navigation.reset()
         self._goal = None

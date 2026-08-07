@@ -15,8 +15,14 @@ from executors.task1_full import (
 )
 from executors.task2 import Task2IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
+from navigation.carried_envelope import CarriedEnvelopeChecker
+from navigation.navigation_types import NavigationGoal, NavigationSegment
 from navigation.navigation_types import NavigationStatus
-from shelf.manipulation import ArmRetractController, ShelfOpenPregraspController
+from shelf.manipulation import (
+    ArmRetractController,
+    HeldTransportController,
+    ShelfOpenPregraspController,
+)
 from shelf.state_tracker import ShelfStateTracker
 from shelf.target_center import StableTargetCenterTracker
 from shelf.task_memory import CompetitionTaskMemory
@@ -330,6 +336,151 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertFalse(result.controls_base)
         self.assertIn("maximum transport height", result.message)
+
+    def test_held_transport_starts_from_preloaded_command_and_keeps_grippers(self) -> None:
+        class RecordingKdl:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def inverse_kinematics(
+                self, *, T_left, T_right, ref_pos, target_height
+            ):
+                self.calls.append(
+                    (T_left.copy(), T_right.copy(), tuple(ref_pos), target_height)
+                )
+                return [list(ref_pos)]
+
+        kdl = RecordingKdl()
+        controller = HeldTransportController(kdl=kdl)
+        hold = ArmCommand(
+            spine_position=SPINE_MIN,
+            head_positions=(0.11, 0.42),
+            left_arm_positions=(0.3, -0.2, 0.4, 0.1, -0.3, 0.2),
+            left_gripper_position=0.83,
+            right_arm_positions=(-0.3, 0.2, -0.4, -0.1, 0.3, -0.2),
+            right_gripper_position=0.79,
+        )
+
+        first = controller.plan(hold, (0.76, 0.03, 1.34), 0.118)
+
+        self.assertEqual(first, hold)
+        self.assertGreaterEqual(controller.waypoint_count, 4)
+        self.assertEqual(len(kdl.calls), controller.waypoint_count)
+        self.assertAlmostEqual(kdl.calls[0][3], SPINE_MIN, places=6)
+        self.assertAlmostEqual(first.left_gripper_position, 0.83, places=6)
+        self.assertAlmostEqual(first.right_gripper_position, 0.79, places=6)
+        self.assertEqual(controller.target_center_base, (0.46, 0.0, 1.34))
+
+    def test_carried_envelope_rejects_extended_direct_turn(self) -> None:
+        checker = CarriedEnvelopeChecker()
+        motion = TransferMotion()
+        start = (-1.28, 0.78, math.pi)
+        old_goal = NavigationGoal(
+            -0.18,
+            1.09,
+            math.pi / 2.0,
+            0.08,
+            0.07,
+            0.0,
+            NavigationSegment.NAV_TABLE,
+            "old_direct_table_mid",
+        )
+        self.assertTrue(motion.begin_navigation(old_goal, _odom(*start)))
+        check = checker.check_path(
+            start,
+            motion.navigation_path,
+            old_goal.yaw,
+            (0.75, 0.0, 1.34),
+            0.118,
+        )
+        self.assertFalse(check.safe)
+
+    def test_compact_segmented_task2_routes_pass_carried_envelope(self) -> None:
+        checker = CarriedEnvelopeChecker()
+        motion = TransferMotion()
+        held = (0.46, 0.0, 1.34)
+        half_width = 0.118
+        segments = (
+            (
+                (-1.28, 0.78, math.pi),
+                NavigationGoal(
+                    -0.72,
+                    0.82,
+                    0.0,
+                    0.08,
+                    0.07,
+                    0.0,
+                    NavigationSegment.NAV_TABLE,
+                    "test_corridor",
+                ),
+            ),
+            (
+                (-0.72, 0.82, 0.0),
+                NavigationGoal(
+                    -0.18,
+                    1.35,
+                    math.pi / 2.0,
+                    0.08,
+                    0.07,
+                    0.0,
+                    NavigationSegment.NAV_TABLE,
+                    "test_right_entry",
+                ),
+            ),
+            (
+                (-0.18, 1.35, math.pi / 2.0),
+                NavigationGoal(
+                    -0.18,
+                    1.74,
+                    math.pi / 2.0,
+                    0.07,
+                    0.07,
+                    0.0,
+                    NavigationSegment.NAV_TABLE,
+                    "test_right_final",
+                ),
+            ),
+            (
+                (-0.72, 0.82, 0.0),
+                NavigationGoal(
+                    -1.00,
+                    1.35,
+                    math.pi / 2.0,
+                    0.08,
+                    0.07,
+                    0.0,
+                    NavigationSegment.NAV_TABLE,
+                    "test_left_entry",
+                ),
+            ),
+            (
+                (-1.00, 1.35, math.pi / 2.0),
+                NavigationGoal(
+                    -1.00,
+                    1.74,
+                    math.pi / 2.0,
+                    0.07,
+                    0.07,
+                    0.0,
+                    NavigationSegment.NAV_TABLE,
+                    "test_left_final",
+                ),
+            ),
+        )
+        for start, goal in segments:
+            motion.reset()
+            self.assertTrue(
+                motion.begin_navigation(goal, _odom(*start)),
+                msg=f"could not plan {goal.source_tag}",
+            )
+            check = checker.check_path(
+                start,
+                motion.navigation_path,
+                goal.yaw,
+                held,
+                half_width,
+            )
+            self.assertTrue(check.safe, msg=f"{goal.source_tag}: {check.detail}")
 
 
 def _odom(x: float, y: float, yaw: float):

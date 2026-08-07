@@ -5,6 +5,7 @@ The modules in this package are deliberately ROS-free.  The formal
 """
 
 from shelf.manipulation import (
+    HeldTransportController,
     ReleaseSpreadController,
     ShelfOpenPregraspController,
     SlideHoldController,
@@ -15,6 +16,7 @@ from shelf.target_center import StableTargetCenterTracker, TargetCenterEstimate
 
 __all__ = [
     "CompetitionTaskMemory",
+    "HeldTransportController",
     "ReleaseSpreadController",
     "ShelfState",
     "ShelfStateTracker",

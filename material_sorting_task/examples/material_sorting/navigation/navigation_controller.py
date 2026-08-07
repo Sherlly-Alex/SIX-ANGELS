@@ -85,6 +85,12 @@ class NavigationController:
     def status(self) -> NavigationStatus:
         return self._status
 
+    @property
+    def path(self) -> tuple[tuple[float, float], ...]:
+        """Return the current immutable path for external safety validation."""
+
+        return tuple((float(x), float(y)) for x, y in self._path)
+
     def set_goal(self, goal: NavigationGoal, robot_x: float, robot_y: float) -> bool:
         """Plan a global path to *goal* from the robot's current position.
 

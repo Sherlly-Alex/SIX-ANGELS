@@ -15,16 +15,21 @@ from desktop_grasp.pregrasp_core import (
     FEEDBACK_VEL_TOL,
     GRIPPER_OPEN,
     GRASP_BACKOFF_X,
+    HAND_Z_OFFSET,
+    LEFT_A_ROT,
     LIFT_ARM_POSITION_TOL,
     LIFT_SLIDE_COMMAND_RATIO,
     OpenPregraspController,
     PREGRASP_BACKOFF_X,
     PregraspInputError,
     PregraspPlanningError,
+    RIGHT_A_ROT,
     SPINE_MAX,
     SPINE_MIN,
     _joint_maps,
+    _make_transform,
 )
+from mmk2_kdl import MMK2Kdl
 
 
 class ShelfOpenPregraspController(OpenPregraspController):
@@ -48,6 +53,264 @@ class ShelfOpenPregraspController(OpenPregraspController):
             joint_states,
             center_backoff_x=PREGRASP_BACKOFF_X,
             half_width=self.half_width,
+        )
+
+
+class HeldTransportController:
+    """Bring a preloaded dual-arm grasp closer without releasing the box.
+
+    The grasp used by the competition client keeps both grippers open and
+    holds the box through lateral arm preload.  Starting a new controller from
+    measured joints would discard that preload.  This controller therefore
+    starts from the last commanded grasp pose, preserves both gripper commands
+    and the maximum-height spine command, then follows small synchronized IK
+    waypoints that translate the box centre toward the robot.
+    """
+
+    # 0.46 m remains reachable across the observed shelf-centre lateral error
+    # range and adds useful wall margin compared with the old 0.75 m reach.
+    TARGET_CENTER_X_M = 0.46
+    TARGET_CENTER_Y_M = 0.0
+    MAX_CENTER_STEP_M = 0.06
+    COMMAND_RATE_PER_S = 0.45
+    ARM_POSITION_TOL = 0.16
+    MAX_JOINT_WAYPOINT_DELTA = 0.75
+    STABLE_TIME_S = 0.30
+    VELOCITY_TOL = 0.03
+
+    def __init__(
+        self,
+        *,
+        target_center_x_m: float = TARGET_CENTER_X_M,
+        kdl: MMK2Kdl | None = None,
+    ) -> None:
+        self.target_center_x_m = float(target_center_x_m)
+        if (
+            not math.isfinite(self.target_center_x_m)
+            or self.target_center_x_m <= 0.0
+        ):
+            raise ValueError("transport target center x must be finite and positive")
+        self._kdl = kdl or MMK2Kdl()
+        self._targets: list[np.ndarray] = []
+        self._centers: list[tuple[float, float, float]] = []
+        self._action_vector: np.ndarray | None = None
+        self._stage_index = 0
+        self._last_update_s: float | None = None
+        self._stable_since_s: float | None = None
+
+    @property
+    def planned(self) -> bool:
+        return bool(self._targets) and self._action_vector is not None
+
+    @property
+    def target_center_base(self) -> tuple[float, float, float] | None:
+        return None if not self._centers else self._centers[-1]
+
+    @property
+    def waypoint_count(self) -> int:
+        return len(self._targets)
+
+    def reset(self) -> None:
+        self._targets.clear()
+        self._centers.clear()
+        self._action_vector = None
+        self._stage_index = 0
+        self._last_update_s = None
+        self._stable_since_s = None
+
+    def plan(
+        self,
+        hold_command: ArmCommand,
+        held_center_base: tuple[float, float, float],
+        half_width_m: float,
+    ) -> ArmCommand:
+        self.reset()
+        start_center = np.asarray(held_center_base, dtype=float)
+        half_width = float(half_width_m)
+        if start_center.shape != (3,) or not np.all(np.isfinite(start_center)):
+            raise PregraspInputError("held center is invalid for transport compaction")
+        if not math.isfinite(half_width) or half_width <= 0.0:
+            raise PregraspInputError("held half-width is invalid for transport compaction")
+        if start_center[0] < self.target_center_x_m - 0.02:
+            raise PregraspPlanningError(
+                "held box is already closer than the configured transport pose"
+            )
+
+        final_center = np.array(
+            [
+                min(float(start_center[0]), self.target_center_x_m),
+                self.TARGET_CENTER_Y_M,
+                float(start_center[2]),
+            ],
+            dtype=float,
+        )
+        center_distance = float(np.linalg.norm(final_center[:2] - start_center[:2]))
+        steps = max(1, int(math.ceil(center_distance / self.MAX_CENTER_STEP_M)))
+        reference = np.array(
+            [
+                hold_command.spine_position,
+                *hold_command.left_arm_positions,
+                *hold_command.right_arm_positions,
+            ],
+            dtype=float,
+        )
+        if reference.shape != (13,) or not np.all(np.isfinite(reference)):
+            raise PregraspInputError("held ArmCommand is invalid")
+
+        previous_joints = reference.copy()
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            center = start_center + fraction * (final_center - start_center)
+            arm_center = center + np.array(
+                [-GRASP_BACKOFF_X, 0.0, HAND_Z_OFFSET], dtype=float
+            )
+            left_target = arm_center + np.array([0.0, half_width, 0.0])
+            right_target = arm_center + np.array([0.0, -half_width, 0.0])
+            solutions = self._kdl.inverse_kinematics(
+                T_left=_make_transform(left_target, LEFT_A_ROT),
+                T_right=_make_transform(right_target, RIGHT_A_ROT),
+                ref_pos=previous_joints,
+                target_height=float(hold_command.spine_position),
+            )
+            if solutions is None or len(solutions) == 0:
+                raise PregraspPlanningError(
+                    "dual-arm IK failed for compact transport center="
+                    f"{np.round(center, 3).tolist()}"
+                )
+            joints = np.asarray(solutions[0], dtype=float)
+            if joints.shape != (13,) or not np.all(np.isfinite(joints)):
+                raise PregraspPlanningError(
+                    "compact transport IK returned invalid joints"
+                )
+            joint_delta = float(np.max(np.abs(joints[1:] - previous_joints[1:])))
+            if joint_delta > self.MAX_JOINT_WAYPOINT_DELTA:
+                raise PregraspPlanningError(
+                    "compact transport IK changed branch; "
+                    f"max waypoint joint delta={joint_delta:.3f} rad"
+                )
+            target = np.array(
+                [
+                    hold_command.spine_position,
+                    *hold_command.head_positions,
+                    *joints[1:7],
+                    hold_command.left_gripper_position,
+                    *joints[7:13],
+                    hold_command.right_gripper_position,
+                ],
+                dtype=float,
+            )
+            self._targets.append(target)
+            self._centers.append(tuple(float(value) for value in center))
+            previous_joints = joints
+
+        self._action_vector = np.array(
+            [
+                hold_command.spine_position,
+                *hold_command.head_positions,
+                *hold_command.left_arm_positions,
+                hold_command.left_gripper_position,
+                *hold_command.right_arm_positions,
+                hold_command.right_gripper_position,
+            ],
+            dtype=float,
+        )
+        return self.command()
+
+    def update(
+        self,
+        now_s: float,
+        joint_states: Any,
+    ) -> tuple[ArmCommand, bool, str]:
+        if not self.planned or self._action_vector is None:
+            raise PregraspPlanningError("held transport update called before plan")
+        positions, velocities = _joint_maps(joint_states)
+        now = float(now_s)
+        if not math.isfinite(now):
+            raise PregraspInputError("control time is non-finite")
+        dt = (
+            0.05
+            if self._last_update_s is None
+            else min(0.20, max(0.01, now - self._last_update_s))
+        )
+        self._last_update_s = now
+        target = self._targets[self._stage_index]
+        diff = target - self._action_vector
+        max_difference = float(np.max(np.abs(diff)))
+        if max_difference > 0.0:
+            ratios = np.abs(diff) / (max_difference + 1e-9)
+            steps = ratios * self.COMMAND_RATE_PER_S * dt
+            self._action_vector += np.sign(diff) * np.minimum(np.abs(diff), steps)
+
+        measured = np.array(
+            [
+                positions["slide_joint"],
+                *(positions[f"left_arm_joint{index}"] for index in range(1, 7)),
+                *(positions[f"right_arm_joint{index}"] for index in range(1, 7)),
+            ],
+            dtype=float,
+        )
+        target_feedback = np.concatenate((target[0:1], target[3:9], target[10:16]))
+        commanded_feedback = np.concatenate(
+            (
+                self._action_vector[0:1],
+                self._action_vector[3:9],
+                self._action_vector[10:16],
+            )
+        )
+        measured_velocity = np.array(
+            [
+                velocities.get("slide_joint", 0.0),
+                *(velocities.get(f"left_arm_joint{index}", 0.0) for index in range(1, 7)),
+                *(velocities.get(f"right_arm_joint{index}", 0.0) for index in range(1, 7)),
+            ],
+            dtype=float,
+        )
+        errors = np.abs(measured - target_feedback)
+        command_error = float(np.max(np.abs(commanded_feedback - target_feedback)))
+        max_velocity = float(np.max(np.abs(measured_velocity)))
+        stable_now = (
+            errors[0] <= FEEDBACK_POS_TOL
+            and float(np.max(errors[1:7])) <= self.ARM_POSITION_TOL
+            and float(np.max(errors[7:13])) <= self.ARM_POSITION_TOL
+            and command_error <= FEEDBACK_POS_TOL
+            and max_velocity <= self.VELOCITY_TOL
+        )
+        if stable_now:
+            if self._stable_since_s is None:
+                self._stable_since_s = now
+        else:
+            self._stable_since_s = None
+
+        stage_reached = (
+            self._stable_since_s is not None
+            and now - self._stable_since_s >= self.STABLE_TIME_S
+        )
+        if stage_reached and self._stage_index + 1 < len(self._targets):
+            self._stage_index += 1
+            self._stable_since_s = None
+            stage_reached = False
+        reached = stage_reached and self._stage_index + 1 == len(self._targets)
+        center = self._centers[self._stage_index]
+        detail = (
+            f"compact_stage={self._stage_index + 1}/{len(self._targets)}, "
+            f"center_base={tuple(round(value, 3) for value in center)}, "
+            f"left_err={float(np.max(errors[1:7])):.3f}, "
+            f"right_err={float(np.max(errors[7:13])):.3f}, "
+            f"cmd_err={command_error:.3f}, max_vel={max_velocity:.3f}"
+        )
+        return self.command(), reached, detail
+
+    def command(self) -> ArmCommand:
+        if self._action_vector is None:
+            raise PregraspPlanningError("held transport command requested before plan")
+        values = self._action_vector
+        return ArmCommand(
+            spine_position=float(values[0]),
+            head_positions=(float(values[1]), float(values[2])),
+            left_arm_positions=tuple(float(value) for value in values[3:9]),
+            left_gripper_position=float(values[9]),
+            right_arm_positions=tuple(float(value) for value in values[10:16]),
+            right_gripper_position=float(values[16]),
         )
 
 
@@ -358,6 +621,7 @@ class SlideHoldController:
 
 __all__ = [
     "ArmRetractController",
+    "HeldTransportController",
     "ReleaseSpreadController",
     "ShelfOpenPregraspController",
     "SlideHoldController",

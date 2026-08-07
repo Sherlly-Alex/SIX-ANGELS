@@ -42,8 +42,16 @@ Implemented flow:
    Shelf pregrasp uses a narrower symmetric 0.18 m half-width; contact width is
    still derived from the box orientation. It then performs the shelf grasp and
    bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
-   raises the spine to the maximum transport height while stationary, transports
-   it to the stored task-1 origin, releases it, and returns to the end zone.
+   and raises the spine to the maximum transport height while stationary. Before
+   the base turns, a grasp-preserving controller moves the held center inward
+   through small synchronized dual-arm IK waypoints. It starts from the last
+   commanded preload and keeps the grippers, half-width and spine command
+   unchanged. Transport then follows separate shelf-to-corridor,
+   corridor-to-table-entry and table-entry-to-placement segments. Each segment
+   is rejected before motion if a swept body/arm/box envelope intersects the
+   shelf or perimeter walls, and the same envelope is predicted over every
+   live velocity command. It finally releases at the stored task-1 origin and
+   returns to the end zone.
 
 Task 3 remains fail-closed.
 
@@ -63,6 +71,7 @@ Important files:
 - `examples/material_sorting/executors/task1_full.py`
 - `examples/material_sorting/executors/task2.py`
 - `examples/material_sorting/executors/transfer_support.py`
+- `examples/material_sorting/navigation/carried_envelope.py`
 - `examples/material_sorting/shelf/state_tracker.py`
 - `examples/material_sorting/shelf/target_center.py`
 - `examples/material_sorting/shelf/task_memory.py`
@@ -75,6 +84,8 @@ conditions occurs:
 
 - Server reports an unsafe collision.
 - A navigation plan fails or enters emergency stop.
+- A planned or live task-2 transport command violates the carried arm/box
+  envelope clearance.
 - Shelf color and task-2 instruction disagree.
 - The shelf scan cannot obtain stable votes for two distinct occupied layers.
 - Fresh task-2 RGB-D frames cannot produce a stable target-object center, or
@@ -90,7 +101,9 @@ Local static compilation and unit tests cover interface wiring, shared memory,
 carried-color filtering, multi-frame layer voting, fail-closed ambiguous-layer
 handling, robust task-2 object-center locking with outlier rejection, the
 shelf-specific pregrasp width, and held-object placement geometry. Runtime
-manipulation uses no Server/referee object coordinate; Server truth remains
+tests also cover grasp-preserving transport command continuity and rejection of
+the former extended-payload wall sweep. Runtime manipulation uses no
+Server/referee object coordinate; Server truth remains
 diagnostic/scoring-only. Physical clearances, camera view, IK convergence and
 referee timing must still be validated in the official 4090 Server/Client
 images, first with a fixed seed and then across randomized seeds.
