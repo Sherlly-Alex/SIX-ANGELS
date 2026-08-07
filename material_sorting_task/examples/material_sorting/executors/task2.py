@@ -71,6 +71,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # generic transfer tolerance unchanged for task 1, but use a tighter
     # task-2-specific final gate and one bounded re-alignment retry.
     SHELF_FINAL_LATERAL_TOLERANCE_M = 0.02
+    # The far shelf staging stand is already on the shelf row.  Allow a small
+    # row error during the direct approach, then correct it at the final grab
+    # stand where the base can rotate without sweeping the open arms through
+    # the shelf side.  A larger error falls back to the safe far-stand
+    # lateral alignment instead of risking a diagonal approach.
+    SHELF_DIRECT_APPROACH_MAX_LATERAL_ERROR_M = 0.10
     # The final lateral check is performed in the robot frame.  A residual
     # yaw error projects the forward target distance into that lateral axis,
     # so task 2 needs a stricter yaw and world-row tolerance than the generic
@@ -403,24 +409,48 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-            self._locked_target_world = estimate.center_world
+            # The RGB-D fit can choose yaw0 for a shelf box whose visible face
+            # is actually the fixed yaw90 competition orientation.  The x
+            # half-extent difference (0.12 - 0.08 = 0.04 m) then shifts the
+            # fitted centre toward the shelf.  Correct only that geometric
+            # ambiguity; the centre still comes from the fresh RGB-D object
+            # cloud and is never replaced with a layout coordinate.
+            corrected_center, orientation_correction_m = (
+                self._correct_shelf_center_orientation(
+                    estimate.center_world,
+                    estimate.orientation,
+                )
+            )
+            self._locked_target_world = corrected_center
             # The competition shelf slot has a fixed box orientation.  The
             # RGB-D cuboid orientation can flip under arm occlusion, so it is
             # not allowed to change the symmetric contact width here.
             self._locked_target_orientation = self.SOURCE_ORIENTATION
-            self._phase = "align_pick_lateral"
+            # The robot has already reached the shelf row while the arms are
+            # staged safely outside.  Approach the grab stand in a single
+            # fixed-heading straight segment; the post-approach phase performs
+            # the final in-place yaw/lateral correction immediately before
+            # opening the grippers around the object.
+            self._phase = "approach_pick"
             self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
             deviation = tuple(
                 round(value, 3) for value in estimate.max_axis_deviation
             )
+            correction_detail = (
+                "; corrected shelf-normal centre offset="
+                f"{orientation_correction_m:+.3f} m"
+                if abs(orientation_correction_m) > 1e-9
+                else ""
+            )
             return StageResult.running(
                 "task 2 locked the detected shelf-box geometric centre at "
-                f"{tuple(round(value, 3) for value in estimate.center_world)} "
+                f"{tuple(round(value, 3) for value in corrected_center)} "
                 f"from {estimate.sample_count} inliers; max_dev={deviation}; "
                 f"quality={estimate.quality}; "
-                "preparing safe lateral base alignment",
+                f"detected_orientation={estimate.orientation}; "
+                f"direct shelf-row approach{correction_detail}",
                 arm_command=self._held_arm_command,
             )
 
@@ -475,7 +505,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     )
                 target_base = world_to_base(self._locked_target_world, pose)
                 lateral_error = target_base[1]
-                if abs(lateral_error) > self.SHELF_FINAL_LATERAL_TOLERANCE_M:
+                if abs(lateral_error) > self.SHELF_DIRECT_APPROACH_MAX_LATERAL_ERROR_M:
                     if self._lateral_realign_attempts < 1:
                         self._lateral_realign_attempts += 1
                         self._phase = "align_pick_lateral"
@@ -506,7 +536,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     self._motion_started = False
                     self._transfer.reset()
                 elif not self._transfer.begin_advance(
-                    context.odometry, distance
+                    context.odometry,
+                    distance,
+                    heading_yaw=self.SHELF_YAW,
                 ):
                     return StageResult.running(
                         "task 2 waiting to start the detected-centre shelf approach",
@@ -629,6 +661,40 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             f"task 2 invalid shelf-pick alignment phase {self._phase!r}",
             arm_command=self._held_arm_command,
         )
+
+    @classmethod
+    def _correct_shelf_center_orientation(
+        cls,
+        center_world: tuple[float, float, float],
+        detected_orientation: str | None,
+    ) -> tuple[tuple[float, float, float], float]:
+        """Undo the known normal-direction bias from a flipped shelf fit.
+
+        Shelf colour boxes are placed with their 16 cm half-width along the
+        world X axis (``yaw90``).  If a visible-face fit selects ``yaw0`` it
+        uses a 12 cm X half-extent, moving the inferred centre 4 cm farther
+        into the shelf.  The correction is expressed along the shelf-facing
+        forward axis, so it remains correct if the shelf yaw is calibrated to
+        a different fixed direction later.
+        """
+
+        try:
+            center = tuple(float(value) for value in center_world)
+        except (TypeError, ValueError):
+            return tuple(center_world), 0.0
+        if len(center) != 3 or detected_orientation != "yaw0":
+            return center, 0.0
+        observed_x_half_extent = 0.12
+        expected_x_half_extent = 0.08
+        correction_m = observed_x_half_extent - expected_x_half_extent
+        forward_x = math.cos(cls.SHELF_YAW)
+        forward_y = math.sin(cls.SHELF_YAW)
+        corrected = (
+            center[0] - correction_m * forward_x,
+            center[1] - correction_m * forward_y,
+            center[2],
+        )
+        return corrected, correction_m
 
     def _capture_held_center(self, context: ExecutionContext) -> None:
         if self._locked_target_world is None:

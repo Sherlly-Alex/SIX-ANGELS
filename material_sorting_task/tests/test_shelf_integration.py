@@ -264,6 +264,23 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertIsInstance(executor._pregrasp, ShelfOpenPregraspController)
         self.assertAlmostEqual(executor._pregrasp.half_width, 0.18, places=6)
 
+    def test_task2_corrects_yaw0_shelf_fit_along_shelf_normal(self) -> None:
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+        corrected, offset = executor._correct_shelf_center_orientation(
+            (-2.719, 0.826, 1.139),
+            "yaw0",
+        )
+        self.assertAlmostEqual(offset, 0.04, places=6)
+        self.assertAlmostEqual(corrected[0], -2.679, places=6)
+        self.assertAlmostEqual(corrected[1], 0.826, places=6)
+        self.assertAlmostEqual(corrected[2], 1.139, places=6)
+        unchanged, offset = executor._correct_shelf_center_orientation(
+            (-2.679, 0.826, 1.139),
+            "yaw90",
+        )
+        self.assertEqual(offset, 0.0)
+        self.assertEqual(unchanged, (-2.679, 0.826, 1.139))
+
     def test_place_stand_preserves_held_object_transform(self) -> None:
         stand = stand_from_held_center(
             (-2.63, 0.778, 0.837),
