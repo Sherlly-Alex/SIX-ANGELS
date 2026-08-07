@@ -309,7 +309,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
             self._memory.record_shelf_state(state)
-            self._place_world = state.empty_place_world
+            self._place_world = self._memory.require_empty_shelf_center()
             target_held_z = self._place_world[2] + self.SHELF_CLEARANCE_M
             target_slide = (
                 self._held_arm_command.spine_position

@@ -24,6 +24,11 @@ Implemented flow:
    accepted only when one colored shelf box and the white packaging
    obstacle vote for two distinct layers in L1-L3. The carried task-1 color is
    ignored. The remaining unique layer is the task-1 placement target.
+   The resulting shelf snapshot keeps exactly three independent coordinates:
+   the calibrated empty-layer center for task 1, the RGB-D center of the
+   colored shelf target for task 2, and the RGB-D center of the shelf
+   packaging box for task 3. The desktop `material_box` is not part of this
+   shelf-state cache.
 5. Placement preserves the grasp while changing the slide. At the shelf front,
    a bounded local motion rotates toward the lateral direction, moves only
    along the shelf row, and restores the shelf-facing yaw before entering the
@@ -32,7 +37,8 @@ Implemented flow:
    transport posture, and returns to the end zone.
 6. The formal `CompetitionController` waits for Server referee progression.
 7. Task 2 verifies that its instruction color matches the stored shelf result
-   and uses that result only for rough navigation and layer selection. At the
+   and uses the independently fused colored-object center for rough
+   navigation and layer selection. At the
    farther arm-staging stand it opens/lowers both arms, waits for the camera to
    settle, and locks the target box's complete 3-D geometric center from fresh
    time-separated RGB-D detections. A component-median/inlier gate rejects edge

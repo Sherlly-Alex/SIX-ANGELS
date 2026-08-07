@@ -27,6 +27,7 @@ from executors.transfer_support import (
 from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from shelf.manipulation import (
+    ArmRetractController,
     ReleaseSpreadController,
     ShelfOpenPregraspController,
     SlideHoldController,
@@ -80,6 +81,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     TABLE_RETREAT_M = 0.35
     PLACE_CLEARANCE_M = 0.055
     PLACE_TIMEOUT_S = 25.0
+    ARM_RETRACT_TIMEOUT_S = 15.0
     TRANSPORT_SEGMENT_TIMEOUT_S = 30.0
     # Keep the successful shelf grasp completely unchanged during transport.
     # While still facing west, reverse east along the shelf aisle until the
@@ -104,6 +106,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_hold = SlideHoldController()
         self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
+        self._arm_retract = ArmRetractController()
         self._target_center_tracker = StableTargetCenterTracker()
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
@@ -121,6 +124,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._arm_retract.reset()
         self._target_center_tracker.reset()
         self._held_center_base = None
         self._place_world = None
@@ -172,7 +176,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.RETURN_TO_END:
             self._transfer.reset()
+            self._arm_retract.reset()
             self._phase = "retreat_table"
+            self._phase_started_s = float(context.now_s)
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if context.unsafe_collision:
@@ -225,6 +231,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._slide_hold.reset()
         self._release.reset()
+        self._arm_retract.reset()
         self._pregrasp.reset()
         self._staged_target_world = None
 
@@ -236,7 +243,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 "task 2 instruction/shelf recognition mismatch: "
                 f"instruction={target_color!r}, shelf={state.colored_class_id!r}"
             )
-        return target_color, state.colored_center_world
+        # Use the independently fused RGB-D center of the colored shelf box.
+        # The empty-layer geometry is only for task 1 placement and must not
+        # be reused as task 2's pick target.
+        return target_color, self._memory.require_task2_target_center()
 
     def _tick_navigate_to_pick(self, context: ExecutionContext) -> StageResult:
         try:
@@ -1197,9 +1207,58 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "navigate_end"
+            # The release IK pose leaves both arms extended toward the table.
+            # Keep the base stationary after the retreat and retract only now,
+            # while there is clear space around the robot.  Navigation must not
+            # start until the neutral transport posture is feedback-stable.
+            self._phase = "retract_arms"
+            self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
+
+        if self._phase == "retract_arms":
+            if self._held_arm_command is None:
+                return StageResult.blocked(
+                    "task 2 cannot retract arms without the table release command"
+                )
+            if not self._arm_retract.planned:
+                try:
+                    self._held_arm_command = self._arm_retract.plan(
+                        self._held_arm_command,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"task 2 safe arm retraction planning failed: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+            try:
+                command, reached, detail = self._arm_retract.update(
+                    context.now_s,
+                    context.joint_states,
+                )
+            except (PregraspInputError, PregraspPlanningError) as exc:
+                return StageResult.blocked(
+                    f"task 2 safe arm retraction control failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+            self._held_arm_command = command
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if reached:
+                self._phase = "navigate_end"
+                self._motion_started = False
+                self._transfer.reset()
+            elif elapsed >= self.ARM_RETRACT_TIMEOUT_S:
+                return StageResult.blocked(
+                    "task 2 safe arm retraction timed out after "
+                    f"{elapsed:.1f}s: {detail}",
+                    arm_command=command,
+                )
+            else:
+                return StageResult.running(
+                    f"task 2 retracting arms after table retreat; {detail}",
+                    arm_command=command,
+                )
 
         if self._phase == "navigate_end":
             if not self._motion_started:

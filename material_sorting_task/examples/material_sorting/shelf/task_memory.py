@@ -20,6 +20,12 @@ class CompetitionTaskMemory:
     task1_origin_world: tuple[float, float, float] | None = None
     task1_color: str | None = None
     shelf_state: ShelfState | None = None
+    # These are the only shelf-state coordinates shared across tasks.  The
+    # desktop material_box and desktop source coordinates are intentionally
+    # not part of this cache.
+    shelf_empty_center_world: tuple[float, float, float] | None = None
+    task2_target_center_world: tuple[float, float, float] | None = None
+    task3_packaging_box_center_world: tuple[float, float, float] | None = None
 
     def record_task1_origin(
         self,
@@ -34,6 +40,11 @@ class CompetitionTaskMemory:
 
     def record_shelf_state(self, state: ShelfState) -> None:
         self.shelf_state = state
+        self.shelf_empty_center_world = state.empty_shelf_center_world
+        self.task2_target_center_world = state.task2_target_center_world
+        self.task3_packaging_box_center_world = (
+            state.task3_packaging_box_center_world
+        )
 
     def require_task1_origin(self) -> tuple[float, float, float]:
         if self.task1_origin_world is None:
@@ -44,6 +55,21 @@ class CompetitionTaskMemory:
         if self.shelf_state is None:
             raise RuntimeError("task 1 has not produced a stable shelf-state result")
         return self.shelf_state
+
+    def require_empty_shelf_center(self) -> tuple[float, float, float]:
+        if self.shelf_empty_center_world is None:
+            raise RuntimeError("task 1 empty shelf center is unavailable")
+        return self.shelf_empty_center_world
+
+    def require_task2_target_center(self) -> tuple[float, float, float]:
+        if self.task2_target_center_world is None:
+            raise RuntimeError("task 2 shelf target center is unavailable")
+        return self.task2_target_center_world
+
+    def require_task3_packaging_box_center(self) -> tuple[float, float, float]:
+        if self.task3_packaging_box_center_world is None:
+            raise RuntimeError("task 3 packaging-box center is unavailable")
+        return self.task3_packaging_box_center_world
 
 
 __all__ = ["CompetitionTaskMemory"]

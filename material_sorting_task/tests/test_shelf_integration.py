@@ -63,7 +63,40 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertEqual(result.white_obstacle_layer, 1)
         self.assertEqual(result.empty_layer, 3)
         self.assertEqual(result.layer_contents, ("packaging_box", "brown", "EMPTY"))
+        # Occupied-object centers come from their own RGB-D observations;
+        # only the empty slot uses calibrated shelf geometry.
+        self.assertEqual(result.task2_target_center_world, (-2.55, 0.81, 0.837))
+        self.assertEqual(
+            result.task3_packaging_box_center_world,
+            (-2.54, 0.78, 0.530),
+        )
         self.assertAlmostEqual(result.empty_place_world[2], 1.166, places=3)
+        self.assertAlmostEqual(result.empty_shelf_center_world[0], -2.63, places=3)
+        self.assertAlmostEqual(result.empty_shelf_center_world[1], 0.778, places=3)
+
+    def test_desktop_material_box_is_not_part_of_shelf_state(self) -> None:
+        tracker = ShelfStateTracker(required_votes=3)
+        result = None
+        for index in range(3):
+            stamp = 30.0 + index
+            result = tracker.update(
+                {
+                    "brown": observation("brown", (-2.55, 0.81, 0.837), stamp),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.54, 0.78, 0.530), stamp
+                    ),
+                    # This is a desktop obstacle and must not create another
+                    # shelf layer or enter the shared shelf-state cache.
+                    "material_box": observation(
+                        "material_box", (-0.54, 2.30, 0.833), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="pink",
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.layer_contents, ("packaging_box", "brown", "EMPTY"))
 
     def test_fails_closed_when_two_semantics_vote_for_same_layer(self) -> None:
         tracker = ShelfStateTracker(required_votes=3)
@@ -149,6 +182,32 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertIsInstance(executors[1], Task1IntegratedExecutor)
         self.assertIsInstance(executors[2], Task2IntegratedExecutor)
         self.assertIs(executors[1]._memory, executors[2]._memory)
+
+    def test_shared_memory_keeps_only_three_shelf_centers(self) -> None:
+        tracker = ShelfStateTracker(required_votes=3)
+        state = None
+        for index in range(3):
+            stamp = 40.0 + index
+            state = tracker.update(
+                {
+                    "brown": observation("brown", (-2.55, 0.81, 0.837), stamp),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.54, 0.78, 0.530), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="pink",
+            )
+        assert state is not None
+        memory = CompetitionTaskMemory()
+        memory.record_shelf_state(state)
+        self.assertEqual(memory.require_empty_shelf_center(), state.empty_shelf_center_world)
+        self.assertEqual(memory.require_task2_target_center(), state.task2_target_center_world)
+        self.assertEqual(
+            memory.require_task3_packaging_box_center(),
+            state.task3_packaging_box_center_world,
+        )
+        self.assertIsNone(getattr(memory, "material_box_center_world", None))
 
     def test_task2_uses_narrow_shelf_pregrasp_controller(self) -> None:
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())
@@ -364,6 +423,50 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertFalse(result.controls_base)
         self.assertIn("maximum transport height", result.message)
+
+    def test_task2_retracts_arms_after_table_retreat_before_end_navigation(self) -> None:
+        memory = CompetitionTaskMemory(
+            task1_origin_world=(-0.20, 2.30, 0.84),
+            task1_color="brown",
+        )
+        executor = Task2IntegratedExecutor(memory)
+        hold = ArmCommand(
+            spine_position=0.14,
+            head_positions=(0.12, 0.20),
+            left_arm_positions=(0.4, 0.3, 0.2, 0.1, -0.1, -0.2),
+            left_gripper_position=0.0,
+            right_arm_positions=(-0.4, -0.3, -0.2, -0.1, 0.1, 0.2),
+            right_gripper_position=0.0,
+        )
+        context = ExecutionContext(
+            now_s=10.0,
+            instruction={},
+            task_index=2,
+            attempt=1,
+            odometry=_odom(-0.70, 0.55, math.pi / 2.0),
+            joint_states=_arm_joint_state(
+                slide=hold.spine_position,
+                head=hold.head_positions,
+                left=hold.left_arm_positions,
+                right=hold.right_arm_positions,
+            ),
+        )
+        executor.enter_stage(TaskStage.RETURN_TO_END, context)
+        executor._held_arm_command = hold
+        # Simulate that the base retreat has already completed.  The first
+        # return tick must command the retract controller and must not start
+        # end-zone navigation yet.
+        executor._phase = "retract_arms"
+        result = executor.tick(TaskStage.RETURN_TO_END, context)
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertIn("retracting arms", result.message)
+        self.assertFalse(result.controls_base)
+        self.assertIsNotNone(result.arm_command)
+        assert result.arm_command is not None
+        self.assertLess(
+            max(abs(value) for value in result.arm_command.left_arm_positions),
+            max(abs(value) for value in hold.left_arm_positions),
+        )
 
     def test_held_transport_starts_from_preloaded_command_and_keeps_grippers(self) -> None:
         class RecordingKdl:

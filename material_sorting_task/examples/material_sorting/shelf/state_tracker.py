@@ -5,7 +5,8 @@ consumes the world-frame semantic observations already produced by
 ``perception/box_detect.py`` instead of creating another ROS node or another
 set of camera subscriptions.  It keeps the important behaviour of the
 original module: shelf-ROI filtering, carried-object rejection, multi-frame
-voting, calibrated layer centers, and fail-closed empty-layer inference.
+voting, independent occupied-object centers, and fail-closed empty-layer
+inference.  Desktop objects are deliberately outside this state tracker.
 """
 
 from __future__ import annotations
@@ -48,19 +49,46 @@ class ShelfState:
     def colored_center_world(self) -> tuple[float, float, float]:
         center = self.layer_centers_world[self.colored_layer - 1]
         if center is None:
-            raise RuntimeError("colored shelf center is unavailable")
+            raise RuntimeError("task 2 shelf target center is unavailable")
+        return center
+
+    @property
+    def task2_target_center_world(self) -> tuple[float, float, float]:
+        """RGB-D center of the colored object that task 2 must pick.
+
+        This is deliberately distinct from the empty-layer center.  The
+        tracker stores the robust median of the colored object's observed
+        world-frame centers; it must never be replaced by the calibrated
+        shelf center.
+        """
+
+        return self.colored_center_world
+
+    @property
+    def task3_packaging_box_center_world(self) -> tuple[float, float, float]:
+        """RGB-D center of the white cuboid used as task-3 shelf reference."""
+
+        center = self.layer_centers_world[self.white_obstacle_layer - 1]
+        if center is None:
+            raise RuntimeError("task 3 packaging-box center is unavailable")
         return center
 
     @property
     def empty_place_world(self) -> tuple[float, float, float]:
         center = self.layer_centers_world[self.empty_layer - 1]
         if center is None:
-            raise RuntimeError("empty shelf placement center is unavailable")
+            raise RuntimeError("task 1 empty shelf center is unavailable")
         return center
+
+    @property
+    def empty_shelf_center_world(self) -> tuple[float, float, float]:
+        """Calibrated center of the uniquely inferred empty shelf layer."""
+
+        return self.empty_place_world
 
 
 class ShelfStateTracker:
-    """Fuse semantic detections until the two occupied layers are stable."""
+    """Fuse the two shelf objects and infer the unique empty layer."""
 
     SHELF_X_LIMITS = (-2.92, -2.38)
     SHELF_Y_LIMITS = (0.36, 1.20)
@@ -168,29 +196,20 @@ class ShelfStateTracker:
             return None
         empty_layer = empty_candidates.pop()
 
+        # The two occupied-layer centers are independent RGB-D estimates.
+        # Do not snap either object to the shelf center: the colored box is
+        # task 2's pick target and the packaging box is task 3's placement
+        # reference.  A coordinate-wise median rejects the occasional edge
+        # or arm-occlusion frame while preserving the object's measured x/y/z.
         colored_samples = points[(colored_label, colored_layer)]
-        colored_y = _median(point[1] for point in colored_samples)
-        shelf_x = float(self.geometry.shelf_xy[0])
-        colored_center = (
-            shelf_x,
-            colored_y,
-            self.geometry.object_center_z_on_board(
-                colored_layer,
-                half_z=self.COLORED_HALF_Z,
-                support_clearance=self.SUPPORT_CLEARANCE,
-            ),
-        )
-        white_center = (
-            shelf_x,
-            float(self.geometry.shelf_xy[1]),
-            self.geometry.object_center_z_on_board(
-                white_layer,
-                half_z=self.PACKAGING_HALF_Z,
-                support_clearance=self.SUPPORT_CLEARANCE,
-            ),
-        )
+        colored_center = _median_center(colored_samples)
+        packaging_samples = points[("packaging_box", white_layer)]
+        packaging_center = _median_center(packaging_samples)
+
+        # The empty slot has no object center to detect.  Its center is the
+        # calibrated shelf-layer center inferred from the two occupied layers.
         empty_center = (
-            shelf_x,
+            float(self.geometry.shelf_xy[0]),
             float(self.geometry.shelf_xy[1]),
             self.geometry.object_center_z_on_board(
                 empty_layer,
@@ -203,7 +222,7 @@ class ShelfStateTracker:
         contents[colored_layer - 1] = colored_label
         centers[colored_layer - 1] = colored_center
         contents[white_layer - 1] = "packaging_box"
-        centers[white_layer - 1] = white_center
+        centers[white_layer - 1] = packaging_center
         contents[empty_layer - 1] = "EMPTY"
         centers[empty_layer - 1] = empty_center
         vote_confidence = min(colored_count, white_count) / float(len(self._frames))
@@ -257,6 +276,17 @@ def _median(values) -> float:
     if len(ordered) % 2:
         return ordered[middle]
     return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def _median_center(points: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+    """Return an independently fused world-frame center for one shelf class."""
+
+    if not points:
+        raise ValueError("cannot fuse an empty center sample set")
+    return tuple(
+        _median(point[axis] for point in points)
+        for axis in range(3)
+    )
 
 
 __all__ = ["ShelfState", "ShelfStateTracker"]
