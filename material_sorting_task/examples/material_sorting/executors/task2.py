@@ -66,7 +66,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     SHELF_ARM_APPROACH_TIMEOUT_S = 25.0
     SHELF_CENTER_CAMERA_SETTLE_S = 0.80
     SHELF_CENTER_ACQUIRE_TIMEOUT_S = 15.0
-    SHELF_FINAL_LATERAL_TOLERANCE_M = 0.05
+    # A five-centimetre gate was large enough to accept a biased shelf-box
+    # centre and visibly open one arm against the shelf side.  Keep the
+    # generic transfer tolerance unchanged for task 1, but use a tighter
+    # task-2-specific final gate and one bounded re-alignment retry.
+    SHELF_FINAL_LATERAL_TOLERANCE_M = 0.02
     SHELF_PREGRASP_HALF_WIDTH_M = 0.18
     # ALIGN_FOR_PICK now contains two arm moves plus the short base advance;
     # give both the staging and final pregrasp enough time in one stage.
@@ -107,7 +111,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
         self._arm_retract = ArmRetractController()
-        self._target_center_tracker = StableTargetCenterTracker()
+        self._target_center_tracker = StableTargetCenterTracker(
+            require_quality="mask_cloud_cuboid"
+        )
         self._held_center_base: tuple[float, float, float] | None = None
         self._place_world: tuple[float, float, float] | None = None
         self._coarse_target_world: tuple[float, float, float] | None = None
@@ -118,6 +124,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_start: float | None = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._lateral_realign_attempts = 0
 
     def reset(self) -> None:
         super().reset()
@@ -136,6 +143,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_start = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._lateral_realign_attempts = 0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -145,6 +153,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         if stage is TaskStage.NAVIGATE_TO_PICK:
             self._transfer.reset()
             self._target_center_tracker.reset()
+            self._lateral_realign_attempts = 0
             self._coarse_target_world = None
             self._pick_stand_world = None
             self._phase = "navigate_shelf_pick"
@@ -401,6 +410,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 "task 2 locked the detected shelf-box geometric centre at "
                 f"{tuple(round(value, 3) for value in estimate.center_world)} "
                 f"from {estimate.sample_count} inliers; max_dev={deviation}; "
+                f"quality={estimate.quality}; "
                 "preparing safe lateral base alignment",
                 arm_command=self._held_arm_command,
             )
@@ -418,6 +428,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     self.SHELF_YAW,
                     context.odometry,
                     context.now_s,
+                    position_tolerance_m=self.SHELF_FINAL_LATERAL_TOLERANCE_M,
                 ):
                     return StageResult.blocked(
                         "task 2 could not start shelf-box lateral alignment",
@@ -455,6 +466,16 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 target_base = world_to_base(self._locked_target_world, pose)
                 lateral_error = target_base[1]
                 if abs(lateral_error) > self.SHELF_FINAL_LATERAL_TOLERANCE_M:
+                    if self._lateral_realign_attempts < 1:
+                        self._lateral_realign_attempts += 1
+                        self._phase = "align_pick_lateral"
+                        self._motion_started = False
+                        self._transfer.reset()
+                        return StageResult.running(
+                            "task 2 rechecking shelf-box lateral alignment before "
+                            f"approach; residual={lateral_error:+.3f} m",
+                            arm_command=self._held_arm_command,
+                        )
                     return StageResult.blocked(
                         "task 2 refused shelf approach because the detected "
                         f"object is still {lateral_error:+.3f} m off centre",

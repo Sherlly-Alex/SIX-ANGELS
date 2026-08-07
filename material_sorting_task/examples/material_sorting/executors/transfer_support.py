@@ -104,6 +104,7 @@ class TransferMotion:
         self._lateral_heading = 0.0
         self._lateral_phase = "idle"
         self._lateral_start_s: float | None = None
+        self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -126,6 +127,7 @@ class TransferMotion:
         self._lateral_heading = 0.0
         self._lateral_phase = "idle"
         self._lateral_start_s = None
+        self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
 
     def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
         pose = odometry_pose(odometry)
@@ -165,6 +167,8 @@ class TransferMotion:
         final_yaw: float,
         odometry: Any,
         now_s: float,
+        *,
+        position_tolerance_m: float | None = None,
     ) -> bool:
         """Start a bounded shelf-front lateral alignment.
 
@@ -183,9 +187,14 @@ class TransferMotion:
             target_y = float(target_xy[1])
             target_yaw = _wrap_to_pi(float(final_yaw))
             start_s = float(now_s)
+            tolerance = (
+                self.LATERAL_POSITION_TOLERANCE_M
+                if position_tolerance_m is None
+                else float(position_tolerance_m)
+            )
         except (TypeError, ValueError, IndexError):
             return False
-        if pose is None or not all(
+        if pose is None or not math.isfinite(tolerance) or tolerance <= 0.0 or not all(
             math.isfinite(value)
             for value in (target_x, target_y, target_yaw, start_s)
         ):
@@ -198,12 +207,13 @@ class TransferMotion:
 
         self._lateral_target = (target_x, target_y)
         self._lateral_final_yaw = target_yaw
+        self._lateral_position_tolerance_m = tolerance
         self._lateral_heading = (
             math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
         )
         self._lateral_phase = (
             "rotate_final"
-            if abs(target_y - pose[1]) <= self.LATERAL_POSITION_TOLERANCE_M
+            if abs(target_y - pose[1]) <= self._lateral_position_tolerance_m
             else "rotate_lateral"
         )
         self._lateral_start_s = start_s
@@ -246,7 +256,7 @@ class TransferMotion:
 
         if self._lateral_phase == "drive_lateral":
             y_error = target_y - pose[1]
-            if abs(y_error) <= self.LATERAL_POSITION_TOLERANCE_M:
+            if abs(y_error) <= self._lateral_position_tolerance_m:
                 self._lateral_phase = "rotate_final"
             else:
                 # Keep x close to the recorded shelf-front line by applying a

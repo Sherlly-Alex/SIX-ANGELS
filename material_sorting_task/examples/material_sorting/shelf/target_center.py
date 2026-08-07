@@ -26,6 +26,7 @@ class TargetCenterEstimate:
     orientation: str | None
     sample_count: int
     max_axis_deviation: tuple[float, float, float]
+    quality: str | None = None
 
 
 class StableTargetCenterTracker:
@@ -47,6 +48,7 @@ class StableTargetCenterTracker:
             tuple[float, float],
         ] = ((-3.10, -2.20), (0.30, 1.30), (0.30, 1.40)),
         layer_z_gate_m: float = 0.14,
+        require_quality: str | None = None,
     ) -> None:
         if window_size < required_samples:
             raise ValueError("window_size must be at least required_samples")
@@ -63,6 +65,9 @@ class StableTargetCenterTracker:
         self.max_axis_deviation = np.asarray(max_axis_deviation, dtype=float)
         self.shelf_roi = shelf_roi
         self.layer_z_gate_m = float(layer_z_gate_m)
+        self.require_quality = (
+            None if require_quality is None else str(require_quality).strip().lower()
+        )
         if self.max_axis_deviation.shape != (3,) or np.any(
             self.max_axis_deviation <= 0.0
         ):
@@ -72,6 +77,7 @@ class StableTargetCenterTracker:
         ] = deque(maxlen=self.window_size)
         self._accept_after_s = 0.0
         self._last_observation_stamp_s: float | None = None
+        self._quality_rejections = 0
 
     @property
     def sample_count(self) -> int:
@@ -81,6 +87,7 @@ class StableTargetCenterTracker:
         self._samples.clear()
         self._accept_after_s = float(accept_after_s)
         self._last_observation_stamp_s = None
+        self._quality_rejections = 0
 
     def update(
         self,
@@ -97,6 +104,11 @@ class StableTargetCenterTracker:
             return None
         if stamp < self._accept_after_s:
             return None
+        if self.require_quality is not None:
+            quality = str(observation.quality or "").strip().lower()
+            if quality != self.require_quality:
+                self._quality_rejections += 1
+                return None
         if now - stamp > self.max_observation_age_s:
             return None
         if (
@@ -156,10 +168,14 @@ class StableTargetCenterTracker:
             orientation=dominant_orientation(orientations),
             sample_count=int(len(inlier_points)),
             max_axis_deviation=tuple(float(value) for value in axis_deviation),
+            quality=self.require_quality or observation.quality,
         )
 
     def status(self) -> str:
-        return f"center_samples={len(self._samples)}/{self.required_samples}"
+        detail = f"center_samples={len(self._samples)}/{self.required_samples}"
+        if self.require_quality is not None:
+            detail += f" quality={self.require_quality} rejected={self._quality_rejections}"
+        return detail
 
     def _inside_roi(self, point: tuple[float, float, float]) -> bool:
         return all(

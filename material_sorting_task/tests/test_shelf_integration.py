@@ -117,6 +117,21 @@ class ShelfStateTrackerTests(unittest.TestCase):
 
 
 class StableTargetCenterTrackerTests(unittest.TestCase):
+    def test_task2_tracker_rejects_visible_surface_fallbacks(self) -> None:
+        tracker = StableTargetCenterTracker(require_quality="mask_cloud_cuboid")
+        tracker.reset(accept_after_s=10.0)
+        fallback = TargetObservation(
+            color="brown",
+            position_world=(-2.67, 0.81, 0.84),
+            received_at_s=10.2,
+            quality="bbox_depth_center",
+        )
+        self.assertIsNone(
+            tracker.update(fallback, now_s=10.2, reference_layer_z=0.84)
+        )
+        self.assertEqual(tracker.sample_count, 0)
+        self.assertIn("quality=mask_cloud_cuboid", tracker.status())
+
     def test_locks_full_object_center_and_rejects_one_spatial_outlier(self) -> None:
         tracker = StableTargetCenterTracker()
         tracker.reset(accept_after_s=10.5)

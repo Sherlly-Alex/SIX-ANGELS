@@ -51,6 +51,11 @@ class TargetObservation:
     received_at_s: float
     orientation: str | None = None
     score: float = 0.0
+    # ``mask_cloud_cuboid`` means the detector had enough same-colour RGB-D
+    # points to fit the complete box.  ``bbox_depth_center`` is the visible
+    # surface fallback and is deliberately not suitable for a final shelf
+    # grasp lock.  Older producers may leave this unset.
+    quality: str | None = None
 
 
 @dataclass(frozen=True)
