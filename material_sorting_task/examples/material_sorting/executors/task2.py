@@ -69,6 +69,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # through the shelf side wall.
     SHELF_CAMERA_STAGE_TIMEOUT_S = 20.0
     SHELF_CENTER_ACQUIRE_TIMEOUT_S = 15.0
+    # Bound the final straight shelf approach separately from the camera
+    # staging and centre-lock windows.  This constant is consumed after the
+    # RGB-D centre has been locked and the base starts advancing.
+    SHELF_ARM_APPROACH_TIMEOUT_S = 30.0
     # A five-centimetre gate was large enough to accept a biased shelf-box
     # centre and visibly open one arm against the shelf side.  Keep the
     # generic transfer tolerance unchanged for task 1, but use a tighter
