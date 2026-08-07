@@ -52,6 +52,8 @@ Implemented flow:
    until the detected center reaches the verified 0.75 m base-frame reach.
    Shelf pregrasp uses a narrower symmetric 0.18 m half-width; contact width is
    still derived from the box orientation. It then performs the shelf grasp and
+   After the straight final approach, it repeats the shelf-row/yaw check once
+   to remove odometry drift before the final arm pregrasp. It then performs the
    bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
    and raises the spine to the maximum transport height while stationary. The
    successful shelf grasp is then kept completely unchanged: there is no

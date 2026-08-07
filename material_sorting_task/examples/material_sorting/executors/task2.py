@@ -131,6 +131,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         self._phase_started_s = 0.0
         self._lateral_realign_attempts = 0
+        self._post_approach_realign_attempts = 0
 
     def reset(self) -> None:
         super().reset()
@@ -150,6 +151,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         self._phase_started_s = 0.0
         self._lateral_realign_attempts = 0
+        self._post_approach_realign_attempts = 0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -160,6 +162,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._transfer.reset()
             self._target_center_tracker.reset()
             self._lateral_realign_attempts = 0
+            self._post_approach_realign_attempts = 0
             self._coarse_target_world = None
             self._pick_stand_world = None
             self._phase = "navigate_shelf_pick"
@@ -499,14 +502,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                         arm_command=self._held_arm_command,
                     )
                 if distance <= 0.015:
-                    self._phase = "final_pregrasp"
+                    self._phase = "post_approach_alignment"
                     self._motion_started = False
-                    self._pregrasp.reset()
-                    # The inherited controller measures its timeout from the
-                    # beginning of ALIGN_FOR_PICK.  Camera settling and base
-                    # alignment are separate bounded phases, so give the
-                    # final object-centred IK move its own timeout window.
-                    self._stage_started_s = float(context.now_s)
+                    self._transfer.reset()
                 elif not self._transfer.begin_advance(
                     context.odometry, distance
                 ):
@@ -537,10 +535,77 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                         base_command=command,
                         arm_command=self._held_arm_command,
                     )
+                self._phase = "post_approach_alignment"
+                self._motion_started = False
+                self._transfer.reset()
+
+        if self._phase == "post_approach_alignment":
+            # The straight approach preserves its initial heading, but wheel
+            # odometry can still accumulate a few centimetres of lateral drift
+            # over the final 0.4 m.  Re-run the strict shelf-front alignment
+            # after that segment, immediately before the arm IK pregrasp.
+            pose = odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "task 2 waiting for odometry before final shelf-centre recheck",
+                    arm_command=self._held_arm_command,
+                )
+            if not self._motion_started:
+                if not self._transfer.begin_lateral_alignment(
+                    (pose[0], self._locked_target_world[1]),
+                    self.SHELF_YAW,
+                    context.odometry,
+                    context.now_s,
+                    position_tolerance_m=self.SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M,
+                    yaw_tolerance_rad=self.SHELF_FINAL_YAW_TOLERANCE_RAD,
+                ):
+                    return StageResult.blocked(
+                        "task 2 could not start the final post-approach centre recheck",
+                        arm_command=self._held_arm_command,
+                    )
+                self._motion_started = True
+            status, command, detail = self._transfer.tick_lateral_alignment(
+                context.odometry, context.now_s
+            )
+            if status is NavigationStatus.GOAL_REACHED:
+                target_base = world_to_base(self._locked_target_world, pose)
+                if abs(target_base[1]) > self.SHELF_FINAL_LATERAL_TOLERANCE_M:
+                    if self._post_approach_realign_attempts < 1:
+                        self._post_approach_realign_attempts += 1
+                        self._motion_started = False
+                        self._transfer.reset()
+                        return StageResult.running(
+                            "task 2 repeating the post-approach centre recheck; "
+                            f"residual={target_base[1]:+.3f} m",
+                            arm_command=self._held_arm_command,
+                        )
+                    return StageResult.blocked(
+                        "task 2 final shelf-centre recheck remains off centre; "
+                        f"target_base=({target_base[0]:.3f}, {target_base[1]:.3f}, "
+                        f"{target_base[2]:.3f}), pose_yaw={pose[2]:.3f}, "
+                        f"yaw_error={_wrap_angle(self.SHELF_YAW - pose[2]):+.3f}",
+                        arm_command=self._held_arm_command,
+                    )
                 self._phase = "final_pregrasp"
                 self._motion_started = False
+                self._transfer.reset()
                 self._pregrasp.reset()
+                # The inherited controller measures its timeout from the
+                # beginning of ALIGN_FOR_PICK.  Camera settling and base
+                # alignment are separate bounded phases, so give the final
+                # object-centred IK move its own timeout window.
                 self._stage_started_s = float(context.now_s)
+            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                return StageResult.blocked(
+                    f"task 2 final post-approach centre recheck stopped: {detail}",
+                    arm_command=self._held_arm_command,
+                )
+            else:
+                return StageResult.running(
+                    f"task 2 correcting final base drift before shelf pregrasp; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
 
         if self._phase == "final_pregrasp":
             result = super().tick(TaskStage.ALIGN_FOR_PICK, context)
