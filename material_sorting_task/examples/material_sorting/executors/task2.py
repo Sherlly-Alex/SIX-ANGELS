@@ -71,6 +71,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # generic transfer tolerance unchanged for task 1, but use a tighter
     # task-2-specific final gate and one bounded re-alignment retry.
     SHELF_FINAL_LATERAL_TOLERANCE_M = 0.02
+    # The final lateral check is performed in the robot frame.  A residual
+    # yaw error projects the forward target distance into that lateral axis,
+    # so task 2 needs a stricter yaw and world-row tolerance than the generic
+    # shelf placement motion used by task 1.
+    SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M = 0.008
+    SHELF_FINAL_YAW_TOLERANCE_RAD = 0.015
     SHELF_PREGRASP_HALF_WIDTH_M = 0.18
     # ALIGN_FOR_PICK now contains two arm moves plus the short base advance;
     # give both the staging and final pregrasp enough time in one stage.
@@ -428,7 +434,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     self.SHELF_YAW,
                     context.odometry,
                     context.now_s,
-                    position_tolerance_m=self.SHELF_FINAL_LATERAL_TOLERANCE_M,
+                    position_tolerance_m=self.SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M,
+                    yaw_tolerance_rad=self.SHELF_FINAL_YAW_TOLERANCE_RAD,
                 ):
                     return StageResult.blocked(
                         "task 2 could not start shelf-box lateral alignment",
@@ -478,7 +485,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                         )
                     return StageResult.blocked(
                         "task 2 refused shelf approach because the detected "
-                        f"object is still {lateral_error:+.3f} m off centre",
+                        f"object is still {lateral_error:+.3f} m off centre; "
+                        f"target_base=({target_base[0]:.3f}, {target_base[1]:.3f}, "
+                        f"{target_base[2]:.3f}), pose_yaw={pose[2]:.3f}, "
+                        f"yaw_error={_wrap_angle(self.SHELF_YAW - pose[2]):+.3f}",
                         arm_command=self._held_arm_command,
                     )
                 distance = target_base[0] - self.PICK_TARGET_BASE_X
@@ -1365,6 +1375,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
             self._slide_applied = True
         return None
+
+
+def _wrap_angle(angle: float) -> float:
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 __all__ = ["Task2Executor", "Task2IntegratedExecutor"]

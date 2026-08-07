@@ -105,6 +105,7 @@ class TransferMotion:
         self._lateral_phase = "idle"
         self._lateral_start_s: float | None = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
+        self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -128,6 +129,7 @@ class TransferMotion:
         self._lateral_phase = "idle"
         self._lateral_start_s = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
+        self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
 
     def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
         pose = odometry_pose(odometry)
@@ -169,6 +171,7 @@ class TransferMotion:
         now_s: float,
         *,
         position_tolerance_m: float | None = None,
+        yaw_tolerance_rad: float | None = None,
     ) -> bool:
         """Start a bounded shelf-front lateral alignment.
 
@@ -192,11 +195,23 @@ class TransferMotion:
                 if position_tolerance_m is None
                 else float(position_tolerance_m)
             )
+            yaw_tolerance = (
+                self.LATERAL_YAW_TOLERANCE_RAD
+                if yaw_tolerance_rad is None
+                else float(yaw_tolerance_rad)
+            )
         except (TypeError, ValueError, IndexError):
             return False
-        if pose is None or not math.isfinite(tolerance) or tolerance <= 0.0 or not all(
-            math.isfinite(value)
-            for value in (target_x, target_y, target_yaw, start_s)
+        if (
+            pose is None
+            or not math.isfinite(tolerance)
+            or tolerance <= 0.0
+            or not math.isfinite(yaw_tolerance)
+            or yaw_tolerance <= 0.0
+            or not all(
+                math.isfinite(value)
+                for value in (target_x, target_y, target_yaw, start_s)
+            )
         ):
             return False
         if abs(target_x - pose[0]) > self.LATERAL_X_TOLERANCE_M:
@@ -208,6 +223,7 @@ class TransferMotion:
         self._lateral_target = (target_x, target_y)
         self._lateral_final_yaw = target_yaw
         self._lateral_position_tolerance_m = tolerance
+        self._lateral_yaw_tolerance_rad = yaw_tolerance
         self._lateral_heading = (
             math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
         )
@@ -245,7 +261,7 @@ class TransferMotion:
         target_x, target_y = self._lateral_target
         if self._lateral_phase == "rotate_lateral":
             yaw_error = _wrap_to_pi(self._lateral_heading - pose[2])
-            if abs(yaw_error) <= self.LATERAL_YAW_TOLERANCE_RAD:
+            if abs(yaw_error) <= self._lateral_yaw_tolerance_rad:
                 self._lateral_phase = "drive_lateral"
             else:
                 angular = max(-0.35, min(0.35, 1.4 * yaw_error))
@@ -280,7 +296,7 @@ class TransferMotion:
 
         if self._lateral_phase == "rotate_final":
             yaw_error = _wrap_to_pi(self._lateral_final_yaw - pose[2])
-            if abs(yaw_error) <= self.LATERAL_YAW_TOLERANCE_RAD:
+            if abs(yaw_error) <= self._lateral_yaw_tolerance_rad:
                 self._lateral_phase = "done"
                 return NavigationStatus.GOAL_REACHED, (0.0, 0.0), (
                     "lateral alignment complete; shelf-facing yaw restored"

@@ -60,8 +60,9 @@ Implemented flow:
    column derived from the saved task-1 origin, turns only west-to-north there,
    and advances straight to the south table entry before final placement. This
    ordering keeps the extended payload away from the east wall. The task-2
-   lateral gate is 0.02 m, with one bounded re-alignment retry before failing
-   closed. Every straight
+   final robot-frame lateral gate is 0.02 m; its shelf-row alignment uses an
+   8 mm world-row tolerance and a 0.015 rad final-yaw tolerance, with one
+   bounded re-alignment retry before failing closed. Every straight
    translation and in-place turn is rejected before motion if its swept
    body/arm/box envelope intersects the shelf or perimeter walls, and the same
    envelope is predicted over every live velocity command. The table-entry and

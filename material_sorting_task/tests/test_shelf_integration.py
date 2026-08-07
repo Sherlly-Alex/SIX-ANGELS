@@ -343,6 +343,25 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(status, NavigationStatus.GOAL_REACHED)
         self.assertEqual(command, (0.0, 0.0))
 
+    def test_transfer_lateral_alignment_accepts_task_specific_yaw_tolerance(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 0.85),
+                math.pi,
+                _odom(-1.30, 0.85, math.pi - 0.02),
+                0.0,
+                position_tolerance_m=0.008,
+                yaw_tolerance_rad=0.015,
+            )
+        )
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.85, math.pi - 0.02), 0.05
+        )
+        self.assertEqual(status, NavigationStatus.NAVIGATING)
+        self.assertEqual(command[0], 0.0)
+        self.assertIn("restoring shelf-facing yaw", detail)
+
     def test_arm_retract_targets_neutral_posture_and_waits_for_stability(self) -> None:
         controller = ArmRetractController()
         hold = ArmCommand(
