@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import math
 
+from control_types import ArmCommand
 from desktop_grasp.pregrasp_core import (
+    GRIPPER_OPEN,
+    HAND_Z_OFFSET,
     PregraspInputError,
     PregraspPlanningError,
     SPINE_MIN,
+    SPINE_MAX,
+    SPINE_REFERENCE_Z,
+    _joint_maps,
     SlideLiftController,
 )
 from executors.base import (
@@ -57,6 +63,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # the verified dual-arm reach without reading a Server object coordinate.
     PICK_TARGET_BASE_X = 0.75
     SHELF_CENTER_CAMERA_SETTLE_S = 0.80
+    # Move only the spine to the coarse shelf layer before locking the fresh
+    # RGB-D centre.  The two arm chains remain in the neutral transport pose;
+    # this changes the camera/hand height without sweeping an open gripper
+    # through the shelf side wall.
+    SHELF_CAMERA_STAGE_TIMEOUT_S = 20.0
     SHELF_CENTER_ACQUIRE_TIMEOUT_S = 15.0
     # A five-centimetre gate was large enough to accept a biased shelf-box
     # centre and visibly open one arm against the shelf side.  Keep the
@@ -129,6 +140,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._phase_started_s = 0.0
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
+        self._camera_target_slide: float | None = None
 
     def reset(self) -> None:
         super().reset()
@@ -148,6 +160,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._phase_started_s = 0.0
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
+        self._camera_target_slide = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -165,19 +178,23 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         elif stage is TaskStage.ALIGN_FOR_PICK:
             # Keep the arms in the neutral transport posture while the base
             # approaches.  The camera can already see the shelf box from the
-            # far stand; extending the arms before the base moves would make
+            # far stand, but the target layer may be hidden by a shelf board.
+            # Stage only the spine to that layer before collecting the fresh
+            # centre; extending the arms before the base moves would make
             # their fixed joint pose sweep toward the shelf as the chassis
             # advances.  The real pregrasp is planned only after the base has
             # reached and turned at the final grab stand.
             self._pregrasp.reset()
+            self._slide_hold.reset()
             self._transfer.reset()
             self._pick_stand_world = None
+            self._camera_target_slide = None
             self._target_center_tracker.reset(
                 accept_after_s=(
                     float(context.now_s) + self.SHELF_CENTER_CAMERA_SETTLE_S
                 )
             )
-            self._phase = "acquire_center"
+            self._phase = "stage_camera"
             self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
@@ -328,6 +345,96 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             return StageResult.blocked(
                 "task 2 shelf alignment has no coarse target",
                 arm_command=self._held_arm_command,
+            )
+
+        if self._phase == "stage_camera":
+            # The task-1 return sequence normally leaves the controller's
+            # cached arm command at the neutral transport pose.  On a fresh
+            # retry it can be empty, so construct the same safe pose from
+            # measured joints before moving the spine.
+            if self._held_arm_command is None:
+                try:
+                    self._held_arm_command = self._neutral_transport_command(
+                        context.joint_states
+                    )
+                except PregraspInputError as exc:
+                    elapsed = max(
+                        0.0, float(context.now_s) - self._phase_started_s
+                    )
+                    if elapsed >= self.SHELF_CAMERA_STAGE_TIMEOUT_S:
+                        return StageResult.blocked(
+                            f"task 2 could not stage the camera safely: {exc}",
+                            arm_command=self._held_arm_command,
+                        )
+                    return StageResult.running(
+                        f"task 2 waiting for joint feedback before camera staging: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+
+            if self._camera_target_slide is None:
+                # ``coarse_target_world`` is the shelf-state estimate of the
+                # target layer.  It is used only to choose height; the final
+                # XY grasp centre still comes from fresh RGB-D observations.
+                target_z = float(self._coarse_target_world[2])
+                self._camera_target_slide = float(
+                    max(
+                        SPINE_MIN,
+                        min(
+                            SPINE_MAX,
+                            SPINE_REFERENCE_Z - (target_z + HAND_Z_OFFSET),
+                        ),
+                    )
+                )
+                try:
+                    self._held_arm_command = self._slide_hold.plan(
+                        self._held_arm_command,
+                        self._camera_target_slide,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"task 2 could not plan target-layer camera staging: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+
+            try:
+                command, reached, detail = self._slide_hold.update(
+                    context.now_s,
+                    context.joint_states,
+                )
+            except (PregraspInputError, PregraspPlanningError) as exc:
+                return StageResult.blocked(
+                    f"task 2 target-layer camera staging failed: {exc}",
+                    arm_command=self._held_arm_command,
+                )
+            self._held_arm_command = command
+            if not reached:
+                elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+                if elapsed >= self.SHELF_CAMERA_STAGE_TIMEOUT_S:
+                    return StageResult.blocked(
+                        "task 2 target-layer camera staging timed out: " + detail,
+                        arm_command=command,
+                    )
+                return StageResult.running(
+                    "task 2 moving the retracted arms to the target shelf layer; "
+                    + detail,
+                    arm_command=command,
+                )
+
+            # Reset the freshness gate after the mechanical motion has
+            # settled; otherwise the last frame from the low transport pose
+            # can be accepted as the first target-centre sample.
+            self._phase = "acquire_center"
+            self._phase_started_s = float(context.now_s)
+            self._target_center_tracker.reset(
+                accept_after_s=(
+                    float(context.now_s) + self.SHELF_CENTER_CAMERA_SETTLE_S
+                )
+            )
+            return StageResult.running(
+                "task 2 reached the target shelf layer with arms retracted; "
+                "waiting for the settled RGB-D target view",
+                arm_command=command,
             )
 
         if self._phase == "acquire_center":
@@ -607,6 +714,34 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         return StageResult.blocked(
             f"task 2 invalid shelf-pick alignment phase {self._phase!r}",
             arm_command=self._held_arm_command,
+        )
+
+    @staticmethod
+    def _neutral_transport_command(joint_states) -> ArmCommand:
+        """Build the verified retracted arm pose from current feedback.
+
+        Task 2 has its own executor instance, so its inherited
+        ``_held_arm_command`` starts empty even though the controller may
+        have just finished task 1's retract sequence.  Use measured head
+        angles to avoid moving the camera unnecessarily, and use the same
+        zero-arm/zero-gripper transport posture as ``ArmRetractController``.
+        """
+
+        positions, _velocities = _joint_maps(joint_states)
+        return ArmCommand(
+            spine_position=float(ArmRetractController.TRANSPORT_SPINE),
+            head_positions=(
+                float(positions.get("head_yaw_joint", 0.0)),
+                float(positions.get("head_pitch_joint", 0.0)),
+            ),
+            left_arm_positions=tuple(
+                float(value) for value in ArmRetractController.TRANSPORT_ARM
+            ),
+            left_gripper_position=float(GRIPPER_OPEN),
+            right_arm_positions=tuple(
+                float(value) for value in ArmRetractController.TRANSPORT_ARM
+            ),
+            right_gripper_position=float(GRIPPER_OPEN),
         )
 
     @classmethod

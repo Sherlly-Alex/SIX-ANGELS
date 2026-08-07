@@ -290,7 +290,7 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
             attempt=1,
         )
         executor.enter_stage(TaskStage.ALIGN_FOR_PICK, context)
-        self.assertEqual(executor._phase, "acquire_center")
+        self.assertEqual(executor._phase, "stage_camera")
         self.assertFalse(executor._pregrasp.planned)
 
     def test_place_stand_preserves_held_object_transform(self) -> None:
