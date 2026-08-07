@@ -44,7 +44,7 @@ Implemented flow:
    bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
    and raises the spine to the maximum transport height while stationary. Before
    the base turns, a grasp-preserving controller moves the held center inward
-   through small synchronized dual-arm IK waypoints. It starts from the last
+   through four small synchronized dual-arm IK waypoints. It starts from the last
    commanded preload and keeps the grippers, half-width and spine command
    unchanged. Transport then follows separate shelf-to-corridor,
    corridor-to-table-entry and table-entry-to-placement segments. Each segment

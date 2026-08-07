@@ -67,11 +67,11 @@ class HeldTransportController:
     waypoints that translate the box centre toward the robot.
     """
 
-    # 0.46 m remains reachable across the observed shelf-centre lateral error
-    # range and adds useful wall margin compared with the old 0.75 m reach.
-    TARGET_CENTER_X_M = 0.46
+    # 0.50 m is the least-invasive compact pose that still clears the east
+    # wall on the right-hand table route with the carried-envelope checker.
+    TARGET_CENTER_X_M = 0.50
     TARGET_CENTER_Y_M = 0.0
-    MAX_CENTER_STEP_M = 0.06
+    COMPACT_WAYPOINT_COUNT = 4
     COMMAND_RATE_PER_S = 0.45
     ARM_POSITION_TOL = 0.16
     MAX_JOINT_WAYPOINT_DELTA = 0.75
@@ -90,6 +90,8 @@ class HeldTransportController:
             or self.target_center_x_m <= 0.0
         ):
             raise ValueError("transport target center x must be finite and positive")
+        if self.COMPACT_WAYPOINT_COUNT < 1:
+            raise ValueError("transport compact waypoint count must be positive")
         self._kdl = kdl or MMK2Kdl()
         self._targets: list[np.ndarray] = []
         self._centers: list[tuple[float, float, float]] = []
@@ -144,8 +146,7 @@ class HeldTransportController:
             ],
             dtype=float,
         )
-        center_distance = float(np.linalg.norm(final_center[:2] - start_center[:2]))
-        steps = max(1, int(math.ceil(center_distance / self.MAX_CENTER_STEP_M)))
+        steps = self.COMPACT_WAYPOINT_COUNT
         reference = np.array(
             [
                 hold_command.spine_position,

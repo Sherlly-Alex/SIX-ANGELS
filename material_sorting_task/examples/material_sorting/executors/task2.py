@@ -87,7 +87,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # clear of the shelf, table and both side walls for either randomized
     # table source slot.  A second segment approaches the table from its south
     # side, so the payload never sweeps through the east wall while turning.
-    TRANSPORT_CENTER_X_M = 0.46
+    TRANSPORT_CENTER_X_M = 0.50
     TRANSPORT_CORRIDOR_X = -0.72
     TRANSPORT_CORRIDOR_Y = 0.82
     TABLE_APPROACH_Y = 1.35

@@ -364,12 +364,12 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         first = controller.plan(hold, (0.76, 0.03, 1.34), 0.118)
 
         self.assertEqual(first, hold)
-        self.assertGreaterEqual(controller.waypoint_count, 4)
+        self.assertEqual(controller.waypoint_count, 4)
         self.assertEqual(len(kdl.calls), controller.waypoint_count)
         self.assertAlmostEqual(kdl.calls[0][3], SPINE_MIN, places=6)
         self.assertAlmostEqual(first.left_gripper_position, 0.83, places=6)
         self.assertAlmostEqual(first.right_gripper_position, 0.79, places=6)
-        self.assertEqual(controller.target_center_base, (0.46, 0.0, 1.34))
+        self.assertEqual(controller.target_center_base, (0.5, 0.0, 1.34))
 
     def test_carried_envelope_rejects_extended_direct_turn(self) -> None:
         checker = CarriedEnvelopeChecker()
@@ -398,7 +398,7 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
     def test_compact_segmented_task2_routes_pass_carried_envelope(self) -> None:
         checker = CarriedEnvelopeChecker()
         motion = TransferMotion()
-        held = (0.46, 0.0, 1.34)
+        held = (0.50, 0.0, 1.34)
         half_width = 0.118
         segments = (
             (
