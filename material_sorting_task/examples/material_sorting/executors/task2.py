@@ -27,7 +27,6 @@ from executors.transfer_support import (
 from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from shelf.manipulation import (
-    HeldTransportController,
     ReleaseSpreadController,
     ShelfOpenPregraspController,
     SlideHoldController,
@@ -81,16 +80,15 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     TABLE_RETREAT_M = 0.35
     PLACE_CLEARANCE_M = 0.055
     PLACE_TIMEOUT_S = 25.0
-    TRANSPORT_COMPACT_TIMEOUT_S = 30.0
-    # After the shelf retreat, first shorten the forward arm/payload envelope
-    # without changing the bilateral preload.  The fixed corridor waypoint is
-    # clear of the shelf, table and both side walls for either randomized
-    # table source slot.  A second segment approaches the table from its south
-    # side, so the payload never sweeps through the east wall while turning.
-    TRANSPORT_CENTER_X_M = 0.50
-    TRANSPORT_CORRIDOR_X = -0.72
-    TRANSPORT_CORRIDOR_Y = 0.82
+    TRANSPORT_SEGMENT_TIMEOUT_S = 30.0
+    # Keep the successful shelf grasp completely unchanged during transport.
+    # While still facing west, reverse east along the shelf aisle until the
+    # base reaches the task-1 table column.  Rotating west -> north there keeps
+    # the extended payload's sweep on the room side instead of toward the east
+    # wall.  A final northbound straight segment reaches the table entry.
+    TABLE_ENTRY_MARGIN_M = 0.25
     TABLE_APPROACH_Y = 1.35
+    TABLE_FINAL_LATERAL_TOLERANCE_M = 0.05
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         # Eight centimetres clears the source board while keeping the box
@@ -104,9 +102,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._memory = memory
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
-        self._held_transport = HeldTransportController(
-            target_center_x_m=self.TRANSPORT_CENTER_X_M
-        )
         self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
         self._target_center_tracker = StableTargetCenterTracker()
@@ -125,7 +120,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().reset()
         self._transfer.reset()
         self._slide_hold.reset()
-        self._held_transport.reset()
         self._release.reset()
         self._target_center_tracker.reset()
         self._held_center_base = None
@@ -174,7 +168,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         elif stage is TaskStage.TRANSPORT:
             self._transfer.reset()
             self._slide_hold.reset()
-            self._held_transport.reset()
             self._phase = "retreat_shelf"
             self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.RETURN_TO_END:
@@ -231,7 +224,6 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().cancel(reason)
         self._transfer.reset()
         self._slide_hold.reset()
-        self._held_transport.reset()
         self._release.reset()
         self._pregrasp.reset()
         self._staged_target_world = None
@@ -549,7 +541,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._place_world = self._memory.require_task1_origin()
         if self._phase == "retreat_shelf":
             if not self._motion_started:
-                if not self._transfer.begin_retreat(context.odometry, self.SHELF_RETREAT_M):
+                if not self._transfer.begin_retreat(
+                    context.odometry,
+                    self.SHELF_RETREAT_M,
+                    heading_yaw=self.SHELF_YAW,
+                ):
                     return StageResult.running(
                         "task 2 waiting for odometry before shelf retreat",
                         arm_command=self._held_arm_command,
@@ -592,161 +588,268 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
             if result is not None:
                 return result
-            # Do not turn with the shelf-pick reach still extended.  Re-solve
-            # both arms through short IK waypoints while retaining exactly the
-            # last bilateral preload, gripper commands and maximum spine pose.
-            self._phase = "compact_transport_hold"
+            # Do not change either arm after the successful shelf grasp.  The
+            # box is carried in exactly the measured post-lift pose; clearance
+            # is created entirely by the segmented base route below.
+            self._phase = "reverse_to_table_column"
             self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "compact_transport_hold":
-            if not self._held_transport.planned:
-                try:
-                    self._held_arm_command = self._held_transport.plan(
-                        self._held_arm_command,
-                        self._held_center_base,
-                        self._held_half_width(),
-                    )
-                except (PregraspInputError, PregraspPlanningError, RuntimeError) as exc:
-                    return StageResult.blocked(
-                        f"task 2 could not plan the grasp-preserving transport pose: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._held_transport.update(
-                    context.now_s, context.joint_states
-                )
-            except (PregraspInputError, PregraspPlanningError) as exc:
-                return StageResult.blocked(
-                    f"task 2 grasp-preserving transport control failed: {exc}",
-                    arm_command=self._held_arm_command,
-                )
-            self._held_arm_command = command
-            if not reached:
-                elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
-                if elapsed >= self.TRANSPORT_COMPACT_TIMEOUT_S:
-                    return StageResult.blocked(
-                        "task 2 timed out while compacting the held-box "
-                        f"transport pose after {elapsed:.1f}s: {detail}",
-                        arm_command=command,
-                    )
-                return StageResult.running(
-                    "task 2 keeping bilateral preload while drawing the held "
-                    f"box into the transport envelope; {detail}",
-                    arm_command=command,
-                )
-            compact_center = self._held_transport.target_center_base
-            if compact_center is None:
-                return StageResult.blocked(
-                    "task 2 compact transport controller lost its held-box transform",
-                    arm_command=command,
-                )
-            self._held_center_base = compact_center
-            pose = odometry_pose(context.odometry)
-            if pose is None:
-                return StageResult.running(
-                    "task 2 compact transport pose reached; waiting for odometry",
-                    arm_command=command,
-                )
-            envelope = self._carried_envelope.check_pose(
-                pose, self._held_center_base, self._held_half_width()
+        if self._phase == "reverse_to_table_column":
+            final_x, _final_y = stand_from_held_center(
+                self._place_world, self._held_center_base, self.TABLE_YAW
             )
-            if not envelope.safe:
-                return StageResult.blocked(
-                    "task 2 compact transport pose is not clear for base motion: "
-                    + envelope.detail,
-                    arm_command=command,
-                )
-            self._phase = "navigate_transport_corridor"
-            self._motion_started = False
-            self._transfer.reset()
-
-        if self._phase == "navigate_transport_corridor":
             if not self._motion_started:
                 pose = odometry_pose(context.odometry)
                 if pose is None:
                     return StageResult.running(
-                        "task 2 waiting for odometry before the carried-box corridor",
+                        "task 2 waiting for odometry before the table-column reverse",
+                        arm_command=self._held_arm_command,
+                    )
+                yaw_error = math.atan2(
+                    math.sin(self.SHELF_YAW - pose[2]),
+                    math.cos(self.SHELF_YAW - pose[2]),
+                )
+                if abs(yaw_error) > 0.15:
+                    return StageResult.blocked(
+                        "task 2 refused the table-column reverse because the "
+                        f"base is not facing west: yaw_error={yaw_error:.3f}",
+                        arm_command=self._held_arm_command,
+                    )
+                distance = final_x - pose[0]
+                if distance < -0.04:
+                    return StageResult.blocked(
+                        "task 2 table column is behind the permitted reverse "
+                        f"direction: current_x={pose[0]:.3f}, target_x={final_x:.3f}",
+                        arm_command=self._held_arm_command,
+                    )
+                if distance <= 0.015:
+                    self._phase = "rotate_to_table"
+                    self._phase_started_s = float(context.now_s)
+                    self._transfer.reset()
+                else:
+                    rotation_safety = self._carried_envelope.check_rotation(
+                        pose,
+                        self.SHELF_YAW,
+                        self._held_center_base,
+                        self._held_half_width(),
+                    )
+                    if not rotation_safety.safe:
+                        return StageResult.blocked(
+                            "task 2 rejected west-heading correction before "
+                            "the table-column reverse: " + rotation_safety.detail,
+                            arm_command=self._held_arm_command,
+                        )
+                    checked_pose = (pose[0], pose[1], self.SHELF_YAW)
+                    end_xy = (final_x, pose[1])
+                    safety = self._carried_envelope.check_fixed_heading_translation(
+                        checked_pose,
+                        end_xy,
+                        self._held_center_base,
+                        self._held_half_width(),
+                    )
+                    if not safety.safe:
+                        return StageResult.blocked(
+                            "task 2 rejected the table-column reverse before motion: "
+                            + safety.detail,
+                            arm_command=self._held_arm_command,
+                        )
+                    if not self._transfer.begin_retreat(
+                        context.odometry,
+                        distance,
+                        heading_yaw=self.SHELF_YAW,
+                    ):
+                        return StageResult.running(
+                            "task 2 waiting to start the table-column reverse",
+                            arm_command=self._held_arm_command,
+                        )
+                    self._motion_started = True
+            if self._phase == "reverse_to_table_column":
+                done, command, detail = self._transfer.tick_retreat(context.odometry)
+                safe, safety_detail = self._guard_carried_command(context, command)
+                if not safe:
+                    return StageResult.blocked(
+                        "task 2 table-column reverse stopped safely: " + safety_detail,
+                        arm_command=self._held_arm_command,
+                    )
+                if not done:
+                    elapsed = max(
+                        0.0, float(context.now_s) - self._phase_started_s
+                    )
+                    if elapsed >= self.TRANSPORT_SEGMENT_TIMEOUT_S:
+                        return StageResult.blocked(
+                            "task 2 table-column reverse timed out after "
+                            f"{elapsed:.1f}s: {detail}",
+                            arm_command=self._held_arm_command,
+                        )
+                    return StageResult.running(
+                        "task 2 preserving the shelf grasp while reversing "
+                        f"toward table column x={final_x:.3f}; {detail}; "
+                        f"{safety_detail}",
+                        base_command=command,
+                        arm_command=self._held_arm_command,
+                    )
+                self._phase = "rotate_to_table"
+                self._phase_started_s = float(context.now_s)
+                self._motion_started = False
+                self._transfer.reset()
+
+        if self._phase == "rotate_to_table":
+            if not self._motion_started:
+                pose = odometry_pose(context.odometry)
+                if pose is None:
+                    return StageResult.running(
+                        "task 2 waiting for odometry before the table-facing turn",
+                        arm_command=self._held_arm_command,
+                    )
+                safety = self._carried_envelope.check_rotation(
+                    pose,
+                    self.TABLE_YAW,
+                    self._held_center_base,
+                    self._held_half_width(),
+                )
+                if not safety.safe:
+                    return StageResult.blocked(
+                        "task 2 rejected the west-to-north table turn before "
+                        "motion: " + safety.detail,
                         arm_command=self._held_arm_command,
                     )
                 goal = NavigationGoal(
-                    x=self.TRANSPORT_CORRIDOR_X,
-                    y=self.TRANSPORT_CORRIDOR_Y,
-                    yaw=0.0,
-                    position_tolerance=0.08,
+                    x=pose[0],
+                    y=pose[1],
+                    yaw=self.TABLE_YAW,
+                    position_tolerance=0.07,
                     yaw_tolerance=0.07,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_TABLE,
-                    source_tag="task2_carried_box_corridor",
+                    source_tag="task2_extended_hold_table_turn",
                 )
-                started, safety = self._begin_carried_navigation(
-                    goal, context, "shelf-to-corridor segment"
-                )
-                if not started:
-                    return StageResult.blocked(safety, arm_command=self._held_arm_command)
+                if not self._transfer.begin_navigation(goal, context.odometry):
+                    return StageResult.blocked(
+                        "task 2 could not start the table-facing in-place turn",
+                        arm_command=self._held_arm_command,
+                    )
                 self._motion_started = True
             status, command, detail = self._tick_carried_navigation(
-                context, "shelf-to-corridor segment"
+                context, "west-to-north table turn"
             )
             if status is NavigationStatus.GOAL_REACHED:
-                self._phase = "navigate_table_mid"
+                self._phase = "advance_to_table_entry"
+                self._phase_started_s = float(context.now_s)
                 self._motion_started = False
                 self._transfer.reset()
             elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
                 return StageResult.blocked(
-                    f"task 2 carried-box corridor navigation stopped safely: {detail}",
+                    f"task 2 table-facing turn stopped safely: {detail}",
                     arm_command=self._held_arm_command,
                 )
             else:
                 return StageResult.running(
-                    "task 2 transporting the compact held box through the "
-                    f"central corridor; {detail}",
+                    "task 2 preserving the shelf grasp while turning north; "
+                    + detail,
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
 
-        if self._phase == "navigate_table_mid":
+        if self._phase == "advance_to_table_entry":
+            _final_x, final_y = stand_from_held_center(
+                self._place_world, self._held_center_base, self.TABLE_YAW
+            )
+            entry_y = min(
+                self.TABLE_APPROACH_Y,
+                final_y - self.TABLE_ENTRY_MARGIN_M,
+            )
             if not self._motion_started:
-                final_x, final_y = stand_from_held_center(
-                    self._place_world, self._held_center_base, self.TABLE_YAW
+                pose = odometry_pose(context.odometry)
+                if pose is None:
+                    return StageResult.running(
+                        "task 2 waiting for odometry before the northbound table entry",
+                        arm_command=self._held_arm_command,
+                    )
+                yaw_error = math.atan2(
+                    math.sin(self.TABLE_YAW - pose[2]),
+                    math.cos(self.TABLE_YAW - pose[2]),
                 )
-                goal = NavigationGoal(
-                    x=final_x,
-                    y=min(self.TABLE_APPROACH_Y, final_y - 0.25),
-                    yaw=self.TABLE_YAW,
-                    position_tolerance=0.08,
-                    yaw_tolerance=0.07,
-                    safety_radius=0.0,
-                    segment=NavigationSegment.NAV_TABLE,
-                    source_tag="task2_carried_box_table_entry",
-                )
-                started, safety = self._begin_carried_navigation(
-                    goal, context, "corridor-to-table-entry segment"
-                )
-                if not started:
+                if abs(yaw_error) > 0.15:
                     return StageResult.blocked(
-                        safety,
+                        "task 2 refused the northbound table entry because the "
+                        f"base is not facing north: yaw_error={yaw_error:.3f}",
+                        arm_command=self._held_arm_command,
+                    )
+                distance = entry_y - pose[1]
+                if distance < -0.04:
+                    return StageResult.blocked(
+                        "task 2 table entry is behind the permitted forward "
+                        f"direction: current_y={pose[1]:.3f}, entry_y={entry_y:.3f}",
+                        arm_command=self._held_arm_command,
+                    )
+                if distance <= 0.015:
+                    return StageResult.succeeded(
+                        "task 2 reached the table entry while preserving the "
+                        "unchanged bilateral shelf grasp",
+                        arm_command=self._held_arm_command,
+                    )
+                rotation_safety = self._carried_envelope.check_rotation(
+                    pose,
+                    self.TABLE_YAW,
+                    self._held_center_base,
+                    self._held_half_width(),
+                )
+                if not rotation_safety.safe:
+                    return StageResult.blocked(
+                        "task 2 rejected north-heading correction before table "
+                        "entry: " + rotation_safety.detail,
+                        arm_command=self._held_arm_command,
+                    )
+                checked_pose = (pose[0], pose[1], self.TABLE_YAW)
+                end_xy = (pose[0], entry_y)
+                safety = self._carried_envelope.check_fixed_heading_translation(
+                    checked_pose,
+                    end_xy,
+                    self._held_center_base,
+                    self._held_half_width(),
+                )
+                if not safety.safe:
+                    return StageResult.blocked(
+                        "task 2 rejected the northbound table entry before motion: "
+                        + safety.detail,
+                        arm_command=self._held_arm_command,
+                    )
+                if not self._transfer.begin_advance(
+                    context.odometry,
+                    distance,
+                    heading_yaw=self.TABLE_YAW,
+                ):
+                    return StageResult.running(
+                        "task 2 waiting to start the northbound table entry",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            status, command, detail = self._tick_carried_navigation(
-                context, "corridor-to-table-entry segment"
-            )
-            if status is NavigationStatus.GOAL_REACHED:
-                return StageResult.succeeded(
-                    "task 2 reached the table entry through two envelope-checked "
-                    "segments while preserving the compact bilateral grasp",
-                    arm_command=self._held_arm_command,
-                )
-            if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+            done, command, detail = self._transfer.tick_advance(context.odometry)
+            safe, safety_detail = self._guard_carried_command(context, command)
+            if not safe:
                 return StageResult.blocked(
-                    f"task 2 table transport stopped safely: {detail}",
+                    "task 2 northbound table entry stopped safely: " + safety_detail,
                     arm_command=self._held_arm_command,
                 )
-            return StageResult.running(
-                f"task 2 transporting shelf box to task 1 origin; {detail}",
-                base_command=command,
+            if not done:
+                elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+                if elapsed >= self.TRANSPORT_SEGMENT_TIMEOUT_S:
+                    return StageResult.blocked(
+                        "task 2 northbound table entry timed out after "
+                        f"{elapsed:.1f}s: {detail}",
+                        arm_command=self._held_arm_command,
+                    )
+                return StageResult.running(
+                    "task 2 carrying the unchanged shelf grasp north toward "
+                    f"table entry y={entry_y:.3f}; {detail}; {safety_detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+            return StageResult.succeeded(
+                "task 2 reached the table entry through envelope-checked "
+                "reverse, turn and forward segments without changing the grasp",
                 arm_command=self._held_arm_command,
             )
         return StageResult.blocked(
@@ -840,6 +943,30 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
         return status, command, f"{detail}; {safety.detail}"
 
+    def _guard_carried_command(
+        self,
+        context: ExecutionContext,
+        command: tuple[float, float],
+    ) -> tuple[bool, str]:
+        """Validate one straight-motion command with the live carried pose."""
+
+        pose = odometry_pose(context.odometry)
+        if pose is None:
+            return False, "waiting for valid odometry"
+        if self._held_center_base is None:
+            return False, "lost the held-box transform"
+        try:
+            half_width = self._held_half_width()
+        except RuntimeError as exc:
+            return False, str(exc)
+        safety = self._carried_envelope.check_command(
+            pose,
+            command,
+            self._held_center_base,
+            half_width,
+        )
+        return safety.safe, safety.detail
+
     def _tick_align_for_place(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 2 table alignment has no held object")
@@ -866,49 +993,116 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             result = self._tick_slide(context, "moving box to table clearance height")
             if result is not None:
                 return result
-            self._phase = "navigate_table_final"
+            self._phase = "advance_table_final"
+            self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "navigate_table_final":
+        if self._phase == "advance_table_final":
+            stand_x, stand_y = stand_from_held_center(
+                self._place_world, self._held_center_base, self.TABLE_YAW
+            )
             if not self._motion_started:
-                stand_x, stand_y = stand_from_held_center(
-                    self._place_world, self._held_center_base, self.TABLE_YAW
+                pose = odometry_pose(context.odometry)
+                if pose is None:
+                    return StageResult.running(
+                        "task 2 waiting for odometry before final table advance",
+                        arm_command=self._held_arm_command,
+                    )
+                yaw_error = math.atan2(
+                    math.sin(self.TABLE_YAW - pose[2]),
+                    math.cos(self.TABLE_YAW - pose[2]),
                 )
-                goal = NavigationGoal(
-                    x=stand_x,
-                    y=stand_y,
-                    yaw=self.TABLE_YAW,
-                    position_tolerance=0.07,
-                    yaw_tolerance=0.07,
-                    safety_radius=0.0,
-                    segment=NavigationSegment.NAV_TABLE,
-                    source_tag="task1_origin_table_final",
-                )
-                started, safety = self._begin_carried_navigation(
-                    goal, context, "table-entry-to-placement segment"
-                )
-                if not started:
+                if abs(yaw_error) > 0.10:
                     return StageResult.blocked(
-                        safety,
+                        "task 2 refused final table advance because the base "
+                        f"is not facing north: yaw_error={yaw_error:.3f}",
+                        arm_command=self._held_arm_command,
+                    )
+                dx = stand_x - pose[0]
+                dy = stand_y - pose[1]
+                forward = (
+                    dx * math.cos(self.TABLE_YAW) + dy * math.sin(self.TABLE_YAW)
+                )
+                lateral = (
+                    -dx * math.sin(self.TABLE_YAW) + dy * math.cos(self.TABLE_YAW)
+                )
+                if abs(lateral) > self.TABLE_FINAL_LATERAL_TOLERANCE_M:
+                    return StageResult.blocked(
+                        "task 2 refused final table advance because the saved "
+                        f"target is {lateral:+.3f} m off the fixed northbound line",
+                        arm_command=self._held_arm_command,
+                    )
+                if forward < -0.04:
+                    return StageResult.blocked(
+                        "task 2 overshot the final table stand by "
+                        f"{-forward:.3f} m",
+                        arm_command=self._held_arm_command,
+                    )
+                if forward <= 0.015:
+                    return StageResult.succeeded(
+                        "task 2 aligned held box over task 1's original table coordinate",
+                        arm_command=self._held_arm_command,
+                    )
+                rotation_safety = self._carried_envelope.check_rotation(
+                    pose,
+                    self.TABLE_YAW,
+                    self._held_center_base,
+                    self._held_half_width(),
+                )
+                if not rotation_safety.safe:
+                    return StageResult.blocked(
+                        "task 2 rejected north-heading correction before the "
+                        "final table advance: " + rotation_safety.detail,
+                        arm_command=self._held_arm_command,
+                    )
+                checked_pose = (pose[0], pose[1], self.TABLE_YAW)
+                end_xy = (pose[0], pose[1] + forward)
+                safety = self._carried_envelope.check_fixed_heading_translation(
+                    checked_pose,
+                    end_xy,
+                    self._held_center_base,
+                    self._held_half_width(),
+                )
+                if not safety.safe:
+                    return StageResult.blocked(
+                        "task 2 rejected final northbound table advance before "
+                        "motion: " + safety.detail,
+                        arm_command=self._held_arm_command,
+                    )
+                if not self._transfer.begin_advance(
+                    context.odometry,
+                    forward,
+                    heading_yaw=self.TABLE_YAW,
+                ):
+                    return StageResult.running(
+                        "task 2 waiting to start final northbound table advance",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            status, command, detail = self._tick_carried_navigation(
-                context, "table-entry-to-placement segment"
-            )
-            if status is NavigationStatus.GOAL_REACHED:
+            done, command, detail = self._transfer.tick_advance(context.odometry)
+            safe, safety_detail = self._guard_carried_command(context, command)
+            if not safe:
+                return StageResult.blocked(
+                    "task 2 final northbound table advance stopped safely: "
+                    + safety_detail,
+                    arm_command=self._held_arm_command,
+                )
+            if done:
                 return StageResult.succeeded(
                     "task 2 aligned held box over task 1's original table coordinate",
                     arm_command=self._held_arm_command,
                 )
-            if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed >= self.TRANSPORT_SEGMENT_TIMEOUT_S:
                 return StageResult.blocked(
-                    f"task 2 final table alignment stopped safely: {detail}",
+                    "task 2 final northbound table advance timed out after "
+                    f"{elapsed:.1f}s: {detail}",
                     arm_command=self._held_arm_command,
                 )
             return StageResult.running(
-                f"task 2 moving from approach to final table stand; {detail}",
+                "task 2 advancing straight from table entry to the exact saved "
+                f"origin; {detail}; {safety_detail}",
                 base_command=command,
                 arm_command=self._held_arm_command,
             )

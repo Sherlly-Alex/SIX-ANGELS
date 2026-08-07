@@ -239,6 +239,65 @@ class CarriedEnvelopeChecker:
             return final_rotation
         return _minimum_check(best, final_rotation)
 
+    def check_fixed_heading_translation(
+        self,
+        start_pose: tuple[float, float, float],
+        end_xy: tuple[float, float],
+        held_center_base: tuple[float, float, float],
+        half_width_m: float,
+    ) -> EnvelopeCheck:
+        """Check a straight translation while the robot keeps one heading.
+
+        This differs from :meth:`check_path`: a differential-drive robot can
+        deliberately reverse while still facing the shelf.  Treating the
+        direction of travel as its yaw would rotate the carried box by 180
+        degrees in the safety model and validate the wrong swept envelope.
+        """
+
+        start_x, start_y, yaw = (float(value) for value in start_pose)
+        end_x, end_y = (float(value) for value in end_xy)
+        if not all(
+            math.isfinite(value)
+            for value in (start_x, start_y, yaw, end_x, end_y)
+        ):
+            return EnvelopeCheck(
+                False,
+                float("-inf"),
+                "non-finite fixed-heading translation",
+            )
+        distance = math.hypot(end_x - start_x, end_y - start_y)
+        samples = max(1, int(math.ceil(distance / self.PATH_SAMPLE_M)))
+        best = EnvelopeCheck(True, float("inf"), "translation unchecked")
+        for sample in range(samples + 1):
+            fraction = sample / samples
+            pose = (
+                start_x + fraction * (end_x - start_x),
+                start_y + fraction * (end_y - start_y),
+                yaw,
+            )
+            check = self.check_pose(pose, held_center_base, half_width_m)
+            if not check.safe:
+                return check
+            best = _minimum_check(best, check)
+        return best
+
+    def check_rotation(
+        self,
+        pose: tuple[float, float, float],
+        end_yaw: float,
+        held_center_base: tuple[float, float, float],
+        half_width_m: float,
+    ) -> EnvelopeCheck:
+        """Check an in-place rotation from the pose yaw to ``end_yaw``."""
+
+        return self._check_rotation(
+            (float(pose[0]), float(pose[1])),
+            float(pose[2]),
+            float(end_yaw),
+            held_center_base,
+            half_width_m,
+        )
+
     def check_command(
         self,
         pose: tuple[float, float, float],

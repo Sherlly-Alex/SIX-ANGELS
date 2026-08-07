@@ -287,12 +287,27 @@ class TransferMotion:
             )
         return NavigationStatus.FAILED, (0.0, 0.0), "lateral alignment failed"
 
-    def begin_retreat(self, odometry: Any, distance_m: float) -> bool:
+    def begin_retreat(
+        self,
+        odometry: Any,
+        distance_m: float,
+        *,
+        heading_yaw: float | None = None,
+    ) -> bool:
+        """Start a reverse segment and optionally hold an explicit heading."""
+
         pose = odometry_pose(odometry)
         distance = float(distance_m)
-        if pose is None or not math.isfinite(distance) or distance <= 0.0:
+        yaw_ref = pose[2] if pose is not None and heading_yaw is None else heading_yaw
+        if (
+            pose is None
+            or not math.isfinite(distance)
+            or distance <= 0.0
+            or yaw_ref is None
+            or not math.isfinite(float(yaw_ref))
+        ):
             return False
-        self._retreat_start = pose
+        self._retreat_start = (pose[0], pose[1], float(yaw_ref))
         self._retreat_distance_m = distance
         return True
 
@@ -315,20 +330,35 @@ class TransferMotion:
         )
         linear = -min(0.12, max(0.04, 0.65 * remaining))
         angular = max(-0.25, min(0.25, 1.0 * yaw_error))
+        if abs(yaw_error) > 0.08:
+            linear = 0.0
         return (
             False,
             (linear, angular),
             f"retreating straight; remaining={max(0.0, remaining):.3f} m",
         )
 
-    def begin_advance(self, odometry: Any, distance_m: float) -> bool:
-        """Start a short forward motion while preserving the current yaw."""
+    def begin_advance(
+        self,
+        odometry: Any,
+        distance_m: float,
+        *,
+        heading_yaw: float | None = None,
+    ) -> bool:
+        """Start a short forward motion at the current or explicit heading."""
 
         pose = odometry_pose(odometry)
         distance = float(distance_m)
-        if pose is None or not math.isfinite(distance) or distance <= 0.0:
+        yaw_ref = pose[2] if pose is not None and heading_yaw is None else heading_yaw
+        if (
+            pose is None
+            or not math.isfinite(distance)
+            or distance <= 0.0
+            or yaw_ref is None
+            or not math.isfinite(float(yaw_ref))
+        ):
             return False
-        self._advance_start = pose
+        self._advance_start = (pose[0], pose[1], float(yaw_ref))
         self._advance_distance_m = distance
         return True
 
@@ -353,6 +383,8 @@ class TransferMotion:
         )
         linear = min(0.10, max(0.035, 0.55 * remaining))
         angular = max(-0.20, min(0.20, 0.8 * yaw_error))
+        if abs(yaw_error) > 0.08:
+            linear = 0.0
         return (
             False,
             (linear, angular),

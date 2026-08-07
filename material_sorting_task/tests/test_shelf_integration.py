@@ -203,6 +203,34 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertTrue(done)
         self.assertEqual(command, (0.0, 0.0))
 
+    def test_transfer_retreat_corrects_explicit_heading_before_translation(self) -> None:
+        motion = TransferMotion()
+        start_yaw = math.pi - 0.12
+        self.assertTrue(
+            motion.begin_retreat(
+                _odom(-1.28, 0.78, start_yaw),
+                0.30,
+                heading_yaw=math.pi,
+            )
+        )
+        done, command, _detail = motion.tick_retreat(
+            _odom(-1.28, 0.78, start_yaw)
+        )
+        self.assertFalse(done)
+        self.assertEqual(command[0], 0.0)
+        self.assertGreater(command[1], 0.0)
+
+        done, command, _detail = motion.tick_retreat(
+            _odom(-1.28, 0.78, math.pi)
+        )
+        self.assertFalse(done)
+        self.assertLess(command[0], 0.0)
+        done, command, _detail = motion.tick_retreat(
+            _odom(-0.98, 0.78, math.pi)
+        )
+        self.assertTrue(done)
+        self.assertEqual(command, (0.0, 0.0))
+
     def test_transfer_lateral_alignment_rotates_drives_then_restores_yaw(self) -> None:
         motion = TransferMotion()
         final_yaw = math.pi
@@ -395,92 +423,56 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         )
         self.assertFalse(check.safe)
 
-    def test_compact_segmented_task2_routes_pass_carried_envelope(self) -> None:
+    def test_extended_hold_segmented_task2_routes_pass_carried_envelope(self) -> None:
         checker = CarriedEnvelopeChecker()
-        motion = TransferMotion()
-        held = (0.50, 0.0, 1.34)
+        held = (0.631, -0.014, 1.34)
         half_width = 0.118
-        segments = (
-            (
-                (-1.28, 0.78, math.pi),
-                NavigationGoal(
-                    -0.72,
-                    0.82,
-                    0.0,
-                    0.08,
-                    0.07,
-                    0.0,
-                    NavigationSegment.NAV_TABLE,
-                    "test_corridor",
-                ),
-            ),
-            (
-                (-0.72, 0.82, 0.0),
-                NavigationGoal(
-                    -0.18,
-                    1.35,
-                    math.pi / 2.0,
-                    0.08,
-                    0.07,
-                    0.0,
-                    NavigationSegment.NAV_TABLE,
-                    "test_right_entry",
-                ),
-            ),
-            (
-                (-0.18, 1.35, math.pi / 2.0),
-                NavigationGoal(
-                    -0.18,
-                    1.74,
-                    math.pi / 2.0,
-                    0.07,
-                    0.07,
-                    0.0,
-                    NavigationSegment.NAV_TABLE,
-                    "test_right_final",
-                ),
-            ),
-            (
-                (-0.72, 0.82, 0.0),
-                NavigationGoal(
-                    -1.00,
-                    1.35,
-                    math.pi / 2.0,
-                    0.08,
-                    0.07,
-                    0.0,
-                    NavigationSegment.NAV_TABLE,
-                    "test_left_entry",
-                ),
-            ),
-            (
-                (-1.00, 1.35, math.pi / 2.0),
-                NavigationGoal(
-                    -1.00,
-                    1.74,
-                    math.pi / 2.0,
-                    0.07,
-                    0.07,
-                    0.0,
-                    NavigationSegment.NAV_TABLE,
-                    "test_left_final",
-                ),
-            ),
-        )
-        for start, goal in segments:
-            motion.reset()
-            self.assertTrue(
-                motion.begin_navigation(goal, _odom(*start)),
-                msg=f"could not plan {goal.source_tag}",
+        start = (-1.28, 0.78, math.pi)
+        # Both randomized task-1 source slots.  The base first reverses east
+        # while still facing west, turns only west -> north at the destination
+        # column, then advances north.  The arms and box remain fully extended.
+        for place in ((-1.0, 2.20, 0.84), (-0.18, 2.20, 0.84)):
+            stand_x, stand_y = stand_from_held_center(
+                place, held, math.pi / 2.0
             )
-            check = checker.check_path(
+            reverse_end = (stand_x, start[1])
+            reverse = checker.check_fixed_heading_translation(
                 start,
-                motion.navigation_path,
-                goal.yaw,
+                reverse_end,
                 held,
                 half_width,
             )
-            self.assertTrue(check.safe, msg=f"{goal.source_tag}: {check.detail}")
+            self.assertTrue(reverse.safe, msg=f"reverse: {reverse.detail}")
+
+            rotation_pose = (stand_x, start[1], math.pi)
+            rotation = checker.check_rotation(
+                rotation_pose,
+                math.pi / 2.0,
+                held,
+                half_width,
+            )
+            self.assertTrue(rotation.safe, msg=f"rotation: {rotation.detail}")
+
+            entry_y = min(1.35, stand_y - 0.25)
+            advance = checker.check_fixed_heading_translation(
+                (stand_x, start[1], math.pi / 2.0),
+                (stand_x, entry_y),
+                held,
+                half_width,
+            )
+            self.assertTrue(advance.safe, msg=f"advance: {advance.detail}")
+
+            entry_pose = (stand_x, entry_y, math.pi / 2.0)
+            final_check = checker.check_fixed_heading_translation(
+                entry_pose,
+                (stand_x, stand_y),
+                held,
+                half_width,
+            )
+            self.assertTrue(
+                final_check.safe,
+                msg=f"final placement: {final_check.detail}",
+            )
 
 
 def _odom(x: float, y: float, yaw: float):

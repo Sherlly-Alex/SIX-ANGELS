@@ -42,16 +42,21 @@ Implemented flow:
    Shelf pregrasp uses a narrower symmetric 0.18 m half-width; contact width is
    still derived from the box orientation. It then performs the shelf grasp and
    bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
-   and raises the spine to the maximum transport height while stationary. Before
-   the base turns, a grasp-preserving controller moves the held center inward
-   through four small synchronized dual-arm IK waypoints. It starts from the last
-   commanded preload and keeps the grippers, half-width and spine command
-   unchanged. Transport then follows separate shelf-to-corridor,
-   corridor-to-table-entry and table-entry-to-placement segments. Each segment
-   is rejected before motion if a swept body/arm/box envelope intersects the
-   shelf or perimeter walls, and the same envelope is predicted over every
-   live velocity command. It finally releases at the stored task-1 origin and
-   returns to the end zone.
+   and raises the spine to the maximum transport height while stationary. The
+   successful shelf grasp is then kept completely unchanged: there is no
+   secondary arm IK and no inward squeeze that could disturb the box. While
+   still facing west, the base reverses east along the shelf aisle to the table
+   column derived from the saved task-1 origin, turns only west-to-north there,
+   and advances straight to the south table entry before final placement. This
+   ordering keeps the extended payload away from the east wall. Every straight
+   translation and in-place turn is rejected before motion if its swept
+   body/arm/box envelope intersects the shelf or perimeter walls, and the same
+   envelope is predicted over every live velocity command. The table-entry and
+   final-placement motions are both fixed-heading northbound advances; the
+   generic grid planner is deliberately not used there because grid-centre
+   snapping can introduce a small but unsafe arm-sweeping turn near the east
+   wall. It finally releases at the exact stored task-1 origin and returns to
+   the end zone.
 
 Task 3 remains fail-closed.
 
@@ -101,8 +106,9 @@ Local static compilation and unit tests cover interface wiring, shared memory,
 carried-color filtering, multi-frame layer voting, fail-closed ambiguous-layer
 handling, robust task-2 object-center locking with outlier rejection, the
 shelf-specific pregrasp width, and held-object placement geometry. Runtime
-tests also cover grasp-preserving transport command continuity and rejection of
-the former extended-payload wall sweep. Runtime manipulation uses no
+tests also cover unchanged-grasp reverse/turn/advance transport for both table
+source slots and rejection of the former extended-payload wall sweep. Runtime
+manipulation uses no
 Server/referee object coordinate; Server truth remains
 diagnostic/scoring-only. Physical clearances, camera view, IK convergence and
 referee timing must still be validated in the official 4090 Server/Client
