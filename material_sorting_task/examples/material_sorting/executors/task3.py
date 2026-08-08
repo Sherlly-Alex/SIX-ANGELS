@@ -38,9 +38,10 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_TARGET_MAX_AGE_S = 1.5
     # Keep the arms/box in the verified grasp pose.  After the reverse retreat,
     # drive directly to a shelf-front pre-place stand that is this far east of
-    # the measured observation stand.  This avoids a short lateral waypoint
-    # whose final-yaw correction made the base spin in place.
-    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.45
+    # the measured observation stand.  The 0.15 m offset keeps the carried
+    # envelope clear while staying on the previously validated central route;
+    # a larger offset moved the base toward the wall in the randomized scene.
+    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.15
     TASK3_TOP_ROI = (
         (-0.90, -0.20),
         (1.90, 2.60),
@@ -339,7 +340,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 )
             # Stop well in front of the shelf, with the carried box still
             # outside the opening.  The next phase is the only one allowed to
-            # enter this final 0.45 m approach corridor.
+            # enter this final 0.15 m approach corridor.
             preplace_x = (
                 self._shelf_scan_stand[0] + self.TASK3_SHELF_PREALIGN_STANDOFF_M
             )
