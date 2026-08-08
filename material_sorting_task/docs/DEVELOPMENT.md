@@ -42,5 +42,6 @@ task-2 shelf grasp/return-to-origin through the formal `TaskExecutor`,
 `StageResult`, `ArmCommand`, and referee interfaces. The new `task123_full`
 path adds task-3 top-box RGB-D reacquisition, task-1's calibrated dual-arm
 grasp/lift, the shared task-1 shelf snapshot, measured packaging-box left
-placement, and safe retreat/retraction. Both paths still require physical
-validation and calibration in the official Client container.
+placement, held-box compaction before the turn, and safe retreat/retraction.
+Both paths still require physical validation and calibration in the official
+Client container.

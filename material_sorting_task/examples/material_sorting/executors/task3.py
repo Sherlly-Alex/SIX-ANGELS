@@ -9,6 +9,7 @@ from executors.base import ExecutionContext, PlaceholderTaskExecutor, StageResul
 from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
 from executors.transfer_support import stand_from_held_center
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
+from shelf.manipulation import HeldTransportController
 from shelf.task3_geometry import task3_safe_release_target, task3_scoring_target
 from shelf.target_center import StableTargetCenterTracker
 
@@ -21,9 +22,11 @@ class Task3Executor(PlaceholderTaskExecutor):
 class Task3IntegratedExecutor(Task1IntegratedExecutor):
     """Run task 3 through the formal ``TaskExecutor`` interface.
 
-    Task 1's calibrated dual-arm pregrasp/contact/lift and its collision-aware
-    shelf transport/retract sequence are retained.  Only the task-specific
-    top-box target lock and packaging-box placement geometry are overridden.
+    Task 1's calibrated dual-arm pregrasp/contact/lift and release/return
+    sequence are retained.  Task 3 adds a held-box compaction and explicit
+    aisle escape before the shelf-facing transport turn; only the
+    task-specific top-box target lock and packaging-box placement geometry are
+    otherwise overridden.
     """
 
     task_id = 3
@@ -35,6 +38,16 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_PICK_STANDOFF_M = 0.65
     TASK3_TARGET_TIMEOUT_S = 25.0
     TASK3_TARGET_MAX_AGE_S = 1.5
+    # The table-top target is picked with the arms extended toward the table.
+    # Before any turn, bring the held centre back to this compact base-frame
+    # position while preserving the gripper preload.
+    TASK3_COMPACT_CENTER_X_M = 0.50
+    TASK3_COMPACT_TIMEOUT_S = 20.0
+    # Leave the table below its obstacle footprint, turn toward the shelf in
+    # the open aisle, and only then descend toward the shelf-front stand.
+    TASK3_ESCAPE_X_M = -0.85
+    TASK3_ESCAPE_Y_M = 1.35
+    TASK3_SHELF_TURN_X_M = -0.85
     TASK3_TOP_ROI = (
         (-0.90, -0.20),
         (1.90, 2.60),
@@ -58,6 +71,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_scoring_place: tuple[float, float, float] | None = None
         self._task3_release_place: tuple[float, float, float] | None = None
         self._task3_white_layer: int | None = None
+        self._held_transport = HeldTransportController(
+            target_center_x_m=self.TASK3_COMPACT_CENTER_X_M
+        )
 
     def reset(self) -> None:
         super().reset()
@@ -66,6 +82,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_scoring_place = None
         self._task3_release_place = None
         self._task3_white_layer = None
+        self._held_transport.reset()
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -83,6 +100,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             # observations can leave this stage with no fresh frames after
             # the camera/arms settle at the pick stand.
             pass
+        elif stage is TaskStage.TRANSPORT:
+            self._held_transport.reset()
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             # Task 1's align-for-place stage starts a shelf scan.  Task 3 has
             # already inherited the stable shelf snapshot from task 1, so it
@@ -293,22 +312,181 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._place_world = release_target
 
     def _tick_task3_transport(self, context: ExecutionContext) -> StageResult:
+        if self._held_arm_command is None or self._held_center_base is None:
+            return StageResult.blocked("task 3 transport has no stable held-object state")
         try:
             self._ensure_task3_place_target()
         except (RuntimeError, ValueError) as exc:
             return StageResult.blocked(f"task 3 cannot prepare shelf placement: {exc}")
-        if self._held_center_base is not None and self._shelf_scan_stand is None:
-            packaging_center = self._memory.require_task3_packaging_box_center()
-            self._shelf_scan_stand = shelf_observation_stand(
-                self._held_center_base,
-                shelf_front_x=self.SHELF_FRONT_X,
-                shelf_y=max(0.58, min(0.98, float(packaging_center[1]))),
-                center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
-                shelf_yaw=self.SHELF_YAW,
+
+        if self._phase == "retreat_table":
+            if not self._motion_started:
+                if not self._transfer.begin_retreat(
+                    context.odometry, self.TABLE_RETREAT_M
+                ):
+                    return StageResult.running(
+                        "task 3 waiting for odometry before table retreat",
+                        arm_command=self._held_arm_command,
+                    )
+                self._motion_started = True
+            done, command, detail = self._transfer.tick_retreat(context.odometry)
+            if not done:
+                return StageResult.running(
+                    f"task 3 holding the top-box and retreating from table; {detail}",
+                    base_command=command,
+                    arm_command=self._held_arm_command,
+                )
+            self._phase = "compact_held_transport"
+            self._motion_started = False
+            self._phase_started_s = float(context.now_s)
+            self._transfer.reset()
+            self._held_transport.reset()
+
+        if self._phase == "compact_held_transport":
+            if self._held_center_base[0] <= self.TASK3_COMPACT_CENTER_X_M + 0.02:
+                # Already compact enough; do not force an unnecessary IK move.
+                self._phase = "escape_corridor"
+                self._motion_started = False
+            else:
+                if not self._held_transport.planned:
+                    half_width = self._contact.half_width
+                    if half_width is None:
+                        return StageResult.blocked(
+                            "task 3 cannot compact transport pose without grasp half-width",
+                            arm_command=self._held_arm_command,
+                        )
+                    try:
+                        self._held_arm_command = self._held_transport.plan(
+                            self._held_arm_command,
+                            self._held_center_base,
+                            float(half_width),
+                        )
+                    except (PregraspInputError, PregraspPlanningError) as exc:
+                        return StageResult.blocked(
+                            f"task 3 held transport compaction planning failed: {exc}",
+                            arm_command=self._held_arm_command,
+                        )
+                try:
+                    command, reached, detail = self._held_transport.update(
+                        context.now_s, context.joint_states
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"task 3 held transport compaction control failed: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+                self._held_arm_command = command
+                if not reached:
+                    elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+                    if elapsed >= self.TASK3_COMPACT_TIMEOUT_S:
+                        return StageResult.blocked(
+                            f"task 3 held transport compaction timed out after {elapsed:.1f}s: {detail}",
+                            arm_command=command,
+                        )
+                    return StageResult.running(
+                        f"task 3 compacting held-box transport pose before turn; {detail}",
+                        arm_command=command,
+                    )
+                compact_center = self._held_transport.target_center_base
+                if compact_center is not None:
+                    self._held_center_base = compact_center
+                self._phase = "escape_corridor"
+                self._motion_started = False
+                self._transfer.reset()
+
+        if self._phase == "escape_corridor":
+            goal = NavigationGoal(
+                x=self.TASK3_ESCAPE_X_M,
+                y=self.TASK3_ESCAPE_Y_M,
+                yaw=self.SHELF_YAW,
+                position_tolerance=0.08,
+                yaw_tolerance=0.06,
+                safety_radius=0.0,
+                segment=NavigationSegment.NAV_TABLE,
+                source_tag="task3_compact_transport_escape_corridor",
             )
-        state = self._memory.require_shelf_state()
-        self._shelf_state = state
-        return super()._tick_transport(context)
+            result = self._tick_task3_transport_navigation(
+                context,
+                goal,
+                next_phase="navigate_shelf_turn",
+                action="moving below the table before turning toward the shelf",
+            )
+            if result is not None:
+                return result
+
+        if self._phase == "navigate_shelf_turn":
+            if self._shelf_scan_stand is None:
+                packaging_center = self._memory.require_task3_packaging_box_center()
+                self._shelf_scan_stand = shelf_observation_stand(
+                    self._held_center_base,
+                    shelf_front_x=self.SHELF_FRONT_X,
+                    shelf_y=max(0.58, min(0.98, float(packaging_center[1]))),
+                    center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
+                    shelf_yaw=self.SHELF_YAW,
+                )
+            goal = NavigationGoal(
+                x=self.TASK3_SHELF_TURN_X_M,
+                y=self._shelf_scan_stand[1],
+                yaw=self.SHELF_YAW,
+                position_tolerance=0.08,
+                yaw_tolerance=0.06,
+                safety_radius=0.0,
+                segment=NavigationSegment.NAV_SHELF,
+                source_tag="task3_compact_transport_shelf_turn",
+            )
+            result = self._tick_task3_transport_navigation(
+                context,
+                goal,
+                next_phase="approach_shelf_scan",
+                action="moving through the aisle to the shelf turn point",
+            )
+            if result is not None:
+                return result
+
+        if self._phase == "approach_shelf_scan":
+            self._shelf_state = self._memory.require_shelf_state()
+            return super()._tick_transport(context)
+
+        return StageResult.blocked(
+            f"task 3 invalid transport phase {self._phase!r}",
+            arm_command=self._held_arm_command,
+        )
+
+    def _tick_task3_transport_navigation(
+        self,
+        context: ExecutionContext,
+        goal: NavigationGoal,
+        *,
+        next_phase: str,
+        action: str,
+    ) -> StageResult | None:
+        """Run one explicit task-3 transport waypoint without a turn shortcut."""
+
+        if not self._motion_started:
+            if not self._transfer.begin_navigation(goal, context.odometry):
+                return StageResult.blocked(
+                    f"task 3 could not plan a collision-free route while {action}",
+                    arm_command=self._held_arm_command,
+                )
+            self._motion_started = True
+        status, command, detail = self._transfer.tick_navigation(
+            context.odometry, context.now_s
+        )
+        if status is NavigationStatus.GOAL_REACHED:
+            self._phase = next_phase
+            self._motion_started = False
+            self._transfer.reset()
+            return None
+        if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+            return StageResult.blocked(
+                f"task 3 transport navigation stopped safely while {action}: {detail}",
+                arm_command=self._held_arm_command,
+            )
+        return StageResult.running(
+            f"task 3 {action}; {detail}",
+            base_command=command,
+            arm_command=self._held_arm_command,
+        )
 
     def _update_shelf_state(self, context: ExecutionContext):
         """Keep task-1's stable shelf snapshot; task 3 does not rescan it."""
