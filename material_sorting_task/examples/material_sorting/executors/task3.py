@@ -9,7 +9,6 @@ from executors.base import ExecutionContext, PlaceholderTaskExecutor, StageResul
 from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
 from executors.transfer_support import stand_from_held_center
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
-from shelf.manipulation import HeldTransportController
 from shelf.task3_geometry import task3_safe_release_target, task3_scoring_target
 from shelf.target_center import StableTargetCenterTracker
 
@@ -23,10 +22,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     """Run task 3 through the formal ``TaskExecutor`` interface.
 
     Task 1's calibrated dual-arm pregrasp/contact/lift and release/return
-    sequence are retained.  Task 3 adds a held-box compaction and explicit
-    aisle escape before the shelf-facing transport turn; only the
-    task-specific top-box target lock and packaging-box placement geometry are
-    otherwise overridden.
+    sequence are retained.  Task 3 adds an explicit aisle escape route while
+    keeping the original held-box arm pose; only the task-specific top-box
+    target lock and packaging-box placement geometry are otherwise overridden.
     """
 
     task_id = 3
@@ -38,15 +36,12 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_PICK_STANDOFF_M = 0.65
     TASK3_TARGET_TIMEOUT_S = 25.0
     TASK3_TARGET_MAX_AGE_S = 1.5
-    # The table-top target is picked with the arms extended toward the table.
-    # Before any turn, bring the held centre back to this compact base-frame
-    # position while preserving the gripper preload.
-    TASK3_COMPACT_CENTER_X_M = 0.50
-    TASK3_COMPACT_TIMEOUT_S = 20.0
-    # Leave the table below its obstacle footprint, turn toward the shelf in
-    # the open aisle, and only then descend toward the shelf-front stand.
+    # Keep the arms/box in the verified grasp pose.  Leave the table well below
+    # its obstacle footprint before turning: with the box still extended, the
+    # base must be at y≈1.05 or lower so the forward swept envelope stays
+    # clear of the table edge at y≈1.92.
     TASK3_ESCAPE_X_M = -0.85
-    TASK3_ESCAPE_Y_M = 1.35
+    TASK3_ESCAPE_Y_M = 1.05
     TASK3_SHELF_TURN_X_M = -0.85
     TASK3_TOP_ROI = (
         (-0.90, -0.20),
@@ -71,9 +66,6 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_scoring_place: tuple[float, float, float] | None = None
         self._task3_release_place: tuple[float, float, float] | None = None
         self._task3_white_layer: int | None = None
-        self._held_transport = HeldTransportController(
-            target_center_x_m=self.TASK3_COMPACT_CENTER_X_M
-        )
 
     def reset(self) -> None:
         super().reset()
@@ -82,7 +74,6 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_scoring_place = None
         self._task3_release_place = None
         self._task3_white_layer = None
-        self._held_transport.reset()
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -100,8 +91,6 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             # observations can leave this stage with no fresh frames after
             # the camera/arms settle at the pick stand.
             pass
-        elif stage is TaskStage.TRANSPORT:
-            self._held_transport.reset()
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             # Task 1's align-for-place stage starts a shelf scan.  Task 3 has
             # already inherited the stable shelf snapshot from task 1, so it
@@ -336,63 +325,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "compact_held_transport"
+            self._phase = "escape_corridor"
             self._motion_started = False
-            self._phase_started_s = float(context.now_s)
             self._transfer.reset()
-            self._held_transport.reset()
-
-        if self._phase == "compact_held_transport":
-            if self._held_center_base[0] <= self.TASK3_COMPACT_CENTER_X_M + 0.02:
-                # Already compact enough; do not force an unnecessary IK move.
-                self._phase = "escape_corridor"
-                self._motion_started = False
-            else:
-                if not self._held_transport.planned:
-                    half_width = self._contact.half_width
-                    if half_width is None:
-                        return StageResult.blocked(
-                            "task 3 cannot compact transport pose without grasp half-width",
-                            arm_command=self._held_arm_command,
-                        )
-                    try:
-                        self._held_arm_command = self._held_transport.plan(
-                            self._held_arm_command,
-                            self._held_center_base,
-                            float(half_width),
-                        )
-                    except (PregraspInputError, PregraspPlanningError) as exc:
-                        return StageResult.blocked(
-                            f"task 3 held transport compaction planning failed: {exc}",
-                            arm_command=self._held_arm_command,
-                        )
-                try:
-                    command, reached, detail = self._held_transport.update(
-                        context.now_s, context.joint_states
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        f"task 3 held transport compaction control failed: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-                self._held_arm_command = command
-                if not reached:
-                    elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
-                    if elapsed >= self.TASK3_COMPACT_TIMEOUT_S:
-                        return StageResult.blocked(
-                            f"task 3 held transport compaction timed out after {elapsed:.1f}s: {detail}",
-                            arm_command=command,
-                        )
-                    return StageResult.running(
-                        f"task 3 compacting held-box transport pose before turn; {detail}",
-                        arm_command=command,
-                    )
-                compact_center = self._held_transport.target_center_base
-                if compact_center is not None:
-                    self._held_center_base = compact_center
-                self._phase = "escape_corridor"
-                self._motion_started = False
-                self._transfer.reset()
 
         if self._phase == "escape_corridor":
             goal = NavigationGoal(
@@ -403,7 +338,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 yaw_tolerance=0.06,
                 safety_radius=0.0,
                 segment=NavigationSegment.NAV_TABLE,
-                source_tag="task3_compact_transport_escape_corridor",
+                source_tag="task3_held_pose_escape_corridor",
             )
             result = self._tick_task3_transport_navigation(
                 context,
@@ -432,7 +367,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 yaw_tolerance=0.06,
                 safety_radius=0.0,
                 segment=NavigationSegment.NAV_SHELF,
-                source_tag="task3_compact_transport_shelf_turn",
+                source_tag="task3_held_pose_shelf_turn",
             )
             result = self._tick_task3_transport_navigation(
                 context,
