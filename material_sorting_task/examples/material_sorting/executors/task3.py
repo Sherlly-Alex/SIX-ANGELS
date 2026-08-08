@@ -41,7 +41,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # the measured observation stand.  The 0.15 m offset keeps the carried
     # envelope clear while staying on the previously validated central route;
     # a larger offset moved the base toward the wall in the randomized scene.
-    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.15
+    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.45
     TASK3_TOP_ROI = (
         (-0.90, -0.20),
         (1.90, 2.60),
