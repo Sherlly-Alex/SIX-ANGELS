@@ -36,13 +36,11 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_PICK_STANDOFF_M = 0.65
     TASK3_TARGET_TIMEOUT_S = 25.0
     TASK3_TARGET_MAX_AGE_S = 1.5
-    # Keep the arms/box in the verified grasp pose.  Leave the table well below
-    # its obstacle footprint before turning: with the box still extended, the
-    # base must be at y≈1.05 or lower so the forward swept envelope stays
-    # clear of the table edge at y≈1.92.
-    TASK3_ESCAPE_X_M = -0.85
-    TASK3_ESCAPE_Y_M = 1.05
-    TASK3_SHELF_TURN_X_M = -0.85
+    # Keep the arms/box in the verified grasp pose.  After the reverse retreat,
+    # drive directly to a shelf-front pre-place stand that is this far east of
+    # the measured observation stand.  This avoids a short lateral waypoint
+    # whose final-yaw correction made the base spin in place.
+    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.45
     TASK3_TOP_ROI = (
         (-0.90, -0.20),
         (1.90, 2.60),
@@ -325,29 +323,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "escape_corridor"
+            self._phase = "navigate_shelf_turn"
             self._motion_started = False
             self._transfer.reset()
-
-        if self._phase == "escape_corridor":
-            goal = NavigationGoal(
-                x=self.TASK3_ESCAPE_X_M,
-                y=self.TASK3_ESCAPE_Y_M,
-                yaw=self.SHELF_YAW,
-                position_tolerance=0.08,
-                yaw_tolerance=0.06,
-                safety_radius=0.0,
-                segment=NavigationSegment.NAV_TABLE,
-                source_tag="task3_held_pose_escape_corridor",
-            )
-            result = self._tick_task3_transport_navigation(
-                context,
-                goal,
-                next_phase="navigate_shelf_turn",
-                action="moving below the table before turning toward the shelf",
-            )
-            if result is not None:
-                return result
 
         if self._phase == "navigate_shelf_turn":
             if self._shelf_scan_stand is None:
@@ -359,21 +337,27 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
                     shelf_yaw=self.SHELF_YAW,
                 )
+            # Stop well in front of the shelf, with the carried box still
+            # outside the opening.  The next phase is the only one allowed to
+            # enter this final 0.45 m approach corridor.
+            preplace_x = (
+                self._shelf_scan_stand[0] + self.TASK3_SHELF_PREALIGN_STANDOFF_M
+            )
             goal = NavigationGoal(
-                x=self.TASK3_SHELF_TURN_X_M,
+                x=preplace_x,
                 y=self._shelf_scan_stand[1],
                 yaw=self.SHELF_YAW,
                 position_tolerance=0.08,
                 yaw_tolerance=0.06,
                 safety_radius=0.0,
                 segment=NavigationSegment.NAV_SHELF,
-                source_tag="task3_held_pose_shelf_turn",
+                source_tag="task3_held_pose_shelf_front_preplace",
             )
             result = self._tick_task3_transport_navigation(
                 context,
                 goal,
                 next_phase="approach_shelf_scan",
-                action="moving through the aisle to the shelf turn point",
+                action="moving to the safe shelf-front pre-place stand",
             )
             if result is not None:
                 return result
