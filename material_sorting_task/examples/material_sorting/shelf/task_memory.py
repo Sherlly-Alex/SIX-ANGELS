@@ -14,7 +14,7 @@ class CompetitionTaskMemory:
     Executors receive the same instance from ``build_task_executors``.  The
     top-level controller may reset an individual executor between attempts,
     but a successful task-1 origin and shelf scan must remain available to
-    task 2.
+    tasks 2 and 3.
     """
 
     task1_origin_world: tuple[float, float, float] | None = None

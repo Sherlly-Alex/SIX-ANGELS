@@ -8,7 +8,7 @@
    then obtain the full 40 points repeatedly. (navigation-to-pick scaffold done)
 4. Support randomized color, table side and shelf layer.
 5. Validate the integrated task 1/2 executor across fixed and randomized seeds;
-   then add task 3 without resetting Client or scene state. (`task12_full`
+   then add task 3 without resetting Client or scene state. (`task123_full`
    interface integration done; 4090 physical validation pending)
 6. Add local recovery for detection loss, failed grasp and failed placement.
 7. Run multi-seed regression and package all offline weights.
@@ -17,7 +17,9 @@
 
 - Do not move before instruction, odometry and joint state inputs are ready.
 - Do not hard-code color order, table side or shelf layer.
-- Use `place_world` from the structured instruction.
+- For task 1/2, use the structured instruction's placement contract; for task
+  3, derive the left-of-packaging target from the client-side measured white
+  cuboid centre and detected layer instead of copying Server coordinates.
 - The official environment does not provide 2D LiDAR.
 - Attempts share the same physical scene; returning to the end zone settles an
   attempt rather than resetting it.
@@ -35,8 +37,10 @@ contact IK and freezes on stable bilateral `/material/grasp_confirmed` feedback.
 If the nominal contact pose does not yet produce bilateral feedback, it reuses
 the standalone grasp's 1 mm steps with a hard 4 mm inward-search bound.
 The standalone desktop-grasp executor still has no formal result action/status.
-The experimental `task12_full` path now performs task-1 transport/shelf place
-and task-2 shelf grasp/return-to-origin through the formal `TaskExecutor`,
-`StageResult`, `ArmCommand`, and referee interfaces. It must still be physically
-validated and calibrated in the official Client container. Task 3 and local
-recovery remain unimplemented.
+The experimental `task12_full` path performs task-1 transport/shelf place and
+task-2 shelf grasp/return-to-origin through the formal `TaskExecutor`,
+`StageResult`, `ArmCommand`, and referee interfaces. The new `task123_full`
+path adds task-3 top-box RGB-D reacquisition, task-1's calibrated dual-arm
+grasp/lift, the shared task-1 shelf snapshot, measured packaging-box left
+placement, and safe retreat/retraction. Both paths still require physical
+validation and calibration in the official Client container.

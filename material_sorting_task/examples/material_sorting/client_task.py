@@ -85,6 +85,7 @@ class CompetitionClient(Node):
         self._last_progress_log_ns = 0
         self._last_controller_serial = -1
         self._last_task2_detection_reset_key: tuple[int, int, str] | None = None
+        self._last_task3_detection_reset_key: tuple[int, int, str] | None = None
 
         self.execution_mode = (
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
@@ -202,6 +203,12 @@ class CompetitionClient(Node):
                 "task-2 shelf pick and return to task-1's saved table origin; "
                 "task 3 remains fail-closed"
             )
+        elif self.execution_mode == "task123_full":
+            self.get_logger().warning(
+                "task123_full enables integrated task-1/task-2 execution and "
+                "task-3 top-box pick, measured packaging-box left placement, "
+                "and safe return; task transitions remain referee-driven"
+            )
         else:
             self.get_logger().info(
                 "formal mode is referee-driven; placeholder executors fail closed and keep "
@@ -234,6 +241,7 @@ class CompetitionClient(Node):
         self.instructions = instructions
         if instructions_changed:
             self._last_task2_detection_reset_key = None
+            self._last_task3_detection_reset_key = None
             self.get_logger().info(
                 "instructions accepted: "
                 + ", ".join(
@@ -415,6 +423,36 @@ class CompetitionClient(Node):
             f"task 2 detection epoch reset for {target_color}; waiting for fresh RGB-D frames"
         )
 
+    def _refresh_task3_detection_epoch(self) -> None:
+        """Clear task 3's colour before reacquiring the table-top box.
+
+        The detector stream is continuous across all three tasks.  A colour
+        that belongs to task 3 may have been observed near the initial table
+        long before the robot returns from task 2, so task 3 must start a new
+        RGB-D observation epoch instead of consuming that old median.
+        """
+
+        if self.controller.task_index != 2 or self.controller.stage not in {
+            TaskStage.NAVIGATE_TO_PICK,
+            TaskStage.ACQUIRE_TARGET,
+        }:
+            return
+        target_color = (
+            str(self.instructions[2].get("target_color", "")).strip().lower()
+            if len(self.instructions) > 2
+            else ""
+        )
+        if not target_color:
+            return
+        key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
+        if key == self._last_task3_detection_reset_key:
+            return
+        self._reset_target_histories([target_color])
+        self._last_task3_detection_reset_key = key
+        self.get_logger().info(
+            f"task 3 detection epoch reset for {target_color}; waiting for fresh RGB-D frames"
+        )
+
     def _publish_base_command(self, linear_x: float, angular_z: float) -> None:
         if not rclpy.ok():
             return
@@ -503,6 +541,7 @@ class CompetitionClient(Node):
             "contact_only",
             "lift_only",
             "task12_full",
+            "task123_full",
         } and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()
@@ -521,6 +560,7 @@ class CompetitionClient(Node):
             return
 
         self._refresh_task2_detection_epoch()
+        self._refresh_task3_detection_epoch()
         missing = self._missing_inputs()
         self.controller.set_inputs_ready(not missing)
         if missing:

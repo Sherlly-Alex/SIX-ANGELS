@@ -90,7 +90,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # shelf placement motion used by task 1.
     SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M = 0.008
     SHELF_FINAL_YAW_TOLERANCE_RAD = 0.015
-    SHELF_PREGRASP_HALF_WIDTH_M = 0.18
+    SHELF_PREGRASP_HALF_WIDTH_M = 0.20
     # ALIGN_FOR_PICK now contains camera settling, base approach/turn and the
     # final arm pregrasp; keep one bounded stage timeout for that sequence.
     PREGRASP_TIMEOUT_S = 75.0

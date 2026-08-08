@@ -262,7 +262,7 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
     def test_task2_uses_narrow_shelf_pregrasp_controller(self) -> None:
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())
         self.assertIsInstance(executor._pregrasp, ShelfOpenPregraspController)
-        self.assertAlmostEqual(executor._pregrasp.half_width, 0.18, places=6)
+        self.assertAlmostEqual(executor._pregrasp.half_width, 0.20, places=6)
 
     def test_task2_corrects_yaw0_shelf_fit_along_shelf_normal(self) -> None:
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())

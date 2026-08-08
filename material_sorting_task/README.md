@@ -8,10 +8,10 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
 和得分真值。任务 1 已提供显式 `nav_only`、`pregrasp_only`、`contact_only` 和
-`lift_only` 分段测试模式。新增的 `task12_full` 将已验证的导航与桌面抓取接到统一货架
-层状态识别、任务 1 空层放置、任务 2 货架抓取和原桌面点放置；任务 1/2 的切换仍只由
-Server 裁判确认。该整合模式已经通过本地接口和状态机测试，需在 4090 官方镜像中逐段
-标定验证。任务 3 仍为安全占位，不会把空动作误判为成功。
+`lift_only` 分段测试模式。`task12_full` 保留为任务 1/2 回归模式；新增的 `task123_full`
+在同一套接口中继续接入任务 3：复用任务 1 的桌面抓取与抬升、任务 1 保存的货架状态，
+并使用货架白色长方体的测量中心计算左侧放置位和安全释放位。任务切换仍只由 Server
+裁判确认；该整合模式已经通过本地接口和状态机测试，需在 4090 官方镜像中逐段标定验证。
 
 ## 目录
 
@@ -147,14 +147,14 @@ MATERIAL_DETECT_BACKEND=yolo \
 bash scripts/run_client.sh
 ```
 
-### 任务 1 + 任务 2 整合测试
+### 任务 1 + 任务 2 + 任务 3 整合测试
 
-`task12_full` 是唯一启用货架搬运与任务 2 的模式。它继续使用同一个
+`task12_full` 保留为任务 1/2 回归模式；`task123_full` 启用三任务完整整合。两者继续使用同一个
 `client_task.py` 发布底盘、升降柱、头部和双臂命令，不得同时启动旧版
 `client_task_1.py`、队友验证脚本或其他控制节点：
 
 ```bash
-MATERIAL_EXECUTION_MODE=task12_full \
+MATERIAL_EXECUTION_MODE=task123_full \
 MATERIAL_DETECT_BACKEND=yolo \
 MATERIAL_DETECTION_LOG_PERIOD=0 \
 bash scripts/run_client.sh
