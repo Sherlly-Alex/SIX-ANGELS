@@ -16,8 +16,15 @@ from shelf_geometry import ShelfGeometry, load_shelf_geometry
 
 TASK3_LEFT_CENTER_OFFSET_M = 0.238
 TASK3_SHELF_DEPTH_OFFSET_M = 0.050
-TASK3_SAFE_RELEASE_REAR_M = 0.060
-TASK3_SAFE_RELEASE_CENTER_INSET_M = 0.040
+# The original release point was only 0.06 m outward from the nominal shelf
+# centre and 0.04 m *toward* the packaging box.  Remote odometry showed the
+# held box physically stopped 0.10 m before that depth, while the lateral
+# inset left essentially no clearance between the two objects.  Release at a
+# shallower, truly left-side point that remains comfortably inside the
+# referee's 0.24 m XY radius.
+TASK3_SAFE_RELEASE_REAR_M = 0.170
+TASK3_SAFE_RELEASE_CENTER_INSET_M = 0.000
+TASK3_SAFE_RELEASE_RADIUS_MARGIN_M = 0.040
 TASK3_BOX_HALF_Z_M = 0.095
 
 
@@ -70,23 +77,48 @@ def task3_safe_release_target(
     *,
     rear_offset_m: float = TASK3_SAFE_RELEASE_REAR_M,
     center_inset_m: float = TASK3_SAFE_RELEASE_CENTER_INSET_M,
+    place_radius_m: float | None = None,
+    opening_yaw: float = 0.0,
+    radius_margin_m: float = TASK3_SAFE_RELEASE_RADIUS_MARGIN_M,
 ) -> tuple[float, float, float]:
-    """Move the release point slightly outward and toward shelf centre.
+    """Move a formal instruction target outward within its scoring radius.
 
-    The returned point remains within the Server task-3 scoring radius while
-    leaving extra clearance from the shelf back and side panel.  A later
-    visual push is deliberately optional; the first formal implementation can
-    release at this bounded safe point and then retreat.
+    ``scoring_target_world`` and ``place_radius_m`` come from this round's
+    structured instruction.  The offset follows the measured/calibrated shelf
+    opening direction instead of assuming world +X.  The legacy lateral inset
+    remains supported for compatibility but defaults to zero, preserving the
+    instructed left-side clearance from the packaging box.
     """
 
     target = _finite_point(scoring_target_world)
     rear = float(rear_offset_m)
     inset = float(center_inset_m)
+    yaw = float(opening_yaw)
+    margin = float(radius_margin_m)
     if not math.isfinite(rear) or rear < 0.0:
         raise ValueError("rear_offset_m must be finite and non-negative")
     if not math.isfinite(inset) or inset < 0.0:
         raise ValueError("center_inset_m must be finite and non-negative")
-    return (float(target[0] + rear), float(target[1] + inset), target[2])
+    if not math.isfinite(yaw):
+        raise ValueError("opening_yaw must be finite")
+    if not math.isfinite(margin) or margin < 0.0:
+        raise ValueError("radius_margin_m must be finite and non-negative")
+    if place_radius_m is not None:
+        radius = float(place_radius_m)
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError("place_radius_m must be finite and positive")
+        rear = min(rear, max(0.0, radius - margin - inset))
+    outward_x = math.cos(yaw)
+    outward_y = math.sin(yaw)
+    # Positive lateral is the opening-frame +Y direction.  It is retained only
+    # for callers that explicitly request it; formal task 3 passes zero.
+    lateral_x = -outward_y
+    lateral_y = outward_x
+    return (
+        float(target[0] + rear * outward_x + inset * lateral_x),
+        float(target[1] + rear * outward_y + inset * lateral_y),
+        target[2],
+    )
 
 
 __all__ = [
@@ -94,6 +126,7 @@ __all__ = [
     "TASK3_LEFT_CENTER_OFFSET_M",
     "TASK3_SAFE_RELEASE_CENTER_INSET_M",
     "TASK3_SAFE_RELEASE_REAR_M",
+    "TASK3_SAFE_RELEASE_RADIUS_MARGIN_M",
     "TASK3_SHELF_DEPTH_OFFSET_M",
     "task3_safe_release_target",
     "task3_scoring_target",

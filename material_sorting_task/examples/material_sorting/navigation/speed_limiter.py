@@ -45,6 +45,16 @@ class SpeedLimiter:
     # public API
     # ------------------------------------------------------------------
 
+    @property
+    def prev_linear(self) -> Optional[float]:
+        """Last emitted linear command (m/s), or ``None`` after ``reset``."""
+        return self._prev_linear
+
+    @property
+    def max_angular(self) -> float:
+        """Configured absolute angular-speed cap (rad/s)."""
+        return float(self._limits.max_angular)
+
     def limit(
         self,
         candidate: VelocityCommand,

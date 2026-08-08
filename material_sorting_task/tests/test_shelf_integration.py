@@ -5,7 +5,8 @@ import unittest
 from types import SimpleNamespace
 
 from control_types import ArmCommand
-from desktop_grasp.pregrasp_core import SPINE_MIN
+from competition_controller import CompetitionController
+from desktop_grasp.pregrasp_core import PregraspPlanningError, SPINE_MIN
 from executors import build_task_executors
 from executors.base import ExecutionContext, StageStatus, TargetObservation, TaskStage
 from executors.task1_full import (
@@ -98,6 +99,51 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.layer_contents, ("packaging_box", "brown", "EMPTY"))
+
+    def test_uses_recent_static_packaging_during_fresh_colored_scan(self) -> None:
+        tracker = ShelfStateTracker(required_votes=3, max_observation_age_s=2.0)
+        result = None
+        # The fixed packaging prop was seen on arrival.  Fresh colour frames
+        # arrive during the head scan, while the held object occludes the prop.
+        for stamp in (30.0, 35.0, 40.0):
+            result = tracker.update(
+                {
+                    "brown": observation("brown", (-2.63, 0.778, 0.837), stamp),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.627, 0.692, 0.528), 15.0
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.layer_contents, ("packaging_box", "brown", "EMPTY"))
+
+    def test_task2_instruction_colour_rejects_early_wrong_colour_votes(self) -> None:
+        tracker = ShelfStateTracker(required_votes=3)
+        packaging = observation(
+            "packaging_box", (-2.634, 0.721, 0.569), 10.0
+        )
+
+        # Reproduce the remote run: the one physical shelf box is initially
+        # misclassified as pink.  Shelf ROI/layer evidence identifies the
+        # instance, while task 2's instruction supplies its canonical colour.
+        result = None
+        for stamp in (10.0, 11.0, 12.0):
+            result = tracker.update(
+                {
+                    "pink": observation("pink", (-2.63, 0.778, 1.168), stamp),
+                    "packaging_box": packaging,
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+                expected_colored_class_id="brown",
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.colored_class_id, "brown")
+        self.assertEqual(result.colored_center_world, (-2.63, 0.778, 1.168))
 
     def test_fails_closed_when_two_semantics_vote_for_same_layer(self) -> None:
         tracker = ShelfStateTracker(required_votes=3)
@@ -227,11 +273,93 @@ class SlideHoldControllerTests(unittest.TestCase):
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):
+    def test_task1_dedicated_shelf_scan_discards_transport_state(self) -> None:
+        memory = CompetitionTaskMemory()
+        executor = Task1IntegratedExecutor(memory)
+
+        # Model a provisional result collected while travelling.  It must not
+        # survive into the deliberate shelf scan or reach task 2/3 memory.
+        tracker = ShelfStateTracker(required_votes=2)
+        stale_state = None
+        for stamp in (1.0, 2.0):
+            stale_state = tracker.update(
+                {
+                    "pink": observation("pink", (-2.55, 0.81, 0.837), stamp),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.54, 0.78, 0.530), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="brown",
+            )
+        self.assertIsNotNone(stale_state)
+        assert stale_state is not None
+        executor._shelf_state = stale_state
+        memory.record_shelf_state(stale_state)
+
+        context = ExecutionContext(
+            now_s=2.0,
+            instruction={},
+            task_index=1,
+            attempt=1,
+        )
+        executor.enter_stage(TaskStage.ALIGN_FOR_PLACE, context)
+
+        self.assertIsNone(executor._shelf_state)
+        self.assertEqual(executor._shelf_tracker.frames_used, 0)
+        self.assertIsNone(memory.shelf_state)
+        self.assertIsNone(memory.shelf_empty_center_world)
+
     def test_task12_mode_uses_one_shared_memory_instance(self) -> None:
         executors = build_task_executors("task12_full")
         self.assertIsInstance(executors[1], Task1IntegratedExecutor)
         self.assertIsInstance(executors[2], Task2IntegratedExecutor)
         self.assertIs(executors[1]._memory, executors[2]._memory)
+
+    def test_controller_configures_task1_from_task2_instruction(self) -> None:
+        executors = build_task_executors("task123_full")
+        controller = CompetitionController(executors)
+        controller.configure(
+            [
+                {"task": 1, "target_color": "yellow"},
+                {"task": 2, "target_color": "brown"},
+                {"task": 3, "target_color": "pink"},
+            ]
+        )
+        self.assertEqual(executors[1]._expected_shelf_color, "brown")
+
+    def test_wrong_detector_colour_flows_to_task2_as_instructed_identity(self) -> None:
+        memory = CompetitionTaskMemory()
+        tracker = ShelfStateTracker(required_votes=3)
+        state = None
+        for stamp in (10.0, 11.0, 12.0):
+            state = tracker.update(
+                {
+                    # Remote failure: the brown shelf box was initially
+                    # reported as pink at the far observation stand.
+                    "pink": observation("pink", (-2.63, 0.778, 1.168), stamp),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.634, 0.721, 0.569), 10.0
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+                expected_colored_class_id="brown",
+            )
+        assert state is not None
+        memory.record_shelf_state(state)
+
+        task2 = Task2IntegratedExecutor(memory)
+        color, center = task2._task2_target(
+            ExecutionContext(
+                now_s=20.0,
+                instruction={"task": 2, "target_color": "brown"},
+                task_index=2,
+                attempt=1,
+            )
+        )
+        self.assertEqual(color, "brown")
+        self.assertEqual(center, (-2.63, 0.778, 1.168))
 
     def test_shared_memory_keeps_only_three_shelf_centers(self) -> None:
         tracker = ShelfStateTracker(required_votes=3)
@@ -426,6 +554,40 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(command[0], 0.0)
         self.assertIn("restoring shelf-facing yaw", detail)
 
+    def test_transfer_lateral_alignment_keeps_default_timeout(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 1.00),
+                math.pi,
+                _odom(-1.30, 0.85, math.pi),
+                0.0,
+            )
+        )
+        status, _command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.85, math.pi), 20.1
+        )
+        self.assertEqual(status, NavigationStatus.FAILED)
+        self.assertIn("limit=20.0s", detail)
+
+    def test_transfer_lateral_alignment_accepts_task_specific_timeout(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 1.00),
+                math.pi,
+                _odom(-1.30, 0.85, math.pi),
+                0.0,
+                timeout_s=35.0,
+            )
+        )
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.85, math.pi), 20.1
+        )
+        self.assertEqual(status, NavigationStatus.NAVIGATING)
+        self.assertEqual(command[0], 0.0)
+        self.assertIn("rotating toward shelf-front", detail)
+
     def test_arm_retract_targets_neutral_posture_and_waits_for_stability(self) -> None:
         controller = ArmRetractController()
         hold = ArmCommand(
@@ -599,6 +761,77 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertAlmostEqual(first.left_gripper_position, 0.83, places=6)
         self.assertAlmostEqual(first.right_gripper_position, 0.79, places=6)
         self.assertEqual(controller.target_center_base, (0.5, 0.0, 1.34))
+
+    def test_held_transport_supports_bounded_forward_insertion(self) -> None:
+        class RecordingKdl:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def inverse_kinematics(
+                self, *, T_left, T_right, ref_pos, target_height
+            ):
+                self.calls.append(
+                    (T_left.copy(), T_right.copy(), tuple(ref_pos), target_height)
+                )
+                return [list(ref_pos)]
+
+        kdl = RecordingKdl()
+        controller = HeldTransportController(
+            allow_extension=True,
+            max_translation_m=0.22,
+            kdl=kdl,
+        )
+        hold = ArmCommand(
+            spine_position=SPINE_MIN,
+            head_positions=(0.11, 0.42),
+            left_arm_positions=(0.3, -0.2, 0.4, 0.1, -0.3, 0.2),
+            left_gripper_position=0.83,
+            right_arm_positions=(-0.3, 0.2, -0.4, -0.1, 0.3, -0.2),
+            right_gripper_position=0.79,
+        )
+
+        first = controller.plan(
+            hold,
+            (0.72, 0.02, 1.10),
+            0.118,
+            target_center_base=(0.88, 0.0, 1.10),
+        )
+
+        self.assertEqual(first, hold)
+        self.assertEqual(controller.waypoint_count, 4)
+        self.assertEqual(len(kdl.calls), 4)
+        self.assertEqual(controller.target_center_base, (0.88, 0.0, 1.10))
+        self.assertAlmostEqual(first.left_gripper_position, 0.83, places=6)
+        self.assertAlmostEqual(first.right_gripper_position, 0.79, places=6)
+
+    def test_held_transport_rejects_insertion_beyond_bound(self) -> None:
+        class IdentityKdl:
+            def inverse_kinematics(
+                self, *, T_left, T_right, ref_pos, target_height
+            ):
+                return [list(ref_pos)]
+
+        controller = HeldTransportController(
+            allow_extension=True,
+            max_translation_m=0.22,
+            kdl=IdentityKdl(),
+        )
+        hold = ArmCommand(
+            spine_position=SPINE_MIN,
+            head_positions=(0.11, 0.42),
+            left_arm_positions=(0.3, -0.2, 0.4, 0.1, -0.3, 0.2),
+            left_gripper_position=0.83,
+            right_arm_positions=(-0.3, 0.2, -0.4, -0.1, 0.3, -0.2),
+            right_gripper_position=0.79,
+        )
+
+        with self.assertRaises(PregraspPlanningError):
+            controller.plan(
+                hold,
+                (0.72, 0.0, 1.10),
+                0.118,
+                target_center_base=(0.96, 0.0, 1.10),
+            )
 
     def test_carried_envelope_rejects_extended_direct_turn(self) -> None:
         checker = CarriedEnvelopeChecker()

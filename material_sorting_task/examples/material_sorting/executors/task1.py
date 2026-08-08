@@ -24,6 +24,11 @@ from desktop_grasp.pregrasp_core import (
     PregraspPlanningError,
     SlideLiftController,
 )
+from navigation.competition_adapter import (
+    format_nav_telemetry,
+    goal_reached_event,
+    refresh_dynamic_overlay,
+)
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import (
     NavigationGoal,
@@ -31,7 +36,8 @@ from navigation.navigation_types import (
     NavigationStatus,
     SpeedLimits,
 )
-from navigation.occupancy_grid import build_material_scene_grid
+from navigation.occupancy_grid import build_layered_scene_grid
+from navigation.robot_geometry import FootprintMode
 
 
 class Task1Executor(PlaceholderTaskExecutor):
@@ -72,8 +78,9 @@ class Task1NavigationExecutor:
             emergency_clearance=0.20,
             max_deceleration=0.50,
         )
+        self._navigation_grid = build_layered_scene_grid()
         self._navigation = NavigationController(
-            build_material_scene_grid(),
+            self._navigation_grid,
             speed_limits,
             pos_tolerance=self.POSITION_TOLERANCE_M,
             yaw_tolerance=self.YAW_TOLERANCE_RAD,
@@ -187,6 +194,14 @@ class Task1NavigationExecutor:
             )
             self._locked_target_world = calibrated_target
             self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+            refresh_dynamic_overlay(
+                self._navigation_grid,
+                context.target_observations,
+                exclude_color=target_color,
+                robot_xy=(robot_x, robot_y),
+            )
+            if hasattr(self._navigation, "set_footprint_mode"):
+                self._navigation.set_footprint_mode(FootprintMode.TRANSIT_STOWED)
             if not self._navigation.set_goal(self._goal, robot_x, robot_y):
                 return StageResult.blocked(
                     "task 1 could not plan a collision-free path to "
@@ -204,15 +219,21 @@ class Task1NavigationExecutor:
         status = self._navigation.status
         if status is NavigationStatus.GOAL_REACHED:
             return StageResult.succeeded(
-                "task 1 reached the detected table-side pick stand; stopping before arm motion"
+                "task 1 reached the detected table-side pick stand; "
+                f"stopping before arm motion; {goal_reached_event(self._goal)}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
             return StageResult.blocked(
                 f"task 1 navigation stopped safely with status={status.value}"
             )
+        telemetry = (
+            format_nav_telemetry(self._navigation.telemetry, phase="task1_pick")
+            if hasattr(self._navigation, "telemetry")
+            else "NAV_TEL unavailable_for_test_double"
+        )
         return StageResult.running(
             f"task 1 navigating to pick stand ({self._goal.x:.2f}, {self._goal.y:.2f}); "
-            f"nav_status={status.value}",
+            f"nav_status={status.value}; {telemetry}",
             base_command=(command.linear_x, command.angular_z),
         )
 

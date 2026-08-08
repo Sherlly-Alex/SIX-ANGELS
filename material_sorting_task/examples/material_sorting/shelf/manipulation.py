@@ -82,14 +82,23 @@ class HeldTransportController:
         self,
         *,
         target_center_x_m: float = TARGET_CENTER_X_M,
+        target_center_y_m: float = TARGET_CENTER_Y_M,
+        allow_extension: bool = False,
+        max_translation_m: float = 0.30,
         kdl: MMK2Kdl | None = None,
     ) -> None:
         self.target_center_x_m = float(target_center_x_m)
+        self.target_center_y_m = float(target_center_y_m)
+        self.allow_extension = bool(allow_extension)
+        self.max_translation_m = float(max_translation_m)
         if (
             not math.isfinite(self.target_center_x_m)
             or self.target_center_x_m <= 0.0
+            or not math.isfinite(self.target_center_y_m)
+            or not math.isfinite(self.max_translation_m)
+            or self.max_translation_m <= 0.0
         ):
-            raise ValueError("transport target center x must be finite and positive")
+            raise ValueError("transport target center/translation limit is invalid")
         if self.COMPACT_WAYPOINT_COUNT < 1:
             raise ValueError("transport compact waypoint count must be positive")
         self._kdl = kdl or MMK2Kdl()
@@ -125,6 +134,8 @@ class HeldTransportController:
         hold_command: ArmCommand,
         held_center_base: tuple[float, float, float],
         half_width_m: float,
+        *,
+        target_center_base: tuple[float, float, float] | None = None,
     ) -> ArmCommand:
         self.reset()
         start_center = np.asarray(held_center_base, dtype=float)
@@ -133,19 +144,33 @@ class HeldTransportController:
             raise PregraspInputError("held center is invalid for transport compaction")
         if not math.isfinite(half_width) or half_width <= 0.0:
             raise PregraspInputError("held half-width is invalid for transport compaction")
-        if start_center[0] < self.target_center_x_m - 0.02:
-            raise PregraspPlanningError(
-                "held box is already closer than the configured transport pose"
+        if target_center_base is None:
+            final_center = np.array(
+                [
+                    (
+                        self.target_center_x_m
+                        if self.allow_extension
+                        else min(float(start_center[0]), self.target_center_x_m)
+                    ),
+                    self.target_center_y_m,
+                    float(start_center[2]),
+                ],
+                dtype=float,
             )
-
-        final_center = np.array(
-            [
-                min(float(start_center[0]), self.target_center_x_m),
-                self.TARGET_CENTER_Y_M,
-                float(start_center[2]),
-            ],
-            dtype=float,
-        )
+        else:
+            final_center = np.asarray(target_center_base, dtype=float)
+            if final_center.shape != (3,) or not np.all(np.isfinite(final_center)):
+                raise PregraspInputError("explicit held target center is invalid")
+        if not self.allow_extension and final_center[0] > start_center[0] + 0.02:
+            raise PregraspPlanningError(
+                "held transport controller refused an outward extension"
+            )
+        translation_m = float(np.linalg.norm(final_center - start_center))
+        if translation_m > self.max_translation_m + 1e-9:
+            raise PregraspPlanningError(
+                "held-object translation exceeds safety bound: "
+                f"requested={translation_m:.3f}m, limit={self.max_translation_m:.3f}m"
+            )
         steps = self.COMPACT_WAYPOINT_COUNT
         reference = np.array(
             [

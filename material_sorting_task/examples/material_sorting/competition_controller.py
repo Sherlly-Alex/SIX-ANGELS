@@ -119,6 +119,15 @@ class CompetitionController:
         if self.instructions and self.state is not ControllerState.WAITING_FOR_INPUTS:
             raise RuntimeError("instructions changed after task execution started")
 
+        # Some integrated executors need cross-task facts before task 1 starts
+        # (for example, task 2's instructed shelf colour constrains task 1's
+        # shelf recognition).  Keep that coupling at the orchestration
+        # boundary instead of letting executors reach into ROS/client state.
+        for executor in self.executors.values():
+            configure = getattr(executor, "configure_instructions", None)
+            if callable(configure):
+                configure(normalized)
+
         self.instructions = normalized
         self.task_index = 0
         self.attempt = 1

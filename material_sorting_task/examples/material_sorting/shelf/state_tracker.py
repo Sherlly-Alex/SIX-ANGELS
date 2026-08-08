@@ -95,6 +95,12 @@ class ShelfStateTracker:
     COLORED_HALF_Z = 0.095
     PACKAGING_HALF_Z = 0.117
     SUPPORT_CLEARANCE = 0.010
+    # The packaging box is a fixed shelf prop.  It is commonly seen while
+    # driving to the observation stand and then occluded by the held box or
+    # head motion during the deliberate semantic scan.  Retain its last valid
+    # RGB-D observation for that short task-1 window; coloured boxes remain
+    # subject to the normal fresh-frame requirement.
+    STATIC_PACKAGING_MAX_AGE_S = 60.0
 
     def __init__(
         self,
@@ -131,6 +137,7 @@ class ShelfStateTracker:
         *,
         now_s: float,
         carried_class_id: str | None,
+        expected_colored_class_id: str | None = None,
     ) -> ShelfState | None:
         """Add one new detector frame and return a stable result when unique.
 
@@ -140,6 +147,9 @@ class ShelfStateTracker:
         """
 
         carried = str(carried_class_id or "").strip().lower()
+        expected = str(expected_colored_class_id or "").strip().lower()
+        if expected and expected not in COLORED_CLASSES:
+            raise ValueError(f"unsupported expected shelf colour {expected!r}")
         relevant: list[tuple[str, TargetObservation]] = []
         for raw_label, observation in observations.items():
             label = str(raw_label).strip().lower()
@@ -148,7 +158,12 @@ class ShelfStateTracker:
             if label not in COLORED_CLASSES and label not in WHITE_CLASSES:
                 continue
             age_s = max(0.0, float(now_s) - float(observation.received_at_s))
-            if age_s > self.max_observation_age_s:
+            max_age_s = (
+                self.STATIC_PACKAGING_MAX_AGE_S
+                if label in WHITE_CLASSES
+                else self.max_observation_age_s
+            )
+            if age_s > max_age_s:
                 continue
             relevant.append((label, observation))
 
@@ -158,10 +173,26 @@ class ShelfStateTracker:
         if signature and signature != self._last_signature:
             self._last_signature = signature
             frame: dict[str, tuple[int, tuple[float, float, float], float]] = {}
+            priorities: dict[str, int] = {}
             for label, observation in relevant:
-                classified = self._classify(label, observation)
+                # The formal scene has exactly one coloured box inside the
+                # shelf ROI, and all three validated instructions are known
+                # before task 1 starts.  Colour segmentation can transiently
+                # call that same physical shelf box pink before correcting it
+                # to brown at a closer view.  Use task 2's instructed identity
+                # after spatial/layer validation, while keeping the detector
+                # label in the frame signature so independent frames are still
+                # required.  An exact-label observation wins if a frame
+                # contains more than one colour candidate.
+                canonical_label = (
+                    expected if expected and label in COLORED_CLASSES else label
+                )
+                classified = self._classify(canonical_label, observation)
                 if classified is not None:
-                    frame[label] = classified
+                    priority = int(label == canonical_label)
+                    if priority >= priorities.get(canonical_label, -1):
+                        frame[canonical_label] = classified
+                        priorities[canonical_label] = priority
             self._frames.append(frame)
 
         return self.result()
