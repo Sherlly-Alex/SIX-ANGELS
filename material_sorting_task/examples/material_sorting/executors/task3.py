@@ -78,7 +78,11 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._locked_target_world = None
             self._locked_target_orientation = None
         elif stage is TaskStage.ACQUIRE_TARGET:
-            self._task3_target_tracker.reset(accept_after_s=float(context.now_s))
+            # Keep samples collected while navigating.  The target remains
+            # fixed on the table, so throwing away the navigation-stage
+            # observations can leave this stage with no fresh frames after
+            # the camera/arms settle at the pick stand.
+            pass
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             # Task 1's align-for-place stage starts a shelf scan.  Task 3 has
             # already inherited the stable shelf snapshot from task 1, so it
@@ -156,6 +160,21 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             color, observation, detail = self._top_box_observation(context)
         except RuntimeError as exc:
             return StageResult.blocked(str(exc))
+        if observation is not None:
+            estimate = self._task3_target_tracker.update(
+                observation,
+                now_s=context.now_s,
+                reference_layer_z=self.TABLE_BOX_CENTER_Z_M,
+            )
+            if estimate is not None:
+                center = estimate.center_world
+                self._task3_target_center = center
+                self._locked_target_world = (
+                    float(center[0]),
+                    float(center[1]),
+                    self.TABLE_BOX_CENTER_Z_M,
+                )
+                self._locked_target_orientation = self.SOURCE_ORIENTATION
         if self._goal is None:
             if observation is None:
                 elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
@@ -215,6 +234,12 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             color, observation, detail = self._top_box_observation(context)
         except RuntimeError as exc:
             return StageResult.blocked(str(exc))
+        if self._task3_target_center is not None and observation is None:
+            return StageResult.succeeded(
+                "task 3 reused the stable top-box center collected during navigation: "
+                f"center={tuple(round(value, 3) for value in self._locked_target_world or ())}, "
+                f"orientation={self.SOURCE_ORIENTATION}"
+            )
         estimate = self._task3_target_tracker.update(
             observation,
             now_s=context.now_s,

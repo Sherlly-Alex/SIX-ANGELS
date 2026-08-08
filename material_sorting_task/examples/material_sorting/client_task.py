@@ -424,12 +424,13 @@ class CompetitionClient(Node):
         )
 
     def _refresh_task3_detection_epoch(self) -> None:
-        """Clear task 3's colour before reacquiring the table-top box.
+        """Mark task 3 start without discarding its target observations.
 
-        The detector stream is continuous across all three tasks.  A colour
-        that belongs to task 3 may have been observed near the initial table
-        long before the robot returns from task 2, so task 3 must start a new
-        RGB-D observation epoch instead of consuming that old median.
+        The task-3 top box stays in the scene while tasks 1 and 2 run.  Its
+        rolling RGB-D median is therefore useful as soon as the robot turns
+        back toward the table.  Unlike task 2's shelf target, do not clear
+        this colour at the task boundary; the task-3 executor keeps fusing
+        the retained observation and any newer frames.
         """
 
         if self.controller.task_index != 2 or self.controller.stage not in {
@@ -447,10 +448,10 @@ class CompetitionClient(Node):
         key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
         if key == self._last_task3_detection_reset_key:
             return
-        self._reset_target_histories([target_color])
         self._last_task3_detection_reset_key = key
         self.get_logger().info(
-            f"task 3 detection epoch reset for {target_color}; waiting for fresh RGB-D frames"
+            f"task 3 retaining existing {target_color} RGB-D history; "
+            "continuing centre tracking from navigation"
         )
 
     def _publish_base_command(self, linear_x: float, angular_z: float) -> None:
