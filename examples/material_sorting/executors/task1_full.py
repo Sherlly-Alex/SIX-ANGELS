@@ -30,6 +30,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     name = "task1_integrated_table_to_empty_shelf"
 
     TABLE_RETREAT_M = 0.80
+    # Task1 benefits from arriving at the direct shelf route already facing
+    # west.  Task3 overrides this because its lower target row is reached by a
+    # south-west diagonal: forcing west first makes the path follower command a
+    # second turn immediately afterwards and can sweep the shallow-held box
+    # into the terminal safety boundary.
+    FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION = True
     SHELF_LEFT_TURN_YAW_TOLERANCE_RAD = 0.060
     SHELF_LEFT_TURN_MAX_SPEED_RADPS = 0.70
     # The old fixed x=-1.88 was a shelf-pick stand.  With a task-1 box held
@@ -46,6 +52,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     # scan stand already aligned with the final straight shelf approach.
     SHELF_OBSERVE_Y = 0.85
     SHELF_TURN_POSITION_TOLERANCE_M = 0.015
+    SHELF_SCAN_YAW_TOLERANCE_RAD = 0.010
     SHELF_YAW = math.pi
     SHELF_CLEARANCE_M = 0.055
     # Move the carried box slightly farther inside the shelf before release.
@@ -241,7 +248,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "turn_left_to_shelf"
+            self._phase = (
+                "turn_left_to_shelf"
+                if self.FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION
+                else "navigate_shelf_scan"
+            )
             self._motion_started = False
             self._transfer.reset()
 
@@ -292,7 +303,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     y=self._shelf_scan_stand[1],
                     yaw=self.SHELF_YAW,
                     position_tolerance=self.SHELF_TURN_POSITION_TOLERANCE_M,
-                    yaw_tolerance=0.010,
+                    yaw_tolerance=self.SHELF_SCAN_YAW_TOLERANCE_RAD,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_SHELF,
                     source_tag="integrated_task1_direct_shelf_scan",

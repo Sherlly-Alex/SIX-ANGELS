@@ -410,6 +410,12 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertAlmostEqual(final_stand[1], executor.TASK3_SAFE_RELEASE_Y + held[1], places=6)
         self.assertAlmostEqual(scan_stand[1], final_stand[1], places=6)
         self.assertAlmostEqual(target_y, 0.540, places=6)
+        self.assertFalse(
+            executor.FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION
+        )
+        self.assertAlmostEqual(
+            executor.SHELF_SCAN_YAW_TOLERANCE_RAD, 0.120, places=6
+        )
 
     def test_task3_packaging_left_target_has_physical_y_clearance(self) -> None:
         executor = Task3IntegratedExecutor(CompetitionTaskMemory())

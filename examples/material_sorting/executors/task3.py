@@ -722,6 +722,13 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # shorter Task1 retreat lets the planned arc sweep the carried box back
     # through the source table and stalls the chassis.
     TABLE_RETREAT_M = 0.80
+    # After the straight table retreat, navigate directly to the shelf-front
+    # placement row.  Starting from the north-facing retreat pose makes the
+    # navigation controller enter its rotate-in-place gate for the south-west
+    # route, then follow the single diagonal cleanly.  The inherited forced
+    # west turn was redundant and immediately followed by another path turn;
+    # in GS that arc stopped at (-0.899, 0.635) with 5 cm carry clearance.
+    FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION = False
     # Task3 is centred on the raised white support, not beside the east wall.
     # Navigate directly to the real 0.620 m dual-arm working distance.
     TABLE_STANDOFF_M = 0.620
@@ -1600,13 +1607,13 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_LIVE_ENTRY_INSIDE_X_TOLERANCE_M = 0.180
     TASK3_LIVE_ENTRY_Y_TOLERANCE_M = 0.060
     TASK3_LIVE_ENTRY_Z_TOLERANCE_M = 0.120
-    # Task3 reaches the safe turn Y while carrying the shallow-gripped object.
-    # Requiring the generic navigator to remove the final 2.5 cm can command a
-    # small terminal arc beside the source-table clearance boundary.  Accept
-    # the same 5 cm residual already validated for final shelf insertion, and
-    # use it again below when deciding whether lateral alignment is necessary.
-    TASK3_SHELF_Y_TOLERANCE_M = 0.050
+    # Hand the last shelf-facing correction to the explicit lateral/final
+    # alignment controller.  The direct navigator reaches this safe staging
+    # point within 6 cm and 0.12 rad; demanding 1 cm/0.01 rad makes it rotate
+    # the long carry footprint beside transient RGB-D overlays.
+    TASK3_SHELF_Y_TOLERANCE_M = 0.060
     SHELF_TURN_POSITION_TOLERANCE_M = TASK3_SHELF_Y_TOLERANCE_M
+    SHELF_SCAN_YAW_TOLERANCE_RAD = 0.120
     TASK3_RELEASE_BACKOFF_M = 0.140
     TASK3_RELEASE_SETTLE_S = 1.0
     TASK3_ENABLE_PUSH = False
