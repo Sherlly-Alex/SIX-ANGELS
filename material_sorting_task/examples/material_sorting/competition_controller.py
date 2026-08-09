@@ -119,6 +119,15 @@ class CompetitionController:
         if self.instructions and self.state is not ControllerState.WAITING_FOR_INPUTS:
             raise RuntimeError("instructions changed after task execution started")
 
+        # Some integrated executors need cross-task facts before task 1 starts
+        # (for example, task 2's instructed shelf colour constrains task 1's
+        # shelf recognition).  Keep that coupling at the orchestration
+        # boundary instead of letting executors reach into ROS/client state.
+        for executor in self.executors.values():
+            configure = getattr(executor, "configure_instructions", None)
+            if callable(configure):
+                configure(normalized)
+
         self.instructions = normalized
         self.task_index = 0
         self.attempt = 1
@@ -143,7 +152,11 @@ class CompetitionController:
         ):
             return self.snapshot()
 
-        if self.referee_driven and self._referee_finished(context):
+        if (
+            self.referee_driven
+            and self._referee_finished(context)
+            and not self._finishing_task3_safe_return()
+        ):
             self._transition(ControllerState.FINISHED, "referee reported all tasks finished")
             return self.snapshot()
 
@@ -397,6 +410,23 @@ class CompetitionController:
             "\u5168\u90e8\u4efb\u52a1\u7ed3\u675f" in task_text
             or "all tasks finished" in task_text
             or "all_tasks_done" in game_text
+        )
+
+    def _finishing_task3_safe_return(self) -> bool:
+        """Let the final task finish its local escape and end-zone alignment.
+
+        The referee awards task 3 as soon as placement is accepted and can
+        report the whole game finished while the robot is still beside the
+        shelf.  Stopping at that instant skips the post-release arm lift and
+        the final table-facing alignment.  Only defer the terminal referee
+        event while task 3's already-running local sequence is active; once it
+        succeeds and enters ``WAITING_FOR_REFEREE``, the next tick finishes the
+        controller normally.
+        """
+
+        return (
+            self.state is ControllerState.EXECUTING_STAGE
+            and self.task_id == 3
         )
 
     def _transition(self, state: ControllerState, message: str) -> None:

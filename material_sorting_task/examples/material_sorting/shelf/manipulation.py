@@ -82,14 +82,23 @@ class HeldTransportController:
         self,
         *,
         target_center_x_m: float = TARGET_CENTER_X_M,
+        target_center_y_m: float = TARGET_CENTER_Y_M,
+        allow_extension: bool = False,
+        max_translation_m: float = 0.30,
         kdl: MMK2Kdl | None = None,
     ) -> None:
         self.target_center_x_m = float(target_center_x_m)
+        self.target_center_y_m = float(target_center_y_m)
+        self.allow_extension = bool(allow_extension)
+        self.max_translation_m = float(max_translation_m)
         if (
             not math.isfinite(self.target_center_x_m)
             or self.target_center_x_m <= 0.0
+            or not math.isfinite(self.target_center_y_m)
+            or not math.isfinite(self.max_translation_m)
+            or self.max_translation_m <= 0.0
         ):
-            raise ValueError("transport target center x must be finite and positive")
+            raise ValueError("transport target center/translation limit is invalid")
         if self.COMPACT_WAYPOINT_COUNT < 1:
             raise ValueError("transport compact waypoint count must be positive")
         self._kdl = kdl or MMK2Kdl()
@@ -125,6 +134,8 @@ class HeldTransportController:
         hold_command: ArmCommand,
         held_center_base: tuple[float, float, float],
         half_width_m: float,
+        *,
+        target_center_base: tuple[float, float, float] | None = None,
     ) -> ArmCommand:
         self.reset()
         start_center = np.asarray(held_center_base, dtype=float)
@@ -133,19 +144,33 @@ class HeldTransportController:
             raise PregraspInputError("held center is invalid for transport compaction")
         if not math.isfinite(half_width) or half_width <= 0.0:
             raise PregraspInputError("held half-width is invalid for transport compaction")
-        if start_center[0] < self.target_center_x_m - 0.02:
-            raise PregraspPlanningError(
-                "held box is already closer than the configured transport pose"
+        if target_center_base is None:
+            final_center = np.array(
+                [
+                    (
+                        self.target_center_x_m
+                        if self.allow_extension
+                        else min(float(start_center[0]), self.target_center_x_m)
+                    ),
+                    self.target_center_y_m,
+                    float(start_center[2]),
+                ],
+                dtype=float,
             )
-
-        final_center = np.array(
-            [
-                min(float(start_center[0]), self.target_center_x_m),
-                self.TARGET_CENTER_Y_M,
-                float(start_center[2]),
-            ],
-            dtype=float,
-        )
+        else:
+            final_center = np.asarray(target_center_base, dtype=float)
+            if final_center.shape != (3,) or not np.all(np.isfinite(final_center)):
+                raise PregraspInputError("explicit held target center is invalid")
+        if not self.allow_extension and final_center[0] > start_center[0] + 0.02:
+            raise PregraspPlanningError(
+                "held transport controller refused an outward extension"
+            )
+        translation_m = float(np.linalg.norm(final_center - start_center))
+        if translation_m > self.max_translation_m + 1e-9:
+            raise PregraspPlanningError(
+                "held-object translation exceeds safety bound: "
+                f"requested={translation_m:.3f}m, limit={self.max_translation_m:.3f}m"
+            )
         steps = self.COMPACT_WAYPOINT_COUNT
         reference = np.array(
             [
@@ -318,6 +343,8 @@ class HeldTransportController:
 class ReleaseSpreadController(OpenPregraspController):
     """Move the two open grippers away from a placed object."""
 
+    MAX_RELATIVE_RELEASE_JOINT_DELTA = 0.75
+
     def plan(
         self,
         target_world: tuple[float, float, float],
@@ -333,6 +360,94 @@ class ReleaseSpreadController(OpenPregraspController):
             center_backoff_x=GRASP_BACKOFF_X,
             half_width=float(half_width),
         )
+
+    def plan_from_held(
+        self,
+        hold_command: ArmCommand,
+        held_center_base: tuple[float, float, float],
+        joint_states: Any,
+        *,
+        half_width: float,
+    ) -> ArmCommand:
+        """Spread around the already-reached base-frame centre.
+
+        Task 3 inserts the box with a bounded arm trajectory before lowering
+        it using only the spine.  Recomputing the centre from world odometry
+        after contact can shift the requested pose outside IK reach.  This
+        path keeps that achieved centre and height, seeds IK from measured
+        joints, and changes only the symmetric lateral spacing.
+        """
+
+        center = np.asarray(held_center_base, dtype=float)
+        width = float(half_width)
+        if center.shape != (3,) or not np.all(np.isfinite(center)):
+            raise PregraspInputError("held release centre is invalid")
+        if not math.isfinite(width) or width <= 0.0:
+            raise PregraspInputError("held release half-width is invalid")
+        positions, _velocities = _joint_maps(joint_states)
+        reference = np.array(
+            [
+                positions["slide_joint"],
+                *(positions[f"left_arm_joint{index}"] for index in range(1, 7)),
+                *(positions[f"right_arm_joint{index}"] for index in range(1, 7)),
+            ],
+            dtype=float,
+        )
+        arm_center = center + np.array(
+            [-GRASP_BACKOFF_X, 0.0, HAND_Z_OFFSET], dtype=float
+        )
+        left_target = arm_center + np.array([0.0, width, 0.0], dtype=float)
+        right_target = arm_center + np.array([0.0, -width, 0.0], dtype=float)
+        solutions = self._kdl.inverse_kinematics(
+            T_left=_make_transform(left_target, LEFT_A_ROT),
+            T_right=_make_transform(right_target, RIGHT_A_ROT),
+            ref_pos=reference,
+            target_height=float(hold_command.spine_position),
+        )
+        if solutions is None or len(solutions) == 0:
+            raise PregraspPlanningError(
+                "dual-arm relative release IK failed for held_center_base="
+                f"{np.round(center, 3).tolist()}"
+            )
+        joints = np.asarray(solutions[0], dtype=float)
+        if joints.shape != (13,) or not np.all(np.isfinite(joints)):
+            raise PregraspPlanningError(
+                "relative release IK returned invalid joints"
+            )
+        joint_delta = float(np.max(np.abs(joints[1:] - reference[1:])))
+        if joint_delta > self.MAX_RELATIVE_RELEASE_JOINT_DELTA:
+            raise PregraspPlanningError(
+                "relative release IK changed branch; "
+                f"max joint delta={joint_delta:.3f} rad"
+            )
+
+        self._target_base = tuple(float(value) for value in center)
+        self._target_vector = np.array(
+            [
+                hold_command.spine_position,
+                *hold_command.head_positions,
+                *joints[1:7],
+                GRIPPER_OPEN,
+                *joints[7:13],
+                GRIPPER_OPEN,
+            ],
+            dtype=float,
+        )
+        self._action_vector = np.array(
+            [
+                positions["slide_joint"],
+                positions.get("head_yaw_joint", hold_command.head_positions[0]),
+                positions.get("head_pitch_joint", hold_command.head_positions[1]),
+                *(positions[f"left_arm_joint{index}"] for index in range(1, 7)),
+                hold_command.left_gripper_position,
+                *(positions[f"right_arm_joint{index}"] for index in range(1, 7)),
+                hold_command.right_gripper_position,
+            ],
+            dtype=float,
+        )
+        self._last_update_s = None
+        self._stable_since_s = None
+        return self.command()
 
 
 class ArmRetractController:

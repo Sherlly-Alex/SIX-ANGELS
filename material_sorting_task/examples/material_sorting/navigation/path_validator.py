@@ -1,38 +1,54 @@
 """Path validation — line-segment collision checking against the static grid.
 
 Samples waypoint segments at a configurable resolution and checks each sample
-point against the inflation-cost map.  Consecutive blocked confirmations are
-accumulated so that transient false-positives do not trigger an immediate
-replan.
+point against the inflation-cost map.  When a :class:`FootprintChecker` and a
+grid (layered or single) are supplied, every sample is additionally checked
+with the oriented chassis / arm envelope using the segment tangent as yaw.
+
+Consecutive blocked confirmations are accumulated so that transient
+false-positives do not trigger an immediate replan.
 """
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
-from navigation.occupancy_grid import OccupancyGrid
+from navigation.footprint_checker import FootprintChecker
+from navigation.occupancy_grid import LayeredGrid, OccupancyGrid
+from navigation.robot_geometry import FootprintMode
+
+GridLike = Union[OccupancyGrid, LayeredGrid]
 
 
 class PathValidator:
     """Check whether a global-path segment is blocked.
 
     Uses the same grid and inflation-cost definition as the A* planner so that
-    the "blocked" predicate is internally consistent.
+    the "blocked" predicate is internally consistent.  Optional oriented
+    footprint checks catch cases where a point-robot path is still free but
+    the chassis or arm envelope would graze a wall / shelf.
     """
 
     def __init__(
         self,
         *,
         inflation_radius: float = 1.0,
-        min_clearance: float = 0.15,
+        min_clearance: float = 0.22,
         sample_step: float = 0.05,
         confirm_threshold: int = 3,
+        footprint_checker: Optional[FootprintChecker] = None,
+        footprint_mode: FootprintMode = FootprintMode.TRANSIT_STOWED,
     ):
         self._inflation_radius = float(inflation_radius)
         self._min_clearance = float(min_clearance)
         self._sample_step = float(sample_step)
         self._confirm_threshold = int(confirm_threshold)
         self._consecutive_blocked: int = 0
+        self._footprint = footprint_checker
+        self._footprint_mode = footprint_mode
+
+    def set_footprint_mode(self, mode: FootprintMode) -> None:
+        self._footprint_mode = mode
 
     # ------------------------------------------------------------------
     # public API
@@ -42,7 +58,7 @@ class PathValidator:
         self,
         p1: Sequence[float],
         p2: Sequence[float],
-        grid: OccupancyGrid,
+        grid: GridLike,
     ) -> bool:
         """Return ``True`` if any point between *p1* and *p2* is blocked.
 
@@ -59,28 +75,35 @@ class PathValidator:
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
+        yaw = math.atan2(dy, dx) if length > 1e-9 else 0.0
+        planning = _planning_surface(grid)
         steps = max(1, int(math.ceil(length / self._sample_step)))
         for i in range(steps + 1):
             t = i / steps
             x = p1[0] + t * dx
             y = p1[1] + t * dy
-            gx, gy = grid.world_to_grid(x, y)
+            gx, gy = planning.world_to_grid(x, y)
             if gx < 0 or gy < 0:
                 return True
-            cost = grid.inflation_cost(
+            cost = planning.inflation_cost(
                 gx, gy,
                 inflation_radius=self._inflation_radius,
                 min_clearance=self._min_clearance,
             )
             if math.isinf(cost):
                 return True
+            if self._footprint is not None:
+                if not self._footprint.is_pose_free(
+                    grid, x, y, yaw, self._footprint_mode,
+                ):
+                    return True
         return False
 
     def path_blocked(
         self,
         path: Sequence[Sequence[float]],
         start_index: int,
-        grid: OccupancyGrid,
+        grid: GridLike,
         lookahead: float = 2.5,
     ) -> bool:
         """Walk *lookahead* metres forward from *start_index* on *path*.
@@ -119,7 +142,7 @@ class PathValidator:
         self,
         path: Sequence[Sequence[float]],
         start_index: int,
-        grid: OccupancyGrid,
+        grid: GridLike,
         lookahead: float = 2.5,
     ) -> bool:
         """Same as ``path_blocked``, but requires *confirm_threshold* consecutive
@@ -138,6 +161,12 @@ class PathValidator:
     @property
     def consecutive_blocked(self) -> int:
         return self._consecutive_blocked
+
+
+def _planning_surface(grid: GridLike) -> OccupancyGrid:
+    if isinstance(grid, LayeredGrid):
+        return grid.planning_grid()
+    return grid
 
 
 def _isfinite(v: float) -> bool:

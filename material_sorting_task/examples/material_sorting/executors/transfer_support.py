@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Mapping
 
+from navigation.competition_adapter import (
+    format_nav_telemetry,
+    goal_reached_event,
+    refresh_dynamic_overlay,
+)
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import NavigationGoal, NavigationStatus, SpeedLimits
-from navigation.occupancy_grid import build_material_scene_grid
+from navigation.occupancy_grid import build_layered_scene_grid
+from navigation.robot_geometry import FootprintMode
 
 
 def odometry_pose(odometry: Any) -> tuple[float, float, float] | None:
@@ -84,8 +90,9 @@ class TransferMotion:
             emergency_clearance=0.20,
             max_deceleration=0.50,
         )
+        self._navigation_grid = build_layered_scene_grid()
         self._navigation = NavigationController(
-            build_material_scene_grid(),
+            self._navigation_grid,
             limits,
             pos_tolerance=0.07,
             yaw_tolerance=0.06,
@@ -106,6 +113,7 @@ class TransferMotion:
         self._lateral_start_s: float | None = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
         self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
+        self._lateral_timeout_s = self.LATERAL_TIMEOUT_S
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -130,12 +138,32 @@ class TransferMotion:
         self._lateral_start_s = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
         self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
+        self._lateral_timeout_s = self.LATERAL_TIMEOUT_S
 
-    def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
+    def begin_navigation(
+        self,
+        goal: NavigationGoal,
+        odometry: Any,
+        *,
+        footprint_mode: FootprintMode = FootprintMode.TRANSIT_STOWED,
+        observations: Mapping[str, Any] | None = None,
+        exclude_color: str | None = None,
+        payload_z: float | None = None,
+    ) -> bool:
         pose = odometry_pose(odometry)
         if pose is None:
             return False
         self._navigation.reset()
+        refresh_dynamic_overlay(
+            self._navigation_grid,
+            observations,
+            exclude_color=exclude_color,
+            robot_xy=(pose[0], pose[1]),
+        )
+        self._navigation.set_footprint_mode(
+            footprint_mode,
+            payload_z=payload_z,
+        )
         self._goal = goal
         self._last_tick_s = None
         return self._navigation.set_goal(goal, pose[0], pose[1])
@@ -159,8 +187,11 @@ class TransferMotion:
         status = self._navigation.status
         detail = (
             f"goal=({self._goal.x:.2f}, {self._goal.y:.2f}, "
-            f"{self._goal.yaw:.2f}); nav_status={status.value}"
+            f"{self._goal.yaw:.2f}); nav_status={status.value}; "
+            f"{format_nav_telemetry(self._navigation.telemetry, phase='transfer')}"
         )
+        if status is NavigationStatus.GOAL_REACHED:
+            detail = f"{detail}; {goal_reached_event(self._goal)}"
         return status, (command.linear_x, command.angular_z), detail
 
     def begin_lateral_alignment(
@@ -172,6 +203,7 @@ class TransferMotion:
         *,
         position_tolerance_m: float | None = None,
         yaw_tolerance_rad: float | None = None,
+        timeout_s: float | None = None,
     ) -> bool:
         """Start a bounded shelf-front lateral alignment.
 
@@ -200,6 +232,11 @@ class TransferMotion:
                 if yaw_tolerance_rad is None
                 else float(yaw_tolerance_rad)
             )
+            timeout = (
+                self.LATERAL_TIMEOUT_S
+                if timeout_s is None
+                else float(timeout_s)
+            )
         except (TypeError, ValueError, IndexError):
             return False
         if (
@@ -208,6 +245,8 @@ class TransferMotion:
             or tolerance <= 0.0
             or not math.isfinite(yaw_tolerance)
             or yaw_tolerance <= 0.0
+            or not math.isfinite(timeout)
+            or timeout <= 0.0
             or not all(
                 math.isfinite(value)
                 for value in (target_x, target_y, target_yaw, start_s)
@@ -224,6 +263,7 @@ class TransferMotion:
         self._lateral_final_yaw = target_yaw
         self._lateral_position_tolerance_m = tolerance
         self._lateral_yaw_tolerance_rad = yaw_tolerance
+        self._lateral_timeout_s = timeout
         self._lateral_heading = (
             math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
         )
@@ -252,10 +292,11 @@ class TransferMotion:
                 "lateral alignment was not started"
             )
         elapsed = max(0.0, float(now_s) - self._lateral_start_s)
-        if elapsed > self.LATERAL_TIMEOUT_S:
+        if elapsed > self._lateral_timeout_s:
             self._lateral_phase = "failed"
             return NavigationStatus.FAILED, (0.0, 0.0), (
-                f"lateral alignment timed out after {elapsed:.1f}s"
+                f"lateral alignment timed out after {elapsed:.1f}s "
+                f"(limit={self._lateral_timeout_s:.1f}s)"
             )
 
         target_x, target_y = self._lateral_target

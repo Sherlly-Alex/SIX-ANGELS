@@ -179,3 +179,5 @@ python3 scripts/check_workspace.py
 ```
 
 开发约束和后续实现顺序见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+导航 v3 的兼容边界、接入结构和本地/SSH 验证步骤见
+[docs/NAVIGATION_V3_INTEGRATION.md](docs/NAVIGATION_V3_INTEGRATION.md)。

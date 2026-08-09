@@ -54,7 +54,7 @@ class GlobalPlanner:
         goal_y: float,
         *,
         inflation_radius: float = 1.0,
-        min_clearance: float = 0.15,
+        min_clearance: float = 0.22,
         cost_weight: float = 4.0,
     ) -> List[Tuple[float, float]]:
         """Return a list of ``(x, y)`` waypoints from start to goal.
@@ -69,6 +69,7 @@ class GlobalPlanner:
             Distance (m) beyond which inflation cost returns to 1.0 (baseline).
         min_clearance:
             Distance (m) within which a cell is considered impassable.
+            Default 0.22 m matches the MMK2 chassis half-width plus margin.
         cost_weight:
             Multiplier for the quadratic-cost gradient.
 
@@ -158,14 +159,15 @@ class GlobalPlanner:
         start_y: float,
         goal: NavigationGoal,
         *,
-        min_clearance: float = 0.15,
+        min_clearance: float = 0.22,
     ) -> List[Tuple[float, float]]:
         """Convenience: plan to a ``NavigationGoal``.
 
         The per-goal ``safety_radius`` is *not* used as the obstacle clearance
         (it encodes the standoff from the target, not a hardware limit). A
-        fixed ``min_clearance`` of 0.15 m is used for safety — the caller may
-        override.
+        fixed ``min_clearance`` of 0.22 m (chassis half-width + margin) is used
+        for safety — the caller may override. Arm / carry envelopes are handled
+        by the oriented footprint checker, not by this point-robot clearance.
         """
         return self.plan_path(
             start_x=start_x,

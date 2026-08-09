@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Mapping, Sequence
 
 from desktop_grasp.pregrasp_core import PregraspInputError, PregraspPlanningError
 from executors.base import ArmCommand, ExecutionContext, StageResult, StageStatus, TaskStage
@@ -14,12 +15,13 @@ from executors.transfer_support import (
     world_to_base,
 )
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
+from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import (
     ArmRetractController,
     ReleaseSpreadController,
     SlideHoldController,
 )
-from shelf.state_tracker import ShelfState, ShelfStateTracker
+from shelf.state_tracker import COLORED_CLASSES, ShelfState, ShelfStateTracker
 from shelf.task_memory import CompetitionTaskMemory
 
 
@@ -56,6 +58,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         super().__init__()
         self._memory = memory
+        self._expected_shelf_color: str | None = None
         self._shelf_tracker = ShelfStateTracker()
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
@@ -74,6 +77,25 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         # Keep a phase-local deadline so a slow lowering motion cannot consume
         # the whole release timeout before the grippers even start to open.
         self._phase_started_s = 0.0
+
+    def configure_instructions(self, instructions: Sequence[Mapping]) -> None:
+        """Bind task 2's instructed colour as task 1 shelf-scan context."""
+
+        task2 = [item for item in instructions if int(item.get("task", 0)) == 2]
+        if len(task2) != 1:
+            raise ValueError("task 1 requires exactly one task-2 instruction")
+        color = str(task2[0].get("target_color", "")).strip().lower()
+        if color not in COLORED_CLASSES:
+            raise ValueError(f"task 2 has unsupported shelf colour {color!r}")
+        task1 = [item for item in instructions if int(item.get("task", 0)) == 1]
+        if len(task1) != 1:
+            raise ValueError("task 1 requires exactly one task-1 instruction")
+        carried_color = str(task1[0].get("target_color", "")).strip().lower()
+        if carried_color == color:
+            raise ValueError(
+                "task-1 carried colour and task-2 shelf colour must be distinct"
+            )
+        self._expected_shelf_color = color
 
     def reset(self) -> None:
         super().reset()
@@ -100,14 +122,21 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         if stage is TaskStage.TRANSPORT:
             self._transfer.reset()
-            # Begin fusing shelf detections as soon as the shelf enters the
-            # camera view during transport.
+            # A new task-1 transport starts one fresh, continuous shelf
+            # observation epoch.  Later tasks inherit this executor but must
+            # retain task 1's shared shelf snapshot.
             self._shelf_tracker.reset()
             self._shelf_state = None
+            if self.task_id == 1:
+                self._memory.clear_shelf_state()
             self._phase = "retreat_table"
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
             self._transfer.reset()
+            # Do not reset here.  Frames collected from the moment the shelf
+            # enters view remain valid at the observation stand.  If transport
+            # already produced a complete stable state, the scan stage can use
+            # it immediately; otherwise it simply keeps adding new frames.
             self._phase = "scan_shelf"
         elif stage is TaskStage.PLACE:
             self._slide_hold.reset()
@@ -238,7 +267,13 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_SHELF,
                     source_tag="integrated_task1_safe_shelf_turn",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal,
+                    context.odometry,
+                    footprint_mode=FootprintMode.TRANSIT_CARRY,
+                    observations=context.target_observations,
+                    exclude_color=str(context.instruction.get("target_color", "")),
+                ):
                     return StageResult.blocked(
                         "task 1 could not plan a safe route to the shelf turn point",
                         arm_command=self._held_arm_command,
@@ -289,6 +324,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 1 shelf alignment has no held object")
         if self._phase == "scan_shelf":
+            if self._expected_shelf_color is None:
+                return StageResult.blocked(
+                    "task 1 shelf scan has no configured task-2 target colour",
+                    arm_command=self._held_arm_command,
+                )
             scan_elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
             pitch_index = min(
                 len(self.SHELF_SCAN_PITCHES) - 1,
@@ -296,16 +336,29 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             pitch = self.SHELF_SCAN_PITCHES[pitch_index]
             self._held_arm_command = _with_head_pitch(self._held_arm_command, pitch)
-            state = self._shelf_state or self._update_shelf_state(context)
+            # Continue the same transport-time observation epoch.  The shelf
+            # tracker locks the coloured target and packaging box independently,
+            # so either target remains available if the carried box later hides it.
+            state = self._update_shelf_state(context)
             if state is None:
                 if scan_elapsed >= self.SHELF_SCAN_TIMEOUT_S:
                     return StageResult.blocked(
-                        "task 1 shelf recognition timed out without two stable occupied layers",
+                        "task 1 shelf recognition timed out without two stable "
+                        f"occupied layers; {self._shelf_tracker.diagnostic_summary}",
                         arm_command=self._held_arm_command,
                     )
                 return StageResult.running(
-                    "task 1 scanning shelf semantics; "
-                    f"head_pitch={pitch:.2f}, accepted_frames={self._shelf_tracker.frames_used}",
+                    "task 1 scanning shelf semantics for task-2 colour "
+                    f"{self._expected_shelf_color!r}; "
+                    f"head_pitch={pitch:.2f}, "
+                    f"{self._shelf_tracker.diagnostic_summary}",
+                    arm_command=self._held_arm_command,
+                )
+            if state.colored_class_id != self._expected_shelf_color:
+                return StageResult.blocked(
+                    "task 1 shelf scan produced a colour outside its task-2 "
+                    f"instruction constraint: expected={self._expected_shelf_color!r}, "
+                    f"observed={state.colored_class_id!r}",
                     arm_command=self._held_arm_command,
                 )
             self._memory.record_shelf_state(state)
@@ -413,6 +466,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             context.target_observations,
             now_s=context.now_s,
             carried_class_id=self._memory.task1_color,
+            expected_colored_class_id=self._expected_shelf_color,
         )
         if state is not None:
             self._shelf_state = state
@@ -629,7 +683,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_END,
                     source_tag="layout_end_zone_center",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal,
+                    context.odometry,
+                    observations=context.target_observations,
+                ):
                     return StageResult.blocked(
                         "task 1 could not plan a route to the end zone",
                         arm_command=self._held_arm_command,

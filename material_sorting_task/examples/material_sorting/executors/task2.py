@@ -32,6 +32,7 @@ from executors.transfer_support import (
 )
 from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
+from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import (
     ArmRetractController,
     ReleaseSpreadController,
@@ -304,7 +305,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 segment=NavigationSegment.NAV_SHELF,
                 source_tag="task1_shelf_state",
             )
-            if not self._transfer.begin_navigation(goal, context.odometry):
+            if not self._transfer.begin_navigation(
+                goal,
+                context.odometry,
+                observations=context.target_observations,
+                exclude_color=target_color,
+            ):
                 return StageResult.blocked(
                     "task 2 could not plan a safe path to the recognized shelf box"
                 )
@@ -983,7 +989,13 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_TABLE,
                     source_tag="task2_extended_hold_table_turn",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal,
+                    context.odometry,
+                    footprint_mode=FootprintMode.TRANSIT_CARRY,
+                    observations=context.target_observations,
+                    exclude_color=str(context.instruction.get("target_color", "")),
+                ):
                     return StageResult.blocked(
                         "task 2 could not start the table-facing in-place turn",
                         arm_command=self._held_arm_command,
@@ -1140,7 +1152,13 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             half_width = self._held_half_width()
         except RuntimeError as exc:
             return False, str(exc)
-        if not self._transfer.begin_navigation(goal, context.odometry):
+        if not self._transfer.begin_navigation(
+            goal,
+            context.odometry,
+            footprint_mode=FootprintMode.TRANSIT_CARRY,
+            observations=context.target_observations,
+            exclude_color=str(context.instruction.get("target_color", "")),
+        ):
             return False, f"task 2 could not plan {segment_name}"
         safety = self._carried_envelope.check_path(
             pose,
@@ -1520,7 +1538,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_END,
                     source_tag="layout_end_zone_center",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal,
+                    context.odometry,
+                    observations=context.target_observations,
+                ):
                     return StageResult.blocked(
                         "task 2 could not plan a route to the end zone",
                         arm_command=self._held_arm_command,
