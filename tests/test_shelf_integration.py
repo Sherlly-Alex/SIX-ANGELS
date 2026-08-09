@@ -14,6 +14,7 @@ from executors.task1_full import (
     target_delta_in_heading,
 )
 from executors.task2 import Task2IntegratedExecutor
+from executors.task3 import Task3IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
 from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment
@@ -22,6 +23,7 @@ from shelf.manipulation import (
     ArmRetractController,
     HeldTransportController,
     ShelfOpenPregraspController,
+    SlideHoldController,
 )
 from shelf.state_tracker import ShelfStateTracker
 from shelf.target_center import StableTargetCenterTracker
@@ -213,6 +215,73 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())
         self.assertIsInstance(executor._pregrasp, ShelfOpenPregraspController)
         self.assertAlmostEqual(executor._pregrasp.half_width, 0.18, places=6)
+        self.assertAlmostEqual(
+            executor._transfer.LATERAL_POSITION_TOLERANCE_M,
+            executor.SHELF_ALIGNMENT_Y_TOLERANCE_M,
+            places=6,
+        )
+
+    def test_task2_final_pregrasp_refreshes_far_staging_odometry(self) -> None:
+        class RecordingPregrasp:
+            def __init__(self, command) -> None:
+                self.planned = False
+                self.command = command
+                self.plan_odometry = None
+
+            def reset(self) -> None:
+                self.planned = False
+
+            def plan(self, _target, odometry, _joints):
+                self.planned = True
+                self.plan_odometry = odometry
+                return self.command
+
+            def update(self, _now_s, _joints):
+                return self.command, False, "final shelf pregrasp moving"
+
+        class CompletedAdvance:
+            def tick_advance(self, _odometry):
+                return True, (0.0, 0.0), "straight advance complete"
+
+        command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.45),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=1.0,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=1.0,
+        )
+        context = ExecutionContext(
+            now_s=5.0,
+            instruction={"target_color": "pink"},
+            task_index=2,
+            attempt=1,
+            odometry=_odom(-1.90, 0.778, math.pi),
+            joint_states=_arm_joint_state(
+                slide=command.spine_position,
+                head=command.head_positions,
+                left=command.left_arm_positions,
+                right=command.right_arm_positions,
+            ),
+        )
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+        executor.enter_stage(TaskStage.ALIGN_FOR_PICK, context)
+        executor._locked_target_world = (-2.63, 0.778, 0.50)
+        executor._coarse_target_world = executor._locked_target_world
+        executor._phase = "approach_pick"
+        executor._motion_started = True
+        stale_odometry = _odom(-1.50, 0.778, math.pi)
+        executor._arm_reference_odometry = stale_odometry
+        pregrasp = RecordingPregrasp(command)
+        executor._pregrasp = pregrasp
+        executor._transfer = CompletedAdvance()
+
+        result = executor._tick_align_for_pick(context)
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertIs(pregrasp.plan_odometry, context.odometry)
+        self.assertIs(executor._arm_reference_odometry, context.odometry)
+        self.assertIsNot(pregrasp.plan_odometry, stale_odometry)
 
     def test_place_stand_preserves_held_object_transform(self) -> None:
         stand = stand_from_held_center(
@@ -238,6 +307,232 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertAlmostEqual(carried_center_y, 0.85, places=6)
         self.assertGreater(carried_center_x, -2.465)
 
+    def test_task1_observation_stand_is_aligned_with_empty_slot_y(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        held = (0.70, -0.025, 0.984)
+        target_y = executor._shelf_observation_target_y(SimpleNamespace())
+        scan_stand = shelf_observation_stand(
+            held,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=target_y,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        final_stand = stand_from_held_center(
+            (-2.63, target_y, 0.837), held, executor.SHELF_YAW
+        )
+        self.assertAlmostEqual(target_y, 0.778, places=3)
+        self.assertAlmostEqual(scan_stand[1], final_stand[1], places=6)
+
+    def test_task1_transport_commands_direct_left_turn(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.0,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.0,
+        )
+        executor._held_center_base = (0.70, -0.02, 0.98)
+        executor._phase = "turn_left_to_shelf"
+        context = ExecutionContext(
+            now_s=1.0,
+            instruction={"target_color": "yellow"},
+            task_index=0,
+            attempt=1,
+            odometry=_odom(-0.21, 0.75, math.pi / 2.0),
+        )
+
+        result = executor._tick_transport(context)
+
+        self.assertAlmostEqual(executor.TABLE_RETREAT_M, 0.80, places=6)
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertTrue(result.controls_base)
+        self.assertEqual(result.base_linear_x, 0.0)
+        self.assertAlmostEqual(
+            result.base_angular_z,
+            executor.SHELF_LEFT_TURN_MAX_SPEED_RADPS,
+            places=6,
+        )
+        self.assertIn("LEFT", result.message)
+
+    def test_slide_hold_ignores_contact_arm_velocity_after_slide_settles(
+        self,
+    ) -> None:
+        controller = SlideHoldController()
+        hold = ArmCommand(
+            spine_position=0.40,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=1.0,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=1.0,
+        )
+        feedback = _arm_joint_state(
+            slide=0.40,
+            head=(0.0, 0.0),
+            left=(0.07,) * 6,
+            right=(0.07,) * 6,
+        )
+        feedback.velocity = [
+            0.0 if name == "slide_joint" else 0.05
+            for name in feedback.name
+        ]
+        controller.plan(hold, 0.40, feedback)
+
+        _command, reached, _detail = controller.update(0.0, feedback)
+        self.assertFalse(reached)
+        _command, reached, detail = controller.update(0.60, feedback)
+
+        self.assertTrue(reached)
+        self.assertIn("slide_vel=0.000", detail)
+        self.assertIn("max_vel=0.050", detail)
+
+    def test_task3_transport_targets_final_safe_left_row_directly(self) -> None:
+        executor = Task3IntegratedExecutor(CompetitionTaskMemory())
+        held = (0.58, 0.002, 1.104)
+        target_y = executor._shelf_observation_target_y(SimpleNamespace())
+        scan_stand = shelf_observation_stand(
+            held,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=target_y,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        final_stand = stand_from_held_center(
+            (executor.TASK3_RELEASE_X, executor.TASK3_SAFE_RELEASE_Y, 1.164),
+            held,
+            executor.SHELF_YAW,
+        )
+        self.assertAlmostEqual(target_y, executor.TASK3_SHELF_TURN_Y, places=6)
+        self.assertAlmostEqual(scan_stand[1], executor.TASK3_SHELF_TURN_Y + held[1], places=6)
+        self.assertAlmostEqual(final_stand[1], executor.TASK3_SAFE_RELEASE_Y + held[1], places=6)
+        self.assertAlmostEqual(scan_stand[1], final_stand[1], places=6)
+        self.assertAlmostEqual(target_y, 0.540, places=6)
+
+    def test_task3_packaging_left_target_has_physical_y_clearance(self) -> None:
+        executor = Task3IntegratedExecutor(CompetitionTaskMemory())
+        context = ExecutionContext(
+            now_s=10.0,
+            instruction={
+                "task": 3,
+                "target_color": "brown",
+                "direction": "left",
+            },
+            task_index=2,
+            attempt=1,
+            target_observations={
+                "packaging_box": observation(
+                    "packaging_box", (-2.646, 0.778, 0.851), 10.0
+                )
+            },
+        )
+
+        target = executor._task3_place_from_rgbd(context)
+
+        self.assertEqual(target[:2], (executor.TASK3_RELEASE_X, 0.540))
+        self.assertAlmostEqual(target[2], 0.829, places=6)
+        cuboid_gap_y = (
+            0.778 - target[1] - (executor.PACKAGING_HALF_Z + 0.080)
+        )
+        self.assertGreaterEqual(cuboid_gap_y, 0.040)
+
+    def test_task3_navigation_uses_stable_support_xy_directly(self) -> None:
+        executor = Task3IntegratedExecutor(CompetitionTaskMemory())
+        pose = _odom(-0.70, 0.55, math.pi / 2.0)
+
+        def make_context(stamp: float, target_x: float) -> ExecutionContext:
+            return ExecutionContext(
+                now_s=stamp,
+                instruction={
+                    "task": 3,
+                    "target_color": "brown",
+                    "place_type": "packaging_left",
+                },
+                task_index=2,
+                attempt=1,
+                odometry=pose,
+                target_observations={
+                    "brown": observation(
+                        "brown", (target_x, 2.30, 1.004), stamp
+                    ),
+                    "material_box": observation(
+                        "material_box", (-0.54, 2.30, 0.833), stamp
+                    ),
+                },
+            )
+
+        first = make_context(0.0, -0.40)
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, first)
+        for index, target_x in enumerate(
+            (-0.40, -0.53, -0.55, -0.54, -0.54, -0.54)
+        ):
+            executor.tick(
+                TaskStage.NAVIGATE_TO_PICK,
+                make_context(index * 0.12, target_x),
+            )
+
+        self.assertIsNotNone(executor.goal)
+        self.assertIsNotNone(executor._navigation_goal)
+        self.assertAlmostEqual(executor.goal.x, -0.54, places=6)
+        self.assertAlmostEqual(executor.goal.y, 1.68, places=6)
+        self.assertAlmostEqual(executor._navigation_goal.x, -0.54, places=6)
+        self.assertAlmostEqual(executor._navigation_goal.y, 1.38, places=6)
+
+        executor.enter_stage(
+            TaskStage.ALIGN_FOR_PICK, make_context(1.0, -0.54)
+        )
+        self.assertEqual(executor._task3_pick_phase, "face_target")
+
+    def test_task3_safe_turn_and_lateral_skip_share_y_tolerance(self) -> None:
+        executor = Task3IntegratedExecutor(CompetitionTaskMemory())
+        self.assertAlmostEqual(
+            executor.SHELF_TURN_POSITION_TOLERANCE_M,
+            executor.TASK3_SHELF_Y_TOLERANCE_M,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            executor._transfer.LATERAL_POSITION_TOLERANCE_M,
+            executor.TASK3_SHELF_Y_TOLERANCE_M,
+            places=6,
+        )
+
+    def test_task2_navigation_prefers_fused_y_over_live_drift(self) -> None:
+        memory = CompetitionTaskMemory(
+            task2_target_center_world=(-2.65, 0.778, 0.837)
+        )
+        executor = Task2IntegratedExecutor(memory)
+        context = SimpleNamespace(
+            instruction={"target_color": "brown"},
+            target_observations={
+                "brown": observation(
+                    "brown", (-2.65, 0.958, 0.837), 10.0
+                )
+            },
+        )
+        color, target = executor._task2_target(context)
+        self.assertEqual(color, "brown")
+        self.assertAlmostEqual(target[0], -2.63, places=6)
+        self.assertAlmostEqual(target[1], 0.778, places=6)
+
+    def test_already_y_aligned_motion_skips_lateral_rotation(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 0.778),
+                math.pi,
+                _odom(-1.30, 0.778, math.pi),
+                0.0,
+            )
+        )
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 0.778, math.pi), 0.05
+        )
+        self.assertEqual(status, NavigationStatus.GOAL_REACHED)
+        self.assertEqual(command, (0.0, 0.0))
+        self.assertIn("shelf-facing yaw restored", detail)
+
     def test_straight_shelf_delta_is_forward_when_target_is_west(self) -> None:
         forward, lateral = target_delta_in_heading(
             (-1.30, 0.825, 3.141592653589793),
@@ -258,6 +553,26 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertAlmostEqual(command[1], 0.0, places=6)
         done, command, _detail = motion.tick_advance(
             _odom(-1.58, 0.85, 3.141592653589793)
+        )
+        self.assertTrue(done)
+        self.assertEqual(command, (0.0, 0.0))
+
+    def test_transfer_advance_honors_stricter_completion_tolerance(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_advance(
+                _odom(0.0, 0.0, 0.0),
+                0.30,
+                completion_tolerance_m=0.005,
+            )
+        )
+        done, command, _detail = motion.tick_advance(
+            _odom(0.291, 0.0, 0.0)
+        )
+        self.assertFalse(done)
+        self.assertGreater(command[0], 0.0)
+        done, command, _detail = motion.tick_advance(
+            _odom(0.296, 0.0, 0.0)
         )
         self.assertTrue(done)
         self.assertEqual(command, (0.0, 0.0))

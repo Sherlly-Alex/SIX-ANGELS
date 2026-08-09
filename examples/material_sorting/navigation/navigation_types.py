@@ -32,6 +32,8 @@ class NavigationStatus(Enum):
 
     IDLE = "idle"
     NAVIGATING = "navigating"
+    FINAL_POSITIONING = "final_positioning"
+    FINAL_ALIGNING = "final_aligning"
     GOAL_REACHED = "goal_reached"
     BLOCKED = "blocked"
     REPLANNING = "replanning"
@@ -162,3 +164,38 @@ class SpeedLimits:
     max_angular_accel: float
     emergency_clearance: float
     max_deceleration: float
+
+
+@dataclass(frozen=True)
+class NavigationTelemetry:
+    """Per-tick snapshot of navigation internals for regression / logs.
+
+    Fields match the handoff document §9 list, plus the phase-A/C metrics
+    (``footprint_min_clearance``, ``rotate_in_place``, ``lookahead``, ``kappa``).
+
+    ``path_length`` / ``planned_straight`` are frozen at ``set_goal`` so the
+    phase-D detour gate (path ≤ 2× chord) is not polluted by shrinking
+    remaining distance as the robot approaches the goal.
+    """
+
+    status: str
+    x: float
+    y: float
+    yaw: float
+    goal_x: float
+    goal_y: float
+    goal_yaw: float
+    dist_err: float
+    yaw_err: float
+    cmd_lin: float
+    cmd_ang: float
+    footprint_min_clearance: float
+    rotate_in_place: bool
+    lookahead: float
+    kappa: float
+    path_deviation: float
+    footprint_mode: str
+    path_length: float = 0.0
+    straight_distance: float = 0.0
+    planned_straight: float = 0.0
+    segment: str = ""

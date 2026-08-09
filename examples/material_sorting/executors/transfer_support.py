@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Any
 
+from navigation.dynamic_overlay import build_nav_overlay
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import NavigationGoal, NavigationStatus, SpeedLimits
-from navigation.occupancy_grid import build_material_scene_grid
+from navigation.occupancy_grid import build_layered_scene_grid
+from navigation.robot_geometry import FootprintMode
 
 
 def odometry_pose(odometry: Any) -> tuple[float, float, float] | None:
@@ -67,6 +70,49 @@ def stand_from_held_center(
     )
 
 
+def navigation_overlay_from_context(
+    context: Any,
+    robot_xy: tuple[float, float],
+    *,
+    exclude_target: bool,
+) -> list:
+    """Convert fresh formal perception observations into dynamic volumes."""
+
+    observations = getattr(context, "target_observations", None)
+    if not isinstance(observations, Mapping):
+        return []
+    try:
+        now_s = float(getattr(context, "now_s"))
+    except (TypeError, ValueError):
+        now_s = float("nan")
+    detections = []
+    for key, observation in observations.items():
+        try:
+            color = str(getattr(observation, "color", key)).strip().lower()
+            xyz = tuple(float(v) for v in observation.position_world[:3])
+            score = float(getattr(observation, "score", 0.0))
+            received_at_s = float(observation.received_at_s)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+            continue
+        if math.isfinite(now_s) and now_s - received_at_s > 2.0:
+            continue
+        detections.append((color, xyz, score))
+    exclude_color = None
+    if exclude_target:
+        instruction = getattr(context, "instruction", {})
+        if isinstance(instruction, Mapping):
+            exclude_color = str(
+                instruction.get("target_color", "")
+            ).strip().lower() or None
+    return build_nav_overlay(
+        detections=detections,
+        exclude_color=exclude_color,
+        robot_xy=robot_xy,
+    )
+
+
 class TransferMotion:
     """Collision-aware navigation plus short straight-line retreat motions."""
 
@@ -77,21 +123,25 @@ class TransferMotion:
 
     def __init__(self) -> None:
         limits = SpeedLimits(
-            max_linear=0.18,
-            max_angular=0.55,
-            max_linear_accel=0.30,
-            max_angular_accel=1.0,
+            max_linear=0.34,
+            max_angular=0.75,
+            max_linear_accel=0.50,
+            max_angular_accel=1.50,
             emergency_clearance=0.20,
-            max_deceleration=0.50,
+            max_deceleration=0.70,
         )
+        self._nav_grid = build_layered_scene_grid()
         self._navigation = NavigationController(
-            build_material_scene_grid(),
+            self._nav_grid,
             limits,
             pos_tolerance=0.07,
             yaw_tolerance=0.06,
-            lookahead_distance=0.40,
+            lookahead_distance=0.45,
+            terminal_linear_max=0.16,
+            terminal_turn_max=0.70,
             timeout=180.0,
             emergency_distance=0.20,
+            footprint_mode=FootprintMode.TRANSIT_STOWED,
         )
         self._goal: NavigationGoal | None = None
         self._last_tick_s: float | None = None
@@ -99,6 +149,7 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start: tuple[float, float, float] | None = None
         self._advance_distance_m = 0.0
+        self._advance_completion_tolerance_m = 0.015
         self._lateral_target: tuple[float, float] | None = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
@@ -111,7 +162,11 @@ class TransferMotion:
 
     @property
     def navigation_path(self) -> tuple[tuple[float, float], ...]:
-        return self._navigation.path
+        return tuple(self._navigation.path)
+
+    @property
+    def navigation_telemetry(self):
+        return self._navigation.telemetry
 
     def reset(self) -> None:
         self._navigation.reset()
@@ -121,17 +176,50 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start = None
         self._advance_distance_m = 0.0
+        self._advance_completion_tolerance_m = 0.015
         self._lateral_target = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
         self._lateral_phase = "idle"
         self._lateral_start_s = None
 
-    def begin_navigation(self, goal: NavigationGoal, odometry: Any) -> bool:
+    def _refresh_navigation_context(
+        self,
+        odometry: Any,
+        context: Any,
+        *,
+        footprint_mode: FootprintMode | None,
+        exclude_target: bool,
+    ) -> None:
+        if footprint_mode is not None:
+            self._navigation.set_footprint_mode(footprint_mode)
+        if context is None:
+            return
+        pose = odometry_pose(odometry)
+        if pose is None:
+            self._nav_grid.clear_dynamic()
+            return
+        self._nav_grid.set_dynamic(navigation_overlay_from_context(
+            context, (pose[0], pose[1]), exclude_target=exclude_target,
+        ))
+
+    def begin_navigation(
+        self,
+        goal: NavigationGoal,
+        odometry: Any,
+        *,
+        context: Any = None,
+        footprint_mode: FootprintMode = FootprintMode.TRANSIT_STOWED,
+        exclude_target: bool = False,
+    ) -> bool:
         pose = odometry_pose(odometry)
         if pose is None:
             return False
         self._navigation.reset()
+        self._refresh_navigation_context(
+            odometry, context, footprint_mode=footprint_mode,
+            exclude_target=exclude_target,
+        )
         self._goal = goal
         self._last_tick_s = None
         return self._navigation.set_goal(goal, pose[0], pose[1])
@@ -140,7 +228,15 @@ class TransferMotion:
         self,
         odometry: Any,
         now_s: float,
+        *,
+        context: Any = None,
+        footprint_mode: FootprintMode | None = None,
+        exclude_target: bool = False,
     ) -> tuple[NavigationStatus, tuple[float, float], str]:
+        self._refresh_navigation_context(
+            odometry, context, footprint_mode=footprint_mode,
+            exclude_target=exclude_target,
+        )
         pose = odometry_pose(odometry)
         if pose is None:
             return NavigationStatus.IDLE, (0.0, 0.0), "waiting for valid odometry"
@@ -153,9 +249,12 @@ class TransferMotion:
         self._last_tick_s = now
         command = self._navigation.update(*pose, dt, obs=None)
         status = self._navigation.status
+        telemetry = self._navigation.telemetry
         detail = (
             f"goal=({self._goal.x:.2f}, {self._goal.y:.2f}, "
-            f"{self._goal.yaw:.2f}); nav_status={status.value}"
+            f"{self._goal.yaw:.2f}); nav_status={status.value}; "
+            f"clearance={telemetry.footprint_min_clearance:.3f}m; "
+            f"footprint={telemetry.footprint_mode}"
         )
         return status, (command.linear_x, command.angular_z), detail
 
@@ -238,7 +337,10 @@ class TransferMotion:
             if abs(yaw_error) <= self.LATERAL_YAW_TOLERANCE_RAD:
                 self._lateral_phase = "drive_lateral"
             else:
-                angular = max(-0.35, min(0.35, 1.4 * yaw_error))
+                angular = math.copysign(
+                    min(0.70, max(0.20, 1.8 * abs(yaw_error))),
+                    yaw_error,
+                )
                 return NavigationStatus.NAVIGATING, (0.0, angular), (
                     "lateral alignment rotating toward shelf-front direction; "
                     f"yaw_err={yaw_error:.3f}"
@@ -259,8 +361,8 @@ class TransferMotion:
                 )
                 desired_yaw = self._lateral_heading + heading_offset
                 yaw_error = _wrap_to_pi(desired_yaw - pose[2])
-                angular = max(-0.30, min(0.30, 1.2 * yaw_error))
-                linear = min(0.09, max(0.035, 0.55 * abs(y_error)))
+                angular = max(-0.45, min(0.45, 1.5 * yaw_error))
+                linear = min(0.14, max(0.05, 0.75 * abs(y_error)))
                 if abs(yaw_error) > 0.18:
                     linear = 0.0
                 return NavigationStatus.NAVIGATING, (linear, angular), (
@@ -275,7 +377,10 @@ class TransferMotion:
                 return NavigationStatus.GOAL_REACHED, (0.0, 0.0), (
                     "lateral alignment complete; shelf-facing yaw restored"
                 )
-            angular = max(-0.35, min(0.35, 1.4 * yaw_error))
+            angular = math.copysign(
+                    min(0.70, max(0.20, 1.8 * abs(yaw_error))),
+                    yaw_error,
+                )
             return NavigationStatus.NAVIGATING, (0.0, angular), (
                 "lateral alignment restoring shelf-facing yaw; "
                 f"yaw_err={yaw_error:.3f}"
@@ -328,7 +433,8 @@ class TransferMotion:
             math.sin(yaw_ref - pose[2]),
             math.cos(yaw_ref - pose[2]),
         )
-        linear = -min(0.12, max(0.04, 0.65 * remaining))
+        max_linear = 0.26 if remaining > 0.25 else 0.18
+        linear = -min(max_linear, max(0.08, 1.05 * remaining))
         angular = max(-0.25, min(0.25, 1.0 * yaw_error))
         if abs(yaw_error) > 0.08:
             linear = 0.0
@@ -344,22 +450,27 @@ class TransferMotion:
         distance_m: float,
         *,
         heading_yaw: float | None = None,
+        completion_tolerance_m: float = 0.015,
     ) -> bool:
         """Start a short forward motion at the current or explicit heading."""
 
         pose = odometry_pose(odometry)
         distance = float(distance_m)
+        completion_tolerance = float(completion_tolerance_m)
         yaw_ref = pose[2] if pose is not None and heading_yaw is None else heading_yaw
         if (
             pose is None
             or not math.isfinite(distance)
             or distance <= 0.0
+            or not math.isfinite(completion_tolerance)
+            or completion_tolerance <= 0.0
             or yaw_ref is None
             or not math.isfinite(float(yaw_ref))
         ):
             return False
         self._advance_start = (pose[0], pose[1], float(yaw_ref))
         self._advance_distance_m = distance
+        self._advance_completion_tolerance_m = completion_tolerance
         return True
 
     def tick_advance(self, odometry: Any) -> tuple[bool, tuple[float, float], str]:
@@ -375,13 +486,14 @@ class TransferMotion:
         dy = pose[1] - start_y
         advanced_m = dx * math.cos(yaw_ref) + dy * math.sin(yaw_ref)
         remaining = self._advance_distance_m - advanced_m
-        if remaining <= 0.015:
+        if remaining <= self._advance_completion_tolerance_m:
             return True, (0.0, 0.0), f"straight advance complete ({advanced_m:.3f} m)"
         yaw_error = math.atan2(
             math.sin(yaw_ref - pose[2]),
             math.cos(yaw_ref - pose[2]),
         )
-        linear = min(0.10, max(0.035, 0.55 * remaining))
+        max_linear = 0.28 if remaining > 0.25 else 0.15
+        linear = min(max_linear, max(0.05, 0.85 * remaining))
         angular = max(-0.20, min(0.20, 0.8 * yaw_error))
         if abs(yaw_error) > 0.08:
             linear = 0.0

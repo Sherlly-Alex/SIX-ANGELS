@@ -20,6 +20,7 @@ def select_local_goal(
     *,
     lookahead_distance: float = 1.2,
     closest_index: Optional[int] = None,
+    project_from_pose: bool = False,
 ) -> Tuple[float, float, float]:
     """Return ``(x, y, yaw)`` of the lookahead target on *global_path*.
 
@@ -35,6 +36,10 @@ def select_local_goal(
     closest_index:
         If given, start walking from this waypoint index.  When ``None`` the
         Euclidean nearest waypoint is used (robust to robot drift).
+    project_from_pose:
+        Project the robot onto the selected segment before walking. The
+        controller enables this while tracking; explicit closest_index callers
+        retain the documented start-at-waypoint behavior.
 
     Returns
     -------
@@ -71,7 +76,44 @@ def select_local_goal(
     else:
         start_idx = max(0, min(closest_index, n - 1))
 
-    accumulated = 0.0
+    # Project the robot onto the current segment and start the lookahead walk
+    # from that projection — not from the segment start.  Walking from the
+    # segment start would put the carrot *behind* the robot once it has
+    # progressed more than *lookahead_distance* along a long segment, which
+    # freezes pure-pursuit on reverse-goal docks (observed table→end).
+    if start_idx < n - 1:
+        a0 = global_path[start_idx]
+        b0 = global_path[start_idx + 1]
+        abx = b0[0] - a0[0]
+        aby = b0[1] - a0[1]
+        ab2 = abx * abx + aby * aby
+        if (closest_index is None or project_from_pose) and ab2 > 1e-12:
+            t0 = ((current_x - a0[0]) * abx + (current_y - a0[1]) * aby) / ab2
+            t0 = max(0.0, min(1.0, t0))
+            proj_x = a0[0] + t0 * abx
+            proj_y = a0[1] + t0 * aby
+        else:
+            proj_x, proj_y = float(a0[0]), float(a0[1])
+            t0 = 0.0
+        # Remaining length on the current segment after the projection.
+        rem_on_seg = math.hypot(b0[0] - proj_x, b0[1] - proj_y)
+        if rem_on_seg >= lookahead_distance or rem_on_seg < 1e-9:
+            if rem_on_seg < 1e-9:
+                # Already at/past b0 — fall through to the next segments.
+                start_idx = start_idx + 1
+                accumulated = 0.0
+            else:
+                t = lookahead_distance / rem_on_seg
+                lx = proj_x + t * (b0[0] - proj_x)
+                ly = proj_y + t * (b0[1] - proj_y)
+                return (lx, ly, _yaw_toward(a0, b0))
+        else:
+            # Consume the rest of this segment, then walk subsequent ones.
+            accumulated = rem_on_seg
+            start_idx = start_idx + 1
+    else:
+        accumulated = 0.0
+
     for i in range(start_idx, n - 1):
         a = global_path[i]
         b = global_path[i + 1]

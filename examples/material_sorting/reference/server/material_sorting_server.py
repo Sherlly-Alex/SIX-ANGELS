@@ -18,25 +18,33 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-from ros2_runtime import bootstrap_ros2_python
-bootstrap_ros2_python()
+
+# Support running this reference server in place or copied beside the Client.
+SCRIPT_DIR = Path(__file__).resolve().parent
+if (SCRIPT_DIR / "mjcf").is_dir():
+    TASK_DIR = SCRIPT_DIR
+    SERVER_DIR = SCRIPT_DIR
+else:
+    TASK_DIR = SCRIPT_DIR.parents[1]
+    SERVER_DIR = SCRIPT_DIR
+REPO_ROOT = TASK_DIR.parents[1]
+ROS2_EXAMPLES_DIR = REPO_ROOT / "examples" / "ros2"
+for import_dir in (ROS2_EXAMPLES_DIR, SERVER_DIR, TASK_DIR, REPO_ROOT):
+    if str(import_dir) not in sys.path:
+        sys.path.insert(0, str(import_dir))
+
+try:
+    from ros2_runtime import bootstrap_ros2_python
+except ModuleNotFoundError:
+    pass
+else:
+    bootstrap_ros2_python()
 import rclpy
 from rclpy._rclpy_pybind11 import RCLError
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import Bool, Header, Int32, String
 
-# 可迁移:从脚本自身位置推导示例目录和仓库根目录
-TASK_DIR = Path(__file__).resolve().parent
-REPO_ROOT = TASK_DIR.parents[1]
-ROS2_EXAMPLES_DIR = REPO_ROOT / "examples" / "ros2"
-if str(ROS2_EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(ROS2_EXAMPLES_DIR))
-if str(TASK_DIR) not in sys.path:
-    sys.path.insert(0, str(TASK_DIR))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-ASSETS_DIR = TASK_DIR / "models"
+ASSETS_DIR = Path(os.environ.get("MATERIAL_ASSETS_DIR", TASK_DIR / "models"))
 os.environ["DISCOVERSE_ASSETS_DIR"] = str(ASSETS_DIR)
 
 from discoverse.robots_env.mmk2_base import MMK2Cfg
@@ -47,7 +55,7 @@ SOURCE_XML = TASK_DIR / "mjcf" / "material_competition.xml"
 RUNTIME_XML = Path("/tmp/material_competition_ros2_runtime.xml")
 RUNTIME_LAYOUT_JSON = Path(os.environ.get("MATERIAL_RUNTIME_LAYOUT", "/tmp/material_competition_runtime_layout.json"))
 LAYOUT_JSON = TASK_DIR / "material_competition_layout.json"
-REFEREE_CONFIG_JSON = TASK_DIR / "referee_json" / "material_referee_config.json"
+REFEREE_CONFIG_JSON = SERVER_DIR / "referee_json" / "material_referee_config.json"
 
 # 出发/结束区中心（机器人朝北 +Y 面向原料区桌子）
 START_XY = np.array([-0.70, 0.55], dtype=float)
@@ -81,9 +89,10 @@ def env_flag(name, default):
 def configure_headless_render_compat(config):
     """修复上游渲染器在容器中拿到空显示器列表时的未初始化分辨率。
 
-    仅在 ``headless + enable_render`` 时生效；正常有窗口环境完全不改动。
+    仅在启用渲染且 screeninfo 未提供主显示器时注入兼容信息。
+    ``MATERIAL_HEADLESS=0`` 时 GLFW 窗口仍会正常创建。
     """
-    if not (getattr(config, "headless", False) and getattr(config, "enable_render", False)):
+    if not getattr(config, "enable_render", False):
         return
     try:
         import screeninfo

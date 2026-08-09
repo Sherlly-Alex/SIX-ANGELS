@@ -26,6 +26,7 @@ from executors.transfer_support import (
 )
 from navigation.carried_envelope import CarriedEnvelopeChecker
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
+from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import (
     ArmRetractController,
     ReleaseSpreadController,
@@ -33,6 +34,7 @@ from shelf.manipulation import (
     SlideHoldController,
 )
 from shelf.task_memory import CompetitionTaskMemory
+from shelf_geometry import DEFAULT_SHELF_XY
 from shelf.target_center import StableTargetCenterTracker
 
 
@@ -53,6 +55,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # motion at the old x=-1.88 made the elbows/grippers sweep through the
     # shelf obstacle while descending.
     SHELF_PICK_APPROACH_X = -1.50
+    SHELF_PICK_POSITION_TOLERANCE_M = 0.010
     # The final stand is derived from the detected object centre.  At the
     # shelf-facing yaw, keeping the object 0.75 m forward of the base matches
     # the verified dual-arm reach without reading a Server object coordinate.
@@ -66,7 +69,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     SHELF_ARM_APPROACH_TIMEOUT_S = 75.0
     SHELF_CENTER_CAMERA_SETTLE_S = 0.80
     SHELF_CENTER_ACQUIRE_TIMEOUT_S = 15.0
-    SHELF_FINAL_LATERAL_TOLERANCE_M = 0.05
+    SHELF_FINAL_LATERAL_TOLERANCE_M = 0.025
+    SHELF_ALIGNMENT_Y_TOLERANCE_M = 0.012
     SHELF_PREGRASP_HALF_WIDTH_M = 0.18
     # ALIGN_FOR_PICK now contains two arm moves plus the short base advance;
     # give both the staging and final pregrasp enough time in one stage.
@@ -103,8 +107,13 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         )
         self._memory = memory
         self._transfer = TransferMotion()
-        self._transfer.LATERAL_POSITION_TOLERANCE_M = 0.02
-        self._transfer.LATERAL_YAW_TOLERANCE_RAD = 0.02
+        # Navigation now arrives on the calibrated shelf-center Y.  Its stricter
+        # 12 mm gate skips rotation only when centring is genuinely complete;
+        # the separate 25 mm final gate accounts for the small yaw projection.
+        self._transfer.LATERAL_POSITION_TOLERANCE_M = (
+            self.SHELF_ALIGNMENT_Y_TOLERANCE_M
+        )
+        self._transfer.LATERAL_YAW_TOLERANCE_RAD = 0.008
         self._slide_hold = SlideHoldController()
         self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
@@ -238,6 +247,15 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._pregrasp.reset()
         self._staged_target_world = None
 
+    @staticmethod
+    def _calibrated_shelf_target(
+        center: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        """Use visual identity/layer Z with the public shelf-slot XY contract."""
+
+        x, y = (float(value) for value in DEFAULT_SHELF_XY)
+        return x, y, float(center[2])
+
     def _task2_target(
         self,
         context: ExecutionContext,
@@ -249,8 +267,27 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         if not target_color:
             raise RuntimeError("task 2 instruction has no target_color")
 
-        # Prefer the instructed colour's current RGB-D observation whenever
-        # it is actually on the shelf.
+        # Task 1.s unobstructed multi-frame shelf result provides identity and layer
+        # height.  The public scene contract fixes the shelf-slot X/Y; calibrate
+        # to that geometry so perspective drift cannot skew navigation or grasp.
+        try:
+            center = tuple(
+                float(value)
+                for value in self._memory.require_task2_target_center()
+            )
+        except RuntimeError:
+            center = ()
+        if len(center) == 3:
+            x, y, z = center
+            if (
+                -3.10 <= x <= -2.20
+                and 0.30 <= y <= 1.30
+                and 0.30 <= z <= 1.40
+            ):
+                return target_color, self._calibrated_shelf_target(center)
+
+        # Standalone/fallback operation can still use a current formal RGB-D
+        # observation when no shared Task-1 shelf result exists.
         observation = context.target_observations.get(target_color)
         if observation is not None:
             center = tuple(
@@ -263,11 +300,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     and 0.30 <= y <= 1.30
                     and 0.30 <= z <= 1.40
                 ):
-                    return target_color, center
+                    return target_color, self._calibrated_shelf_target(center)
 
-        # Before the instructed box is visible, use Task 1's shelf result only
-        # as a coarse navigation stand.  It must NOT override target_color.
-        return target_color, self._memory.require_task2_target_center()
+        raise RuntimeError(
+            "task 2 shelf target is unavailable from shared memory and live perception"
+        )
 
     def _tick_navigate_to_pick(self, context: ExecutionContext) -> StageResult:
         try:
@@ -275,26 +312,37 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         except RuntimeError as exc:
             return StageResult.blocked(str(exc))
         if not self._motion_started:
+            # Freeze exactly the coordinate used to create this navigation
+            # goal; later detector frames must not move the arrival Y while a
+            # path is already in progress.
+            self._coarse_target_world = center
             goal = NavigationGoal(
                 x=self.SHELF_PICK_APPROACH_X,
                 y=max(0.58, min(0.98, center[1])),
                 yaw=self.SHELF_YAW,
-                position_tolerance=0.06,
-                yaw_tolerance=0.06,
+                position_tolerance=self.SHELF_PICK_POSITION_TOLERANCE_M,
+                yaw_tolerance=0.008,
                 safety_radius=0.0,
                 segment=NavigationSegment.NAV_SHELF,
-                source_tag="task1_shelf_state",
+                source_tag="task1_shelf_state_target_y_aligned",
             )
-            if not self._transfer.begin_navigation(goal, context.odometry):
+            if not self._transfer.begin_navigation(
+                goal, context.odometry, context=context,
+                footprint_mode=FootprintMode.TRANSIT_STOWED,
+                exclude_target=True,
+            ):
                 return StageResult.blocked(
                     "task 2 could not plan a safe path to the recognized shelf box"
                 )
             self._motion_started = True
         status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+            context.odometry, context.now_s, context=context,
+            footprint_mode=FootprintMode.TRANSIT_STOWED,
+            exclude_target=True,
         )
         if status is NavigationStatus.GOAL_REACHED:
-            self._coarse_target_world = center
+            if self._coarse_target_world is None:
+                self._coarse_target_world = center
             return StageResult.succeeded(
                 f"task 2 reached the far shelf arm-staging stand for {target_color}"
             )
@@ -357,6 +405,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
             center = estimate.center_world
 
+        center = self._calibrated_shelf_target(center)
+
         if len(center) != 3 or not all(
             math.isfinite(v) for v in center
         ):
@@ -386,7 +436,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             "task 2 locked PRE-ARM Task1 fused shelf centre: "
             f"color={target_color}, "
             f"center={tuple(round(v, 3) for v in center)}; "
-            "close-range visual retargeting disabled"
+            "visual X/Y drift removed by shelf-slot calibration"
         )
 
     def _tick_align_for_pick(self, context: ExecutionContext) -> StageResult:
@@ -440,6 +490,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
             if result.status is StageStatus.SUCCEEDED:
                 self._pregrasp.reset()
+                self._arm_reference_odometry = None
                 self._phase = "acquire_center"
                 self._motion_started = False
                 self._transfer.reset()
@@ -487,7 +538,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-            self._locked_target_world = estimate.center_world
+            self._locked_target_world = self._calibrated_shelf_target(
+                estimate.center_world
+            )
             # The competition shelf slot has a fixed box orientation.  The
             # RGB-D cuboid orientation can flip under arm occlusion, so it is
             # not allowed to change the symmetric contact width here.
@@ -501,7 +554,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
             return StageResult.running(
                 "task 2 locked the detected shelf-box geometric centre at "
-                f"{tuple(round(value, 3) for value in estimate.center_world)} "
+                f"{tuple(round(value, 3) for value in self._locked_target_world)} "
                 f"from {estimate.sample_count} inliers; max_dev={deviation}; "
                 "preparing safe lateral base alignment",
                 arm_command=self._held_arm_command,
@@ -592,13 +645,14 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     self._phase = "final_pregrasp"
                     self._motion_started = False
                     self._pregrasp.reset()
+                    self._arm_reference_odometry = None
                     # The inherited controller measures its timeout from the
                     # beginning of ALIGN_FOR_PICK.  Camera settling and base
                     # alignment are separate bounded phases, so give the
                     # final object-centred IK move its own timeout window.
                     self._stage_started_s = float(context.now_s)
                 elif not self._transfer.begin_advance(
-                    context.odometry, distance
+                    context.odometry, distance, heading_yaw=self.SHELF_YAW
                 ):
                     return StageResult.running(
                         "task 2 waiting to start the detected-centre shelf approach",
@@ -630,6 +684,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 self._phase = "final_pregrasp"
                 self._motion_started = False
                 self._pregrasp.reset()
+                self._arm_reference_odometry = None
                 self._stage_started_s = float(context.now_s)
 
         if self._phase == "final_pregrasp":
@@ -856,7 +911,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_TABLE,
                     source_tag="task2_extended_hold_table_turn",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal, context.odometry, context=context,
+                    footprint_mode=FootprintMode.TRANSIT_CARRY,
+                    exclude_target=True,
+                ):
                     return StageResult.blocked(
                         "task 2 could not start the table-facing in-place turn",
                         arm_command=self._held_arm_command,
@@ -1013,7 +1072,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             half_width = self._held_half_width()
         except RuntimeError as exc:
             return False, str(exc)
-        if not self._transfer.begin_navigation(goal, context.odometry):
+        if not self._transfer.begin_navigation(
+            goal, context.odometry, context=context,
+            footprint_mode=FootprintMode.TRANSIT_CARRY,
+            exclude_target=True,
+        ):
             return False, f"task 2 could not plan {segment_name}"
         safety = self._carried_envelope.check_path(
             pose,
@@ -1038,7 +1101,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         """Run one segment with a short-horizon arm/payload envelope guard."""
 
         status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+            context.odometry, context.now_s, context=context,
+            footprint_mode=FootprintMode.TRANSIT_CARRY,
+            exclude_target=True,
         )
         pose = odometry_pose(context.odometry)
         if pose is None:
@@ -1401,14 +1466,20 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     segment=NavigationSegment.NAV_END,
                     source_tag="layout_end_zone_center",
                 )
-                if not self._transfer.begin_navigation(goal, context.odometry):
+                if not self._transfer.begin_navigation(
+                    goal, context.odometry, context=context,
+                    footprint_mode=FootprintMode.TRANSIT_STOWED,
+                    exclude_target=False,
+                ):
                     return StageResult.blocked(
                         "task 2 could not plan a route to the end zone",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
             status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s
+                context.odometry, context.now_s, context=context,
+                footprint_mode=FootprintMode.TRANSIT_STOWED,
+                exclude_target=False,
             )
             if status is NavigationStatus.GOAL_REACHED:
                 return StageResult.succeeded(

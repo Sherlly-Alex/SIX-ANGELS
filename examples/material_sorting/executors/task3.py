@@ -722,6 +722,10 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # shorter Task1 retreat lets the planned arc sweep the carried box back
     # through the source table and stalls the chassis.
     TABLE_RETREAT_M = 0.80
+    # Task3 is centred on the raised white support, not beside the east wall.
+    # Navigate directly to the real 0.620 m dual-arm working distance.
+    TABLE_STANDOFF_M = 0.620
+    TABLE_WALL_CLEARANCE_OFFSET_M = 0.0
 
     # Task3 starts on the coloured block resting on the white material_box,
     # between Task1's two calibrated table slots. This broad gate accepts
@@ -904,6 +908,32 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     base_command=(0.0, 0.0),
                 )
 
+            # Feed the inherited table navigator the stable multi-frame centre,
+            # preferring the static white support XY used by manipulation.
+            # This makes its one navigation goal equal the real grasp stand
+            # instead of correcting a noisy first detector frame afterwards.
+            if self._goal is None:
+                assert observation is not None
+                assert self._task3_source_estimate is not None
+                stable_xy = (
+                    self._task3_support_world[:2]
+                    if self._task3_support_world is not None
+                    else self._task3_source_estimate.center_world[:2]
+                )
+                stable_observation = replace(
+                    observation,
+                    position_world=(
+                        float(stable_xy[0]),
+                        float(stable_xy[1]),
+                        self.TASK3_SOURCE_CENTER_Z,
+                    ),
+                )
+                stable_observations = dict(compat_context.target_observations)
+                stable_observations[target_color] = stable_observation
+                compat_context = replace(
+                    compat_context, target_observations=stable_observations
+                )
+
         if stage is TaskStage.ACQUIRE_TARGET:
             return self._tick_task3_acquire_target(context)
 
@@ -1035,85 +1065,10 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     "was not obtained",
                     arm_command=self._held_arm_command,
                 )
-
-            # Once the inherited straight retreat has finished, suspend its
-            # navigation and force the first turn to be LEFT (positive yaw).
-            # This prevents the carried box sweeping through the source table.
-            if getattr(self, "_task3_left_turn_active", False):
-                pose = self._odometry_pose(context.odometry)
-                if pose is None:
-                    return StageResult.running(
-                        "Task3 waiting for odometry during forced left turn",
-                        base_command=(0.0, 0.0),
-                        arm_command=self._held_arm_command,
-                    )
-
-                yaw_error = self._wrap_angle(math.pi - pose[2])
-
-                # Starting near +pi/2, rotate CCW only toward shelf-facing pi.
-                if yaw_error > 0.080:
-                    return StageResult.running(
-                        "Task3 forcing LEFT turn after safe straight retreat; "
-                        f"yaw={pose[2]:.3f}, target={math.pi:.3f}, "
-                        f"remaining={yaw_error:.3f}",
-                        base_command=(0.0, 0.35),
-                        arm_command=self._held_arm_command,
-                    )
-
-                self._task3_left_turn_active = False
-                self._task3_left_turn_done = True
-                return StageResult.running(
-                    "Task3 forced LEFT turn complete; handing transport "
-                    "back to shelf navigation",
-                    base_command=(0.0, 0.0),
-                    arm_command=self._held_arm_command,
-                )
-
-            result = super().tick(stage, compat_context)
-
-            if getattr(self, "_task3_left_turn_done", False):
-                return result
-
-            message = str(result.message).lower()
-
-            # Let Task1's proven straight retreat happen unchanged.
-            if "retreating straight" in message:
-                self._task3_transport_retreat_seen = True
-                return result
-
-            # Do NOT turn while still close to the source table.
-            if not getattr(self, "_task3_transport_retreat_seen", False):
-                return result
-
-            # Straight retreat has completed.  Before accepting any generic
-            # navigation turn command, force the safe counter-clockwise turn.
-            self._task3_left_turn_active = True
-
-            pose = self._odometry_pose(context.odometry)
-            if pose is None:
-                return StageResult.running(
-                    "Task3 straight retreat complete; waiting for odometry "
-                    "before forced LEFT turn",
-                    base_command=(0.0, 0.0),
-                    arm_command=self._held_arm_command,
-                )
-
-            yaw_error = self._wrap_angle(math.pi - pose[2])
-            if yaw_error > 0.080:
-                return StageResult.running(
-                    "Task3 straight retreat complete; starting forced LEFT "
-                    f"turn, yaw={pose[2]:.3f}, remaining={yaw_error:.3f}",
-                    base_command=(0.0, 0.35),
-                    arm_command=self._held_arm_command,
-                )
-
-            self._task3_left_turn_active = False
-            self._task3_left_turn_done = True
-            return StageResult.running(
-                "Task3 already safely west-facing after retreat",
-                base_command=(0.0, 0.0),
-                arm_command=self._held_arm_command,
-            )
+            # The parent now plans directly from the cleared table retreat to
+            # the shelf scan stand.  No extra forced turn or intermediate
+            # waypoint is needed, so the carry footprint follows one route.
+            return super().tick(stage, compat_context)
 
         if stage is TaskStage.PLACE:
             return self._tick_task3_place(compat_context)
@@ -1276,6 +1231,51 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         """
 
         if action == "entering the recognized empty shelf layer":
+            # The shallow Task3 grip flexes under shelf contact, so the frozen
+            # held-center transform no longer predicts the real box X/Y to
+            # centimetre accuracy.  Stop from the carried box itself before
+            # contact can shove it deeper or sideways into packaging_box.
+            if self._place_world is not None:
+                target_color = str(
+                    context.instruction.get("target_color", "")
+                ).strip().lower()
+                observation = context.target_observations.get(target_color)
+                if observation is not None:
+                    age_s = max(
+                        0.0,
+                        float(context.now_s)
+                        - float(observation.received_at_s),
+                    )
+                    observed = tuple(
+                        float(value)
+                        for value in observation.position_world
+                    )
+                    target_clearance_z = (
+                        float(self._place_world[2]) + self.SHELF_CLEARANCE_M
+                    )
+                    x_error = observed[0] - float(self._place_world[0])
+                    y_error = observed[1] - float(self._place_world[1])
+                    z_error = observed[2] - target_clearance_z
+                    if (
+                        age_s <= self.TASK3_SOURCE_MAX_AGE_S
+                        and -self.TASK3_LIVE_ENTRY_INSIDE_X_TOLERANCE_M
+                        <= x_error
+                        <= self.TASK3_LIVE_ENTRY_OUTSIDE_X_TOLERANCE_M
+                        and abs(y_error)
+                        <= self.TASK3_LIVE_ENTRY_Y_TOLERANCE_M
+                        and abs(z_error)
+                        <= self.TASK3_LIVE_ENTRY_Z_TOLERANCE_M
+                    ):
+                        self._task3_live_entry_detail = (
+                            f"live_box=({observed[0]:.3f},"
+                            f"{observed[1]:.3f},{observed[2]:.3f}), "
+                            f"errors=({x_error:+.3f},"
+                            f"{y_error:+.3f},{z_error:+.3f})"
+                        )
+                        self._transfer.reset()
+                        self._motion_started = False
+                        return True, None
+
             pose = self._odometry_pose(context.odometry)
             if pose is not None:
                 robot_x, robot_y, _robot_yaw = pose
@@ -1592,7 +1592,21 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # Leave only part of the box supported by the shelf. The visual pusher
     # completes the move from this outside release to the official final x.
     TASK3_RELEASE_X = -2.560
-    TASK3_SAFE_RELEASE_Y = 0.600
+    TASK3_SAFE_RELEASE_Y = 0.540
+    # Route directly to the final packaging-left row.  Using the same Y for
+    # transport and placement avoids a rotate-drive-rotate shelf-front detour.
+    TASK3_SHELF_TURN_Y = TASK3_SAFE_RELEASE_Y
+    TASK3_LIVE_ENTRY_OUTSIDE_X_TOLERANCE_M = 0.040
+    TASK3_LIVE_ENTRY_INSIDE_X_TOLERANCE_M = 0.180
+    TASK3_LIVE_ENTRY_Y_TOLERANCE_M = 0.060
+    TASK3_LIVE_ENTRY_Z_TOLERANCE_M = 0.120
+    # Task3 reaches the safe turn Y while carrying the shallow-gripped object.
+    # Requiring the generic navigator to remove the final 2.5 cm can command a
+    # small terminal arc beside the source-table clearance boundary.  Accept
+    # the same 5 cm residual already validated for final shelf insertion, and
+    # use it again below when deciding whether lateral alignment is necessary.
+    TASK3_SHELF_Y_TOLERANCE_M = 0.050
+    SHELF_TURN_POSITION_TOLERANCE_M = TASK3_SHELF_Y_TOLERANCE_M
     TASK3_RELEASE_BACKOFF_M = 0.140
     TASK3_RELEASE_SETTLE_S = 1.0
     TASK3_ENABLE_PUSH = False
@@ -1605,6 +1619,12 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_PUSH_LOST_TIMEOUT_S = 1.0
     TASK3_PUSH_BASE_SPEED_MPS = 0.015
     TASK3_PUSH_MAX_SPEED_MPS = 0.035
+
+    def _shelf_observation_target_y(self, context: ExecutionContext) -> float:
+        """Align the shelf observation stand with the packaging-left target."""
+
+        del context
+        return float(self.TASK3_SAFE_RELEASE_Y)
 
     # packaging_box is a static shelf obstacle.  It is often visible during
     # the safe turn but occluded by the carried box at the final scan stand;
@@ -1631,6 +1651,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         # only this executor enough time to finish and accept the measured
         # 0.08 rad shelf-facing yaw instead of failing at 90 s by a hair.
         self._transfer.LATERAL_TIMEOUT_S = 120.0
+        self._transfer.LATERAL_POSITION_TOLERANCE_M = (
+            self.TASK3_SHELF_Y_TOLERANCE_M
+        )
         self._transfer.LATERAL_YAW_TOLERANCE_RAD = 0.08
         self._task3_source_tracker = StableTargetCenterTracker(
             window_size=12,
@@ -1690,7 +1713,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         elif stage is TaskStage.ALIGN_FOR_PICK:
             self._transfer.reset()
             self._motion_started = False
-            self._task3_pick_phase = "rotate_to_stand"
+            self._task3_pick_phase = "face_target"
             self._task3_pick_align_started_s = float(context.now_s)
             self._task3_live_aim_xy = None
         elif stage is TaskStage.GRASP:
@@ -1878,10 +1901,10 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         )
 
         # "Left" for the official west-facing shelf is negative world Y.
-        # Keep 4 cm toward shelf center during release for side-wall margin.
-        # The old validated Task3 used y=0.600 for the shallow release.  Keep
-        # that side-wall margin while still deriving the layer height from the
-        # live packaging-box observation.
+        # The calibrated shelf centre is y=0.778 and the official left offset is
+        # 0.238 m, so y=0.540 leaves about 4 cm between the two cuboids.
+        # Do not bias this back toward the packaging box: y=0.600 overlaps
+        # their physical Y extents even though it remains inside referee radius.
         target_y = self.TASK3_SAFE_RELEASE_Y
 
         self._task3_packaging_world = (px, py, pz)
@@ -1962,7 +1985,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             )
             self._final_place_stand = (
                 self._final_place_stand[0],
-                max(0.54, min(0.98, self._final_place_stand[1])),
+                max(0.50, min(0.98, self._final_place_stand[1])),
             )
             self._phase = "clearance"
             self._motion_started = False
