@@ -1,7 +1,0 @@
-# The official offline Client image already provides ROS 2, cv_bridge, PyTorch,
-# torchvision and CUDA. These are the additional Python-level dependencies used
-# directly by the project modules.
-numpy>=1.24
-scipy>=1.10
-opencv-python>=4.8
-ultralytics>=8.0
