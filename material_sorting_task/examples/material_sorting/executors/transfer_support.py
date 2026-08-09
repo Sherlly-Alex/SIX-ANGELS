@@ -79,7 +79,7 @@ class TransferMotion:
     LATERAL_POSITION_TOLERANCE_M = 0.035
     LATERAL_X_TOLERANCE_M = 0.18
     LATERAL_YAW_TOLERANCE_RAD = 0.06
-    LATERAL_TIMEOUT_S = 20.0
+    LATERAL_TIMEOUT_S = 30.0
 
     def __init__(self) -> None:
         limits = SpeedLimits(

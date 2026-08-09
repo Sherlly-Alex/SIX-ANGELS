@@ -95,7 +95,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # Release only far enough to clear the coloured box.  The inherited task-1
     # release opens to 0.18 m and recomputes a world-frame IK pose, which is
     # unnecessary and too wide beside the fixed white packaging box.
-    TASK3_RELEASE_SPREAD_M = 0.035
+    TASK3_RELEASE_SPREAD_M = 0.040
     TASK3_RELEASE_MIN_HALF_WIDTH_M = 0.110
     TASK3_RELEASE_MAX_HALF_WIDTH_M = 0.140
     # Keep the arms/box in the verified grasp pose.  After the reverse retreat,
