@@ -470,6 +470,16 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     CONTACT_SEARCH_STEP_M = 0.001
     CONTACT_SEARCH_MAX_M = 0.004
     CONTACT_SEARCH_INTERVAL_S = 0.30
+    COMPLIANT_SOFT_STEP_M = 0.0005
+    COMPLIANT_SOFT_INTERVAL_S = 0.25
+    COMPLIANT_SOFT_MAX_M = 0.004
+    COMPLIANT_POST_ALIGN_STEP_M = 0.0005
+    COMPLIANT_POST_ALIGN_INTERVAL_S = 0.20
+    COMPLIANT_POST_ALIGN_PRELOAD_M = 0.002
+    COMPLIANT_ABSOLUTE_MAX_M = 0.006
+    COMPLIANT_SINGLE_SIDE_WAIT_S = 2.0
+    COMPLIANT_RETRY_BACKOFF_M = 0.001
+    COMPLIANT_MAX_RETRIES = 1
     REQUIRE_SERVER_CONTACT = True
     ALLOW_SETTLED_MAX_SEARCH = False
 
@@ -483,6 +493,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._contact_since_s: float | None = None
         self._contact_search_used_m = 0.0
         self._contact_search_next_s = 0.0
+        self._compliance_wait_since_s: float | None = None
+        self._compliance_post_align_target_m: float | None = None
+        self._compliance_retry_count = 0
 
     def reset(self) -> None:
         super().reset()
@@ -490,6 +503,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._contact_since_s = None
         self._contact_search_used_m = 0.0
         self._contact_search_next_s = 0.0
+        self._compliance_wait_since_s = None
+        self._compliance_post_align_target_m = None
+        self._compliance_retry_count = 0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -498,6 +514,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             self._contact_since_s = None
             self._contact_search_used_m = 0.0
             self._contact_search_next_s = float(context.now_s)
+            self._compliance_wait_since_s = None
+            self._compliance_post_align_target_m = None
+            self._compliance_retry_count = 0
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is TaskStage.GRASP:
@@ -534,6 +553,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._contact_since_s = None
         self._contact_search_used_m = 0.0
         self._contact_search_next_s = 0.0
+        self._compliance_wait_since_s = None
+        self._compliance_post_align_target_m = None
+        self._compliance_retry_count = 0
 
     def _tick_contact(self, context: ExecutionContext) -> StageResult:
         if self._locked_target_world is None:
@@ -543,11 +565,44 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             )
 
         now_s = float(context.now_s)
+        prepare_compliance = getattr(
+            self._contact, "prepare_compliance", None
+        )
+        if not self._contact.planned and callable(prepare_compliance):
+            try:
+                ready, compliance_detail = prepare_compliance(
+                    now_s,
+                    context.joint_states,
+                )
+            except PregraspInputError as exc:
+                return self._wait_for_contact_inputs(context, str(exc))
+            if not ready:
+                return StageResult.running(
+                    "task 1 holding the open pregrasp while calibrating wrist "
+                    f"effort; {compliance_detail}",
+                    arm_command=self._held_arm_command,
+                )
+
+        observe_server_contact = getattr(
+            self._contact, "observe_server_contact", None
+        )
+        if callable(observe_server_contact):
+            observe_server_contact(context.grasp_confirmed)
+        compliance_enabled = bool(
+            getattr(self._contact, "compliance_enabled", False)
+        )
+
         # Once bilateral contact appears, freeze the last command instead of
         # continuing toward the unconstrained IK solution.  A short stable
         # confirmation rejects single-frame contact noise.  If contact drops,
-        # resume the bounded inward ramp from the same command.
-        if self.REQUIRE_SERVER_CONTACT and self._contact_since_s is not None:
+        # resume the bounded inward ramp from the same command.  The compliant
+        # controller instead keeps ticking so joint 6 can follow the measured
+        # surface angle before it is locked.
+        if (
+            not compliance_enabled
+            and self.REQUIRE_SERVER_CONTACT
+            and self._contact_since_s is not None
+        ):
             if context.grasp_confirmed:
                 contact_age_s = max(0.0, now_s - self._contact_since_s)
                 if contact_age_s >= self.CONTACT_CONFIRM_TIME_S:
@@ -580,7 +635,11 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-        if self.REQUIRE_SERVER_CONTACT and context.grasp_confirmed:
+        if (
+            not compliance_enabled
+            and self.REQUIRE_SERVER_CONTACT
+            and context.grasp_confirmed
+        ):
             self._contact_since_s = now_s
             return StageResult.running(
                 "task 1 Server detected bilateral target contact; "
@@ -601,6 +660,23 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 arm_command=self._held_arm_command,
             )
         self._held_arm_command = command
+
+        if bool(getattr(self._contact, "hard_effort_limit_exceeded", False)):
+            return StageResult.blocked(
+                "task 1 compliant grasp stopped because wrist effort reached "
+                "the 6.0 N.m safety limit",
+                arm_command=command,
+            )
+
+        if compliance_enabled:
+            compliant_result = self._tick_compliant_contact_search(
+                context,
+                command,
+                pose_settled,
+                detail,
+            )
+            if compliant_result is not None:
+                return compliant_result
 
         if (
             pose_settled
@@ -674,6 +750,221 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             f"{settled_text}grasp_confirmed=false; {detail}",
             arm_command=command,
         )
+
+    def _tick_compliant_contact_search(
+        self,
+        context: ExecutionContext,
+        command: ArmCommand,
+        pose_settled: bool,
+        detail: str,
+    ) -> StageResult | None:
+        """Run soft contact, bilateral wrist locking, and bounded preload.
+
+        ``None`` means the effort/angle signal was not useful after one safe
+        retry and the caller should continue through the validated legacy
+        four-millimetre completion path.
+        """
+
+        now_s = float(context.now_s)
+        diagnostic = str(
+            getattr(self._contact, "diagnostic_summary", "compliance=unknown")
+        )
+        bilateral_aligned = bool(
+            getattr(self._contact, "bilateral_aligned", False)
+        )
+
+        if bilateral_aligned:
+            self._compliance_wait_since_s = None
+            if self.REQUIRE_SERVER_CONTACT:
+                if context.grasp_confirmed:
+                    return StageResult.succeeded(
+                        "task 1 Server contact and bilateral compliant wrist "
+                        f"alignment are confirmed; {diagnostic}",
+                        arm_command=command,
+                    )
+                return StageResult.running(
+                    "task 1 both wrists are aligned and locked; waiting for "
+                    f"Server bilateral contact confirmation; {diagnostic}",
+                    arm_command=command,
+                )
+
+            if self._compliance_post_align_target_m is None:
+                self._compliance_post_align_target_m = min(
+                    self.COMPLIANT_ABSOLUTE_MAX_M,
+                    max(
+                        self.CONTACT_SEARCH_MAX_M,
+                        self._contact_search_used_m
+                        + self.COMPLIANT_POST_ALIGN_PRELOAD_M,
+                    ),
+                )
+                self._contact_search_next_s = now_s
+
+            if bool(
+                getattr(self._contact, "preload_effort_limit_reached", False)
+            ):
+                return StageResult.succeeded(
+                    "task 1 locked both aligned wrists and stopped preload at "
+                    f"the wrist-effort soft limit; {diagnostic}",
+                    arm_command=command,
+                )
+
+            target_offset = self._compliance_post_align_target_m
+            if (
+                pose_settled
+                and now_s >= self._contact_search_next_s
+                and self._contact_search_used_m < target_offset - 1e-9
+            ):
+                next_offset = min(
+                    target_offset,
+                    self._contact_search_used_m
+                    + self.COMPLIANT_POST_ALIGN_STEP_M,
+                )
+                replanned = self._replan_contact_offset(
+                    context,
+                    next_offset,
+                    "post-alignment preload",
+                )
+                if isinstance(replanned, StageResult):
+                    return replanned
+                self._contact_search_used_m = next_offset
+                self._contact_search_next_s = (
+                    now_s + self.COMPLIANT_POST_ALIGN_INTERVAL_S
+                )
+                self._held_arm_command = replanned
+                return StageResult.running(
+                    "task 1 applying locked-wrist post-alignment preload; "
+                    f"offset={next_offset * 1000.0:.1f}/"
+                    f"{target_offset * 1000.0:.1f} mm; {diagnostic}",
+                    arm_command=replanned,
+                )
+
+            if pose_settled and self._contact_search_used_m >= target_offset - 1e-9:
+                return StageResult.succeeded(
+                    "task 1 bilateral compliant grasp settled with locked "
+                    f"wrists and {self._contact_search_used_m * 1000.0:.1f} mm "
+                    f"bounded preload; {diagnostic}",
+                    arm_command=command,
+                )
+            return StageResult.running(
+                "task 1 holding aligned wrists while the bounded preload "
+                f"settles; {diagnostic}; {detail}",
+                arm_command=command,
+            )
+
+        # Before bilateral alignment, approach in gentler half-millimetre
+        # steps so the first-contact wrist can rotate instead of levering the
+        # box away from the other hand.
+        if (
+            pose_settled
+            and now_s >= self._contact_search_next_s
+            and self._contact_search_used_m
+            < self.COMPLIANT_SOFT_MAX_M - 1e-9
+        ):
+            next_offset = min(
+                self.COMPLIANT_SOFT_MAX_M,
+                self._contact_search_used_m + self.COMPLIANT_SOFT_STEP_M,
+            )
+            replanned = self._replan_contact_offset(
+                context,
+                next_offset,
+                "soft compliant contact",
+            )
+            if isinstance(replanned, StageResult):
+                return replanned
+            self._contact_search_used_m = next_offset
+            self._contact_search_next_s = now_s + self.COMPLIANT_SOFT_INTERVAL_S
+            self._held_arm_command = replanned
+            return StageResult.running(
+                "task 1 advancing the compliant contact search; "
+                f"offset={next_offset * 1000.0:.1f}/"
+                f"{self.COMPLIANT_SOFT_MAX_M * 1000.0:.1f} mm; {diagnostic}",
+                arm_command=replanned,
+            )
+
+        if (
+            pose_settled
+            and self._contact_search_used_m
+            >= self.COMPLIANT_SOFT_MAX_M - 1e-9
+        ):
+            if self._compliance_wait_since_s is None:
+                self._compliance_wait_since_s = now_s
+            wait_s = max(0.0, now_s - self._compliance_wait_since_s)
+            if wait_s >= self.COMPLIANT_SINGLE_SIDE_WAIT_S:
+                any_contact = bool(getattr(self._contact, "any_contact", False))
+                if (
+                    any_contact
+                    and self._compliance_retry_count
+                    < self.COMPLIANT_MAX_RETRIES
+                ):
+                    next_offset = max(
+                        0.0,
+                        self._contact_search_used_m
+                        - self.COMPLIANT_RETRY_BACKOFF_M,
+                    )
+                    replanned = self._replan_contact_offset(
+                        context,
+                        next_offset,
+                        "single-side contact backoff",
+                    )
+                    if isinstance(replanned, StageResult):
+                        return replanned
+                    retry = getattr(self._contact, "retry_compliance", None)
+                    if callable(retry):
+                        retry()
+                    self._compliance_retry_count += 1
+                    self._contact_search_used_m = next_offset
+                    self._contact_search_next_s = (
+                        now_s + self.COMPLIANT_SOFT_INTERVAL_S
+                    )
+                    self._compliance_wait_since_s = None
+                    self._held_arm_command = replanned
+                    return StageResult.running(
+                        "task 1 backed off 1.0 mm after one-sided compliant "
+                        f"contact; retry={self._compliance_retry_count}/"
+                        f"{self.COMPLIANT_MAX_RETRIES}; {diagnostic}",
+                        arm_command=replanned,
+                    )
+
+                abandon = getattr(self._contact, "abandon_compliance", None)
+                if callable(abandon):
+                    abandon("no_stable_bilateral_signal")
+                self._compliance_wait_since_s = None
+                return None
+
+            return StageResult.running(
+                "task 1 holding maximum soft contact while waiting for "
+                f"bilateral wrist alignment ({wait_s:.1f}/"
+                f"{self.COMPLIANT_SINGLE_SIDE_WAIT_S:.1f}s); {diagnostic}",
+                arm_command=command,
+            )
+
+        return StageResult.running(
+            "task 1 moving inward with compliant wrist monitoring; "
+            f"offset={self._contact_search_used_m * 1000.0:.1f} mm; "
+            f"{diagnostic}; {detail}",
+            arm_command=command,
+        )
+
+    def _replan_contact_offset(
+        self,
+        context: ExecutionContext,
+        offset_m: float,
+        action: str,
+    ) -> ArmCommand | StageResult:
+        try:
+            return self._contact.tighten(
+                self._locked_target_world,
+                offset_m,
+                context.odometry,
+                context.joint_states,
+            )
+        except PregraspInputError as exc:
+            return self._wait_for_contact_inputs(context, str(exc))
+        except PregraspPlanningError as exc:
+            return StageResult.blocked(
+                f"task 1 {action} planning failed: {exc}",
+                arm_command=self._held_arm_command,
+            )
 
     def _wait_for_contact_inputs(
         self,
