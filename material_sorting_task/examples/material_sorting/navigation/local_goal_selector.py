@@ -20,6 +20,7 @@ def select_local_goal(
     *,
     lookahead_distance: float = 1.2,
     closest_index: Optional[int] = None,
+    project_from_pose: bool = False,
 ) -> Tuple[float, float, float]:
     """Return ``(x, y, yaw)`` of the lookahead target on *global_path*.
 
@@ -35,6 +36,10 @@ def select_local_goal(
     closest_index:
         If given, start walking from this waypoint index.  When ``None`` the
         Euclidean nearest waypoint is used (robust to robot drift).
+    project_from_pose:
+        Project the robot onto the selected segment before walking. The
+        controller enables this while tracking; explicit closest_index callers
+        retain the documented start-at-waypoint behavior.
 
     Returns
     -------
@@ -82,7 +87,7 @@ def select_local_goal(
         abx = b0[0] - a0[0]
         aby = b0[1] - a0[1]
         ab2 = abx * abx + aby * aby
-        if ab2 > 1e-12:
+        if (closest_index is None or project_from_pose) and ab2 > 1e-12:
             t0 = ((current_x - a0[0]) * abx + (current_y - a0[1]) * aby) / ab2
             t0 = max(0.0, min(1.0, t0))
             proj_x = a0[0] + t0 * abx

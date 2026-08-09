@@ -92,19 +92,23 @@ class FakeContactController:
         self.half_width = 0.118
         self.plan_target = None
         self.plan_orientation = None
+        self.plan_odometry = None
         self.update_count = 0
         self.updates_since_plan = 0
         self.tighten_offsets = []
+        self.tighten_odometries = []
 
     def reset(self) -> None:
         self.planned = False
         self.update_count = 0
         self.updates_since_plan = 0
         self.tighten_offsets = []
+        self.tighten_odometries = []
 
     def plan(self, target_world, orientation, odometry, joint_states):
         self.plan_target = target_world
         self.plan_orientation = orientation
+        self.plan_odometry = odometry
         self.planned = True
         return ARM_COMMAND
 
@@ -115,48 +119,10 @@ class FakeContactController:
 
     def tighten(self, target_world, inward_offset, odometry, joint_states):
         self.tighten_offsets.append(inward_offset)
+        self.tighten_odometries.append(odometry)
         self.half_width = 0.118 - inward_offset
         self.updates_since_plan = 0
         return ARM_COMMAND
-
-
-class FakeCompliantContactController(FakeContactController):
-    def __init__(self) -> None:
-        super().__init__()
-        self.compliance_enabled = True
-        self.bilateral_aligned = False
-        self.any_contact = True
-        self.preload_effort_limit_reached = False
-        self.hard_effort_limit_exceeded = False
-        self.diagnostic_summary = "compliance=fake"
-
-    def reset(self) -> None:
-        super().reset()
-        self.compliance_enabled = True
-        self.bilateral_aligned = False
-
-    def prepare_compliance(self, now_s, joint_states):
-        return True, self.diagnostic_summary
-
-    def observe_server_contact(self, confirmed):
-        return None
-
-    def retry_compliance(self):
-        self.bilateral_aligned = False
-
-    def abandon_compliance(self, reason):
-        self.compliance_enabled = False
-
-    def tighten(self, target_world, inward_offset, odometry, joint_states):
-        command = super().tighten(
-            target_world,
-            inward_offset,
-            odometry,
-            joint_states,
-        )
-        if inward_offset >= 0.001 - 1e-9:
-            self.bilateral_aligned = True
-        return command
 
 
 class FakeLiftController:
@@ -225,10 +191,6 @@ def joint_states(
     slide: float = 0.0,
     left_arm=None,
     right_arm=None,
-    left_effort=None,
-    right_effort=None,
-    left_velocity=None,
-    right_velocity=None,
 ):
     names = [
         "slide_joint",
@@ -241,16 +203,12 @@ def joint_states(
     ]
     left = [0.0] * 6 if left_arm is None else list(left_arm)
     right = [0.0] * 6 if right_arm is None else list(right_arm)
-    left_tau = [0.0] * 6 if left_effort is None else list(left_effort)
-    right_tau = [0.0] * 6 if right_effort is None else list(right_effort)
-    left_vel = [0.0] * 6 if left_velocity is None else list(left_velocity)
-    right_vel = [0.0] * 6 if right_velocity is None else list(right_velocity)
     positions = [slide, 0.0, 0.0, *left, 1.0, *right, 1.0]
     return SimpleNamespace(
         name=names,
         position=positions,
-        velocity=[0.0, 0.0, 0.0, *left_vel, 0.0, *right_vel, 0.0],
-        effort=[0.0, 0.0, 0.0, *left_tau, 0.0, *right_tau, 0.0],
+        velocity=[0.0] * len(names),
+        effort=[0.0] * len(names),
     )
 
 
@@ -296,16 +254,16 @@ class OpenPregraspControllerTests(unittest.TestCase):
 
         controller.plan(
             (-0.18, 2.20, 0.834),
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             joint_states(),
         )
 
         self.assertIsNotNone(controller.target_base)
         self.assertAlmostEqual(controller.target_base[0], 0.65, places=6)
-        self.assertAlmostEqual(controller.target_base[1], 0.0, places=6)
+        self.assertAlmostEqual(controller.target_base[1], -0.04, places=6)
         self.assertAlmostEqual(kdl.left[0, 3], 0.57, places=6)
-        self.assertAlmostEqual(kdl.left[1, 3], 0.225, places=6)
-        self.assertAlmostEqual(kdl.right[1, 3], -0.225, places=6)
+        self.assertAlmostEqual(kdl.left[1, 3], 0.185, places=6)
+        self.assertAlmostEqual(kdl.right[1, 3], -0.265, places=6)
         self.assertAlmostEqual(kdl.left[2, 3], 0.854, places=6)
 
     def test_contact_pose_uses_calibrated_task1_lateral_width(self) -> None:
@@ -315,99 +273,23 @@ class OpenPregraspControllerTests(unittest.TestCase):
         controller.plan(
             (-0.18, 2.20, 0.834),
             "yaw0",
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             joint_states(),
         )
 
         self.assertAlmostEqual(controller.half_width, 0.118, places=6)
         self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
         self.assertAlmostEqual(kdl.left[0, 3], 0.67, places=6)
-        self.assertAlmostEqual(kdl.left[1, 3], 0.118, places=6)
-        self.assertAlmostEqual(kdl.right[1, 3], -0.118, places=6)
+        self.assertAlmostEqual(kdl.left[1, 3], 0.078, places=6)
+        self.assertAlmostEqual(kdl.right[1, 3], -0.158, places=6)
 
         controller.tighten(
             (-0.18, 2.20, 0.834),
             0.001,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             joint_states(),
         )
         self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
-
-    def test_contact_pose_adds_symmetric_five_degree_toe_in(self) -> None:
-        kdl = FakeKdl()
-        controller = ContactGraspController(kdl=kdl)
-
-        controller.plan(
-            (-0.18, 2.20, 0.834),
-            "yaw0",
-            odometry(-0.18, 1.55, math.pi / 2.0),
-            joint_states(),
-        )
-
-        # Left and right tool-forward axes must turn toward the centre line.
-        self.assertLess(kdl.left[1, 0], -0.08)
-        self.assertGreater(kdl.right[1, 0], 0.08)
-
-    def test_effort_contact_follows_then_locks_both_wrists(self) -> None:
-        kdl = FakeKdl()
-        controller = ContactGraspController(kdl=kdl)
-        expected_slide = 1.32163718 - 0.854
-        baseline = joint_states(slide=expected_slide)
-
-        ready = False
-        for tick in range(9):
-            ready, _detail = controller.prepare_compliance(
-                tick * 0.05,
-                baseline,
-            )
-        self.assertTrue(ready)
-        self.assertTrue(controller.compliance_enabled)
-
-        controller.plan(
-            (-0.18, 2.20, 0.834),
-            "yaw0",
-            odometry(-0.18, 1.55, math.pi / 2.0),
-            baseline,
-        )
-        contact_feedback = joint_states(
-            slide=expected_slide,
-            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
-            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.04],
-            left_effort=[0.0, 0.0, 0.0, 0.0, 0.0, 1.2],
-            right_effort=[0.0, 0.0, 0.0, 0.0, 0.0, -1.2],
-        )
-        command = None
-        for tick in range(50):
-            command, _settled, _detail = controller.update(
-                0.50 + tick * 0.05,
-                contact_feedback,
-            )
-            if controller.bilateral_aligned:
-                break
-
-        self.assertTrue(controller.bilateral_aligned)
-        self.assertAlmostEqual(command.left_arm_positions[5], 0.04, places=6)
-        self.assertAlmostEqual(command.right_arm_positions[5], -0.04, places=6)
-
-        tightened = controller.tighten(
-            (-0.18, 2.20, 0.834),
-            0.001,
-            odometry(-0.18, 1.55, math.pi / 2.0),
-            contact_feedback,
-        )
-        self.assertAlmostEqual(tightened.left_arm_positions[5], 0.04, places=6)
-        self.assertAlmostEqual(tightened.right_arm_positions[5], -0.04, places=6)
-
-    def test_missing_effort_keeps_legacy_contact_available(self) -> None:
-        controller = ContactGraspController(kdl=FakeKdl())
-        feedback = joint_states()
-        feedback.effort = []
-
-        ready, detail = controller.prepare_compliance(0.0, feedback)
-
-        self.assertTrue(ready)
-        self.assertFalse(controller.compliance_enabled)
-        self.assertIn("legacy_no_effort", detail)
 
     def test_contact_converges_when_box_blocks_joint_by_point_153_rad(self) -> None:
         kdl = FakeKdl()
@@ -420,7 +302,7 @@ class OpenPregraspControllerTests(unittest.TestCase):
         controller.plan(
             (-0.18, 2.20, 0.834),
             "yaw0",
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             blocked_feedback,
         )
 
@@ -475,6 +357,38 @@ class SlideLiftControllerTests(unittest.TestCase):
         self.assertEqual(command.right_arm_positions, ARM_COMMAND.right_arm_positions)
 
 
+    def test_lift_ignores_contact_arm_velocity_after_slide_settles(self) -> None:
+        controller = SlideLiftController(lift_height=0.15)
+        feedback = joint_states(
+            slide=ARM_COMMAND.spine_position,
+            left_arm=ARM_COMMAND.left_arm_positions,
+            right_arm=ARM_COMMAND.right_arm_positions,
+        )
+        command = controller.plan(ARM_COMMAND, feedback)
+
+        reached = False
+        detail = ""
+        for tick in range(40):
+            feedback = joint_states(
+                slide=command.spine_position,
+                left_arm=command.left_arm_positions,
+                right_arm=command.right_arm_positions,
+            )
+            feedback.velocity = [
+                0.0 if name == "slide_joint" else 0.024
+                for name in feedback.name
+            ]
+            command, reached, detail = controller.update(
+                tick * 0.20, feedback
+            )
+            if reached:
+                break
+
+        self.assertTrue(reached)
+        self.assertIn("slide_vel=0.000", detail)
+        self.assertIn("max_vel=0.024", detail)
+
+
 class Task1PregraspExecutorTests(unittest.TestCase):
     def test_navigates_then_holds_open_pregrasp_before_contact(self) -> None:
         pregrasp = FakePregraspController()
@@ -485,7 +399,7 @@ class Task1PregraspExecutorTests(unittest.TestCase):
 
         moving = executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
         self.assertTrue(moving.controls_base)
-        at_goal = context(0.05, odometry(-0.18, 1.55, math.pi / 2.0))
+        at_goal = context(0.05, odometry(-0.22, 1.55, math.pi / 2.0))
         reached = executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal)
         self.assertEqual(reached.status, StageStatus.SUCCEEDED)
 
@@ -501,7 +415,7 @@ class Task1PregraspExecutorTests(unittest.TestCase):
 
         aligned = executor.tick(
             TaskStage.ALIGN_FOR_PICK,
-            context(0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
+            context(0.10, odometry(-0.22, 1.55, math.pi / 2.0)),
         )
         self.assertEqual(aligned.status, StageStatus.SUCCEEDED)
         self.assertEqual(aligned.arm_command, ARM_COMMAND)
@@ -518,7 +432,7 @@ class Task1PregraspExecutorTests(unittest.TestCase):
         )
         collision = context(
             0.0,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             unsafe_collision=True,
         )
         executor.enter_stage(TaskStage.ACQUIRE_TARGET, collision)
@@ -541,7 +455,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
         initial = context(0.0, odometry(-0.70, 0.55, math.pi / 2.0))
         executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
         executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
-        at_goal = context(0.05, odometry(-0.18, 1.55, math.pi / 2.0))
+        at_goal = context(0.05, odometry(-0.22, 1.55, math.pi / 2.0))
         self.assertEqual(
             executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal).status,
             StageStatus.SUCCEEDED,
@@ -573,7 +487,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.10,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 grasp_confirmed=True,
             ),
         )
@@ -585,7 +499,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.25,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 grasp_confirmed=True,
             ),
         )
@@ -596,7 +510,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.41,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 grasp_confirmed=True,
             ),
         )
@@ -616,7 +530,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.10,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 grasp_confirmed=True,
             ),
         )
@@ -626,7 +540,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.20,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 grasp_confirmed=False,
             ),
         )
@@ -640,7 +554,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
         executor.tick(TaskStage.GRASP, at_goal)
         search = executor.tick(
             TaskStage.GRASP,
-            context(0.60, odometry(-0.18, 1.55, math.pi / 2.0)),
+            context(0.60, odometry(-0.22, 1.55, math.pi / 2.0)),
         )
 
         self.assertEqual(search.status, StageStatus.RUNNING)
@@ -653,12 +567,12 @@ class Task1ContactExecutorTests(unittest.TestCase):
         for expected_mm in (2, 3, 4):
             executor.tick(
                 TaskStage.GRASP,
-                context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
+                context(now_s, odometry(-0.22, 1.55, math.pi / 2.0)),
             )
             now_s += 0.10
             result = executor.tick(
                 TaskStage.GRASP,
-                context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
+                context(now_s, odometry(-0.22, 1.55, math.pi / 2.0)),
             )
             self.assertAlmostEqual(
                 contact_controller.tighten_offsets[-1],
@@ -669,9 +583,28 @@ class Task1ContactExecutorTests(unittest.TestCase):
         self.assertEqual(len(contact_controller.tighten_offsets), 4)
         executor.tick(
             TaskStage.GRASP,
-            context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
+            context(now_s, odometry(-0.22, 1.55, math.pi / 2.0)),
         )
         self.assertEqual(len(contact_controller.tighten_offsets), 4)
+
+    def test_contact_search_keeps_pregrasp_odometry_when_base_is_displaced(self) -> None:
+        executor, contact_controller, at_goal = self._reach_contact_stage()
+        reference_odometry = at_goal.odometry
+        displaced = context(
+            0.10, odometry(-0.16, 1.53, math.pi / 2.0 + 0.08)
+        )
+
+        executor.tick(TaskStage.GRASP, displaced)
+        self.assertIs(contact_controller.plan_odometry, reference_odometry)
+        executor.tick(
+            TaskStage.GRASP,
+            context(0.60, odometry(-0.14, 1.51, math.pi / 2.0 + 0.12)),
+        )
+
+        self.assertEqual(contact_controller.tighten_offsets, [0.001])
+        self.assertIs(
+            contact_controller.tighten_odometries[-1], reference_odometry
+        )
 
     def test_unsafe_structure_collision_holds_contact_command(self) -> None:
         executor, _contact_controller, at_goal = self._reach_contact_stage()
@@ -681,7 +614,7 @@ class Task1ContactExecutorTests(unittest.TestCase):
             TaskStage.GRASP,
             context(
                 0.10,
-                odometry(-0.18, 1.55, math.pi / 2.0),
+                odometry(-0.22, 1.55, math.pi / 2.0),
                 unsafe_collision=True,
             ),
         )
@@ -704,7 +637,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         initial = context(0.0, odometry(-0.70, 0.55, math.pi / 2.0))
         executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
         executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
-        at_goal = context(0.05, odometry(-0.18, 1.55, math.pi / 2.0))
+        at_goal = context(0.05, odometry(-0.22, 1.55, math.pi / 2.0))
         self.assertEqual(
             executor.tick(TaskStage.NAVIGATE_TO_PICK, at_goal).status,
             StageStatus.SUCCEEDED,
@@ -730,7 +663,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         for _ in range(20):
             result = executor.tick(
                 TaskStage.GRASP,
-                context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
+                context(now_s, odometry(-0.22, 1.55, math.pi / 2.0)),
             )
             if result.status is StageStatus.SUCCEEDED:
                 break
@@ -743,14 +676,14 @@ class Task1LiftExecutorTests(unittest.TestCase):
 
         lift_context = context(
             now_s + 0.05,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
         )
         executor.enter_stage(TaskStage.LIFT, lift_context)
         lifting = executor.tick(TaskStage.LIFT, lift_context)
         self.assertEqual(lifting.status, StageStatus.RUNNING)
         lifted = executor.tick(
             TaskStage.LIFT,
-            context(now_s + 0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
+            context(now_s + 0.10, odometry(-0.22, 1.55, math.pi / 2.0)),
         )
         self.assertEqual(lifted.status, StageStatus.SUCCEEDED)
         self.assertEqual(lift_controller.plan_command, ARM_COMMAND)
@@ -758,7 +691,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
 
         transport_context = context(
             now_s + 0.15,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
         )
         executor.enter_stage(TaskStage.TRANSPORT, transport_context)
         held = executor.tick(TaskStage.TRANSPORT, transport_context)
@@ -766,56 +699,12 @@ class Task1LiftExecutorTests(unittest.TestCase):
         self.assertEqual(held.arm_command, LIFTED_ARM_COMMAND)
         self.assertIn("transport", held.message)
 
-    def test_compliant_alignment_adds_two_millimetres_locked_preload(self) -> None:
-        contact_controller = FakeCompliantContactController()
-        executor = Task1LiftExecutor(
-            pregrasp_controller=FakePregraspController(),
-            contact_controller=contact_controller,
-            lift_controller=FakeLiftController(),
-        )
-        grasp_context = context(
-            0.0,
-            odometry(-0.18, 1.55, math.pi / 2.0),
-        )
-        executor._locked_target_world = (-0.18, 2.20, 0.834)
-        executor._held_arm_command = ARM_COMMAND
-        executor.enter_stage(TaskStage.GRASP, grasp_context)
-
-        result = None
-        for tick in range(40):
-            result = executor.tick(
-                TaskStage.GRASP,
-                context(
-                    tick * 0.30,
-                    odometry(-0.18, 1.55, math.pi / 2.0),
-                ),
-            )
-            if result.status is StageStatus.SUCCEEDED:
-                break
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.status, StageStatus.SUCCEEDED)
-        self.assertEqual(
-            contact_controller.tighten_offsets,
-            [
-                0.0005,
-                0.001,
-                0.0015,
-                0.002,
-                0.0025,
-                0.003,
-                0.0035,
-                0.004,
-            ],
-        )
-        self.assertIn("locked wrists", result.message)
-
     def test_unsafe_collision_blocks_lift_and_holds_preload(self) -> None:
         executor, _contact_controller, _lift_controller = self._reach_grasp_stage()
         executor._held_arm_command = ARM_COMMAND
         collision = context(
             1.0,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+            odometry(-0.22, 1.55, math.pi / 2.0),
             unsafe_collision=True,
         )
         executor.enter_stage(TaskStage.LIFT, collision)

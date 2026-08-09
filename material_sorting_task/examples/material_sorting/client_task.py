@@ -29,7 +29,7 @@ from competition_controller import (
     ExecutionContext,
 )
 from executors import build_task_executors
-from executors.base import ArmCommand, TargetObservation, TaskStage
+from executors.base import ArmCommand, TargetObservation
 from desktop_grasp.target_metadata import dominant_orientation, infer_box_orientation
 from instruction_parser import (
     InstructionParseError,
@@ -74,18 +74,12 @@ class CompetitionClient(Node):
             str,
             deque[str | None],
         ] = {}
-        self._target_quality_histories: dict[
-            str,
-            deque[str | None],
-        ] = {}
         self.target_observations: dict[str, TargetObservation] = {}
         self.grasp_confirmed = False
         self.unsafe_collision = False
         self._last_wait_log_ns = 0
         self._last_progress_log_ns = 0
         self._last_controller_serial = -1
-        self._last_task2_detection_reset_key: tuple[int, int, str] | None = None
-        self._last_task3_detection_reset_key: tuple[int, int, str] | None = None
 
         self.execution_mode = (
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
@@ -106,7 +100,8 @@ class CompetitionClient(Node):
             )
         self.controller = CompetitionController(
             executors,
-            referee_driven=self.execution_mode != "dry_run",
+            referee_driven=self.execution_mode not in {"dry_run", "task3_only"},
+            local_task_id=3 if self.execution_mode == "task3_only" else None,
         )
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
@@ -205,9 +200,16 @@ class CompetitionClient(Node):
             )
         elif self.execution_mode == "task123_full":
             self.get_logger().warning(
-                "task123_full enables integrated task-1/task-2 execution and "
-                "task-3 top-box pick, measured packaging-box left placement, "
-                "and safe return; task transitions remain referee-driven"
+                "task123_full enables integrated Task1 -> Task2 -> Task3; "
+                "Task3 uses dynamic instruction target_color, teacher dual-arm "
+                "table pick/lift/transport, and live RGB-D packaging_box "
+                "placement on its left side"
+            )
+        elif self.execution_mode == "task3_only":
+            self.get_logger().warning(
+                "task3_only is an unscored physical diagnostic: it skips Task1/Task2, "
+                "selects Task3's published target_color, and runs the complete Task3 "
+                "pick/transport/place sequence"
             )
         else:
             self.get_logger().info(
@@ -240,8 +242,6 @@ class CompetitionClient(Node):
 
         self.instructions = instructions
         if instructions_changed:
-            self._last_task2_detection_reset_key = None
-            self._last_task3_detection_reset_key = None
             self.get_logger().info(
                 "instructions accepted: "
                 + ", ".join(
@@ -274,24 +274,7 @@ class CompetitionClient(Node):
         self.joints_received = True
 
     def _detections_cb(self, msg: Detection3DArray) -> None:
-        now_s = self.get_clock().now().nanoseconds * 1e-9
-        # Preserve the RGB-D frame timestamp.  Using callback time made old
-        # points look fresh after the robot entered task 2, even while the
-        # rolling median still contained pre-staging shelf views.
-        try:
-            header_stamp = (
-                float(msg.header.stamp.sec)
-                + float(msg.header.stamp.nanosec) * 1e-9
-            )
-        except (AttributeError, TypeError, ValueError):
-            header_stamp = 0.0
-        received_at_s = (
-            header_stamp
-            if math.isfinite(header_stamp)
-            and header_stamp > 0.0
-            and abs(now_s - header_stamp) <= 30.0
-            else now_s
-        )
+        received_at_s = self.get_clock().now().nanoseconds * 1e-9
         for detection in msg.detections:
             try:
                 if not detection.results:
@@ -339,29 +322,11 @@ class CompetitionClient(Node):
                 # ROS callback; the pregrasp planner will use its safe yaw-0
                 # fallback for that observation.
                 orientation = None
-            try:
-                bbox_size = (
-                    float(detection.bbox.size.x),
-                    float(detection.bbox.size.y),
-                    float(detection.bbox.size.z),
-                )
-            except (AttributeError, TypeError, ValueError):
-                bbox_size = (0.0, 0.0, 0.0)
-            full_fit = (
-                orientation in {"yaw0", "yaw90"}
-                and all(math.isfinite(value) and value > 1e-4 for value in bbox_size)
-            )
-            quality = "mask_cloud_cuboid" if full_fit else "bbox_depth_center"
             orientation_history = self._target_orientation_histories.setdefault(
                 color,
                 deque(maxlen=7),
             )
             orientation_history.append(orientation)
-            quality_history = self._target_quality_histories.setdefault(
-                color,
-                deque(maxlen=7),
-            )
-            quality_history.append(quality)
             if len(history) < 3:
                 continue
             samples = tuple(history)
@@ -369,90 +334,13 @@ class CompetitionClient(Node):
                 float(median(sample[axis] for sample in samples))
                 for axis in range(3)
             )
-            quality_values = tuple(quality_history)
-            if quality_values and all(value == "mask_cloud_cuboid" for value in quality_values):
-                stable_quality = "mask_cloud_cuboid"
-            elif quality_values and all(value == "bbox_depth_center" for value in quality_values):
-                stable_quality = "bbox_depth_center"
-            else:
-                # Do not let a median assembled from mixed full-fit and
-                # surface-fallback frames pass the task-2 quality gate.
-                stable_quality = "mixed"
             self.target_observations[color] = TargetObservation(
                 color=color,
                 position_world=stable_position,
                 received_at_s=received_at_s,
                 orientation=dominant_orientation(orientation_history),
                 score=score,
-                quality=stable_quality,
             )
-
-    def _reset_target_histories(self, colors: list[str]) -> None:
-        """Drop pre-task-2 frames so a new shelf lock starts from fresh RGB-D data."""
-
-        for color in colors:
-            self._target_histories.pop(color, None)
-            self._target_orientation_histories.pop(color, None)
-            self._target_quality_histories.pop(color, None)
-            self.target_observations.pop(color, None)
-
-    def _refresh_task2_detection_epoch(self) -> None:
-        """Clear the target colour once when task 2 starts its arm staging.
-
-        Task 1 and the early task-2 navigation intentionally share the same
-        detector stream.  Without an epoch boundary, the seven-sample client
-        median can combine old table/shelf-edge frames with the final shelf
-        view, making a biased but apparently stable centre.
-        """
-
-        if self.controller.task_index != 1 or self.controller.stage is not TaskStage.ALIGN_FOR_PICK:
-            return
-        target_color = (
-            str(self.instructions[1].get("target_color", "")).strip().lower()
-            if len(self.instructions) > 1
-            else ""
-        )
-        if not target_color:
-            return
-        key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
-        if key == self._last_task2_detection_reset_key:
-            return
-        self._reset_target_histories([target_color])
-        self._last_task2_detection_reset_key = key
-        self.get_logger().info(
-            f"task 2 detection epoch reset for {target_color}; waiting for fresh RGB-D frames"
-        )
-
-    def _refresh_task3_detection_epoch(self) -> None:
-        """Mark task 3 start without discarding its target observations.
-
-        The task-3 top box stays in the scene while tasks 1 and 2 run.  Its
-        rolling RGB-D median is therefore useful as soon as the robot turns
-        back toward the table.  Unlike task 2's shelf target, do not clear
-        this colour at the task boundary; the task-3 executor keeps fusing
-        the retained observation and any newer frames.
-        """
-
-        if self.controller.task_index != 2 or self.controller.stage not in {
-            TaskStage.NAVIGATE_TO_PICK,
-            TaskStage.ACQUIRE_TARGET,
-        }:
-            return
-        target_color = (
-            str(self.instructions[2].get("target_color", "")).strip().lower()
-            if len(self.instructions) > 2
-            else ""
-        )
-        if not target_color:
-            return
-        key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
-        if key == self._last_task3_detection_reset_key:
-            return
-        self._last_task3_detection_reset_key = key
-        self.get_logger().info(
-            f"task 3 retaining existing {target_color} RGB-D history; "
-            "continuing centre tracking from navigation"
-        )
 
     def _publish_base_command(self, linear_x: float, angular_z: float) -> None:
         if not rclpy.ok():
@@ -542,7 +430,6 @@ class CompetitionClient(Node):
             "contact_only",
             "lift_only",
             "task12_full",
-            "task123_full",
         } and self.instructions:
             target_color = (
                 str(self.instructions[0].get("target_color", "")).strip().lower()
@@ -560,8 +447,6 @@ class CompetitionClient(Node):
                 self._publish_arm_command(snapshot.arm_command)
             return
 
-        self._refresh_task2_detection_epoch()
-        self._refresh_task3_detection_epoch()
         missing = self._missing_inputs()
         self.controller.set_inputs_ready(not missing)
         if missing:
@@ -575,7 +460,8 @@ class CompetitionClient(Node):
         if self.phase is ClientPhase.WAITING_FOR_SERVER:
             self.phase = ClientPhase.READY
             self.get_logger().info(
-                "client inputs ready; starting three-task competition controller"
+                "client inputs ready; starting "
+                + ("Task3-only diagnostic" if self.execution_mode == "task3_only" else "three-task competition controller")
             )
 
         now_s = self.get_clock().now().nanoseconds * 1e-9

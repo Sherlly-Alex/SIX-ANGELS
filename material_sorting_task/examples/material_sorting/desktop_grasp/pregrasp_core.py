@@ -282,6 +282,7 @@ class OpenPregraspController:
     """Plan and ramp one open dual-arm pose using measured joint feedback."""
 
     ARM_POSITION_TOL = FEEDBACK_POS_TOL
+    COMMAND_RATE_PER_S = COMMAND_RATE_PER_S
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
         self._kdl = kdl or MMK2Kdl()
@@ -445,7 +446,7 @@ class OpenPregraspController:
         diff = np.abs(self._target_vector - self._action_vector)
         ratios = diff / (float(np.max(diff)) + 1e-6)
         ratios[0] *= SLIDE_COMMAND_RATIO
-        steps = ratios * COMMAND_RATE_PER_S * dt
+        steps = ratios * self.COMMAND_RATE_PER_S * dt
         self._action_vector += np.sign(
             self._target_vector - self._action_vector
         ) * np.minimum(diff, steps)
@@ -1036,8 +1037,9 @@ class SlideLiftController:
         left_error = float(np.max(np.abs(measured_left - target_left)))
         right_error = float(np.max(np.abs(measured_right - target_right)))
         command_error = abs(self._action_vector[0] - self._target_vector[0])
+        slide_velocity = abs(velocities.get("slide_joint", 0.0))
         max_velocity = max(
-            abs(velocities.get("slide_joint", 0.0)),
+            slide_velocity,
             *(abs(velocities.get(f"left_arm_joint{index}", 0.0)) for index in range(1, 7)),
             *(abs(velocities.get(f"right_arm_joint{index}", 0.0)) for index in range(1, 7)),
         )
@@ -1046,7 +1048,7 @@ class SlideLiftController:
             and left_error <= LIFT_ARM_POSITION_TOL
             and right_error <= LIFT_ARM_POSITION_TOL
             and command_error <= FEEDBACK_POS_TOL
-            and max_velocity <= FEEDBACK_VEL_TOL
+            and slide_velocity <= FEEDBACK_VEL_TOL
         )
         reached = False
         if stable_now:
@@ -1060,7 +1062,7 @@ class SlideLiftController:
             f"slide_target={self._target_vector[0]:.3f}, "
             f"slide_err={slide_error:.3f}, left_err={left_error:.3f}, "
             f"right_err={right_error:.3f}, cmd_err={command_error:.3f}, "
-            f"max_vel={max_velocity:.3f}"
+            f"slide_vel={slide_velocity:.3f}, max_vel={max_velocity:.3f}"
         )
         return self.command(), reached, detail
 

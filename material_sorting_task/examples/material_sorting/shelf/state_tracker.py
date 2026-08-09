@@ -95,12 +95,6 @@ class ShelfStateTracker:
     COLORED_HALF_Z = 0.095
     PACKAGING_HALF_Z = 0.117
     SUPPORT_CLEARANCE = 0.010
-    # The packaging box is a fixed shelf prop.  It is commonly seen while
-    # driving to the observation stand and then occluded by the held box or
-    # head motion during the deliberate semantic scan.  Retain its last valid
-    # RGB-D observation for that short task-1 window; coloured boxes remain
-    # subject to the normal fresh-frame requirement.
-    STATIC_PACKAGING_MAX_AGE_S = 60.0
 
     def __init__(
         self,
@@ -121,46 +115,15 @@ class ShelfStateTracker:
         self._frames: deque[dict[str, tuple[int, tuple[float, float, float], float]]] = deque(
             maxlen=self.window_size
         )
-        # Keep the two semantic targets in independent histories.  A carried
-        # task-1 box or an arm can hide one shelf layer after the robot reaches
-        # the observation stand; frames for the still-visible target must not
-        # evict the already useful samples of the temporarily hidden target.
-        self._colored_samples: deque[
-            tuple[str, int, tuple[float, float, float], float]
-        ] = deque(maxlen=self.window_size)
-        self._packaging_samples: deque[
-            tuple[int, tuple[float, float, float], float]
-        ] = deque(maxlen=self.window_size)
-        self._stable_colored: (
-            tuple[str, int, tuple[float, float, float], float, int] | None
-        ) = None
-        self._stable_packaging: (
-            tuple[int, tuple[float, float, float], float, int] | None
-        ) = None
         self._last_signature: tuple[tuple[str, float], ...] | None = None
 
     def reset(self) -> None:
         self._frames.clear()
-        self._colored_samples.clear()
-        self._packaging_samples.clear()
-        self._stable_colored = None
-        self._stable_packaging = None
         self._last_signature = None
 
     @property
     def frames_used(self) -> int:
         return len(self._frames)
-
-    @property
-    def diagnostic_summary(self) -> str:
-        """Compact independent-vote status for task-1 progress logs."""
-
-        colored = self._colored_vote_status()
-        packaging = self._packaging_vote_status()
-        return (
-            f"frames={len(self._frames)}, colored={colored}, "
-            f"packaging={packaging}"
-        )
 
     def update(
         self,
@@ -168,7 +131,6 @@ class ShelfStateTracker:
         *,
         now_s: float,
         carried_class_id: str | None,
-        expected_colored_class_id: str | None = None,
     ) -> ShelfState | None:
         """Add one new detector frame and return a stable result when unique.
 
@@ -178,9 +140,6 @@ class ShelfStateTracker:
         """
 
         carried = str(carried_class_id or "").strip().lower()
-        expected = str(expected_colored_class_id or "").strip().lower()
-        if expected and expected not in COLORED_CLASSES:
-            raise ValueError(f"unsupported expected shelf colour {expected!r}")
         relevant: list[tuple[str, TargetObservation]] = []
         for raw_label, observation in observations.items():
             label = str(raw_label).strip().lower()
@@ -189,12 +148,7 @@ class ShelfStateTracker:
             if label not in COLORED_CLASSES and label not in WHITE_CLASSES:
                 continue
             age_s = max(0.0, float(now_s) - float(observation.received_at_s))
-            max_age_s = (
-                self.STATIC_PACKAGING_MAX_AGE_S
-                if label in WHITE_CLASSES
-                else self.max_observation_age_s
-            )
-            if age_s > max_age_s:
+            if age_s > self.max_observation_age_s:
                 continue
             relevant.append((label, observation))
 
@@ -204,53 +158,37 @@ class ShelfStateTracker:
         if signature and signature != self._last_signature:
             self._last_signature = signature
             frame: dict[str, tuple[int, tuple[float, float, float], float]] = {}
-            priorities: dict[str, int] = {}
             for label, observation in relevant:
-                # The formal scene has exactly one coloured box inside the
-                # shelf ROI, and all three validated instructions are known
-                # before task 1 starts.  Colour segmentation can transiently
-                # call that same physical shelf box pink before correcting it
-                # to brown at a closer view.  Use task 2's instructed identity
-                # after spatial/layer validation, while keeping the detector
-                # label in the frame signature so independent frames are still
-                # required.  An exact-label observation wins if a frame
-                # contains more than one colour candidate.
-                canonical_label = (
-                    expected if expected and label in COLORED_CLASSES else label
-                )
-                classified = self._classify(canonical_label, observation)
+                classified = self._classify(label, observation)
                 if classified is not None:
-                    priority = int(label == canonical_label)
-                    if priority >= priorities.get(canonical_label, -1):
-                        frame[canonical_label] = classified
-                        priorities[canonical_label] = priority
+                    frame[label] = classified
             self._frames.append(frame)
-            for label, (layer, point, score) in frame.items():
-                if label in COLORED_CLASSES:
-                    self._colored_samples.append((label, layer, point, score))
-                else:
-                    self._packaging_samples.append((layer, point, score))
-            self._lock_independent_targets()
 
         return self.result()
 
     def result(self) -> ShelfState | None:
-        self._lock_independent_targets()
-        if self._stable_colored is None or self._stable_packaging is None:
+        if len(self._frames) < self.required_votes:
             return None
-        (
-            colored_label,
-            colored_layer,
-            colored_center,
-            colored_score,
-            colored_count,
-        ) = self._stable_colored
-        (
-            white_layer,
-            packaging_center,
-            packaging_score,
-            white_count,
-        ) = self._stable_packaging
+
+        colored_votes: Counter[tuple[str, int]] = Counter()
+        white_votes: Counter[int] = Counter()
+        points: dict[tuple[str, int], list[tuple[float, float, float]]] = {}
+        scores: dict[tuple[str, int], list[float]] = {}
+        for frame in self._frames:
+            for label, (layer, point, score) in frame.items():
+                if label in COLORED_CLASSES:
+                    colored_votes[(label, layer)] += 1
+                else:
+                    white_votes[layer] += 1
+                points.setdefault((label, layer), []).append(point)
+                scores.setdefault((label, layer), []).append(score)
+
+        if not colored_votes or not white_votes:
+            return None
+        (colored_label, colored_layer), colored_count = colored_votes.most_common(1)[0]
+        white_layer, white_count = white_votes.most_common(1)[0]
+        if colored_count < self.required_votes or white_count < self.required_votes:
+            return None
         if colored_layer == white_layer:
             return None
         empty_candidates = {1, 2, 3} - {colored_layer, white_layer}
@@ -263,6 +201,11 @@ class ShelfStateTracker:
         # task 2's pick target and the packaging box is task 3's placement
         # reference.  A coordinate-wise median rejects the occasional edge
         # or arm-occlusion frame while preserving the object's measured x/y/z.
+        colored_samples = points[(colored_label, colored_layer)]
+        colored_center = _median_center(colored_samples)
+        packaging_samples = points[("packaging_box", white_layer)]
+        packaging_center = _median_center(packaging_samples)
+
         # The empty slot has no object center to detect.  Its center is the
         # calibrated shelf-layer center inferred from the two occupied layers.
         empty_center = (
@@ -282,8 +225,9 @@ class ShelfStateTracker:
         centers[white_layer - 1] = packaging_center
         contents[empty_layer - 1] = "EMPTY"
         centers[empty_layer - 1] = empty_center
-        vote_confidence = min(colored_count, white_count) / float(self.window_size)
-        score_confidence = min(colored_score, packaging_score)
+        vote_confidence = min(colored_count, white_count) / float(len(self._frames))
+        semantic_scores = scores.get((colored_label, colored_layer), ())
+        score_confidence = _median(semantic_scores) if semantic_scores else 0.0
         confidence = max(0.0, min(1.0, 0.7 * vote_confidence + 0.3 * score_confidence))
         return ShelfState(
             empty_layer=empty_layer,
@@ -295,72 +239,6 @@ class ShelfStateTracker:
             confidence=confidence,
             frames_used=len(self._frames),
         )
-
-    def _lock_independent_targets(self) -> None:
-        """Latch each shelf target as soon as its own votes become stable.
-
-        The latches survive later partial or empty frames until ``reset()``
-        starts the next randomized task-1 observation epoch.
-        """
-
-        if self._stable_colored is None and self._colored_samples:
-            votes = Counter(
-                (label, layer)
-                for label, layer, _point, _score in self._colored_samples
-            )
-            (label, layer), count = votes.most_common(1)[0]
-            if count >= self.required_votes:
-                matching = [
-                    (point, score)
-                    for sample_label, sample_layer, point, score in self._colored_samples
-                    if sample_label == label and sample_layer == layer
-                ]
-                self._stable_colored = (
-                    label,
-                    layer,
-                    _median_center([point for point, _score in matching]),
-                    _median(score for _point, score in matching),
-                    count,
-                )
-
-        if self._stable_packaging is None and self._packaging_samples:
-            votes = Counter(layer for layer, _point, _score in self._packaging_samples)
-            layer, count = votes.most_common(1)[0]
-            if count >= self.required_votes:
-                matching = [
-                    (point, score)
-                    for sample_layer, point, score in self._packaging_samples
-                    if sample_layer == layer
-                ]
-                self._stable_packaging = (
-                    layer,
-                    _median_center([point for point, _score in matching]),
-                    _median(score for _point, score in matching),
-                    count,
-                )
-
-    def _colored_vote_status(self) -> str:
-        if self._stable_colored is not None:
-            label, layer, _center, _score, count = self._stable_colored
-            return f"locked:{label}@L{layer}({count})"
-        if not self._colored_samples:
-            return f"none(0/{self.required_votes})"
-        votes = Counter(
-            (label, layer)
-            for label, layer, _point, _score in self._colored_samples
-        )
-        (label, layer), count = votes.most_common(1)[0]
-        return f"{label}@L{layer}({count}/{self.required_votes})"
-
-    def _packaging_vote_status(self) -> str:
-        if self._stable_packaging is not None:
-            layer, _center, _score, count = self._stable_packaging
-            return f"locked:L{layer}({count})"
-        if not self._packaging_samples:
-            return f"none(0/{self.required_votes})"
-        votes = Counter(layer for layer, _point, _score in self._packaging_samples)
-        layer, count = votes.most_common(1)[0]
-        return f"L{layer}({count}/{self.required_votes})"
 
     def _classify(
         self,

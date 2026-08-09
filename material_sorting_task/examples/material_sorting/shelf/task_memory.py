@@ -14,7 +14,7 @@ class CompetitionTaskMemory:
     Executors receive the same instance from ``build_task_executors``.  The
     top-level controller may reset an individual executor between attempts,
     but a successful task-1 origin and shelf scan must remain available to
-    tasks 2 and 3.
+    task 2.
     """
 
     task1_origin_world: tuple[float, float, float] | None = None
@@ -45,19 +45,6 @@ class CompetitionTaskMemory:
         self.task3_packaging_box_center_world = (
             state.task3_packaging_box_center_world
         )
-
-    def clear_shelf_state(self) -> None:
-        """Discard a provisional shelf interpretation before a fresh scan.
-
-        The task-1 transport path can expose a partial shelf view.  That is
-        useful for warm-up, but it must never become the state handed to the
-        later formal tasks before the dedicated shelf scan has stabilised.
-        """
-
-        self.shelf_state = None
-        self.shelf_empty_center_world = None
-        self.task2_target_center_world = None
-        self.task3_packaging_box_center_world = None
 
     def require_task1_origin(self) -> tuple[float, float, float]:
         if self.task1_origin_world is None:

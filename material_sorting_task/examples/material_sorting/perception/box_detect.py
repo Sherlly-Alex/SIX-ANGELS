@@ -63,25 +63,6 @@ BOX_SIZE_BY_ORIENTATION = {
     "yaw90": (0.16, 0.24, 0.19),
 }
 
-# Gaussian-splat rendering can make the coloured box faces much less saturated
-# than the source texture.  Keep the stricter COLOR_HSV ranges for the global
-# colour detector, but allow a second, low-saturation pass *inside an existing
-# detector bbox*.  The relaxed mask is also intersected with the target's
-# centre-depth layer below, so white shelf pixels behind the box cannot become
-# part of the fitted cloud merely because their colour is slightly tinted.
-RGBD_RELAXED_COLOR_HSV = {
-    "pink": [
-        ((145, 12, 80), (179, 255, 255)),
-        ((0, 12, 80), (12, 255, 255)),
-    ],
-    "yellow": [((14, 18, 70), (45, 255, 255))],
-    "brown": [((3, 15, 25), (30, 230, 230))],
-}
-RGBD_MASK_MIN_POINTS = 30
-RGBD_DEPTH_GATE_MIN_M = 0.035
-RGBD_DEPTH_GATE_SCALE = 0.045
-RGBD_DEPTH_GATE_MAX_M = 0.080
-
 
 def render_fk_xml():
     with open(SOURCE_XML, "r", encoding="utf-8") as f:
@@ -269,17 +250,11 @@ class BoxDetectNode(Node):
         return float(np.median(valid)) * 1e-3 if len(valid) else 0.0
 
     @staticmethod
-    def color_mask(rgb_roi, color, *, relaxed=False):
-        """Segment one box color inside a detector bbox.
-
-        ``relaxed`` is only used after a YOLO/colour bbox already identifies
-        the semantic class.  It deliberately does not alter the global colour
-        detector's thresholds.
-        """
+    def color_mask(rgb_roi, color):
+        """Segment one box color inside a detector bbox."""
         hsv = cv2.cvtColor(rgb_roi, cv2.COLOR_BGR2HSV)
         mask = np.zeros(hsv.shape[:2], np.uint8)
-        ranges = RGBD_RELAXED_COLOR_HSV if relaxed else COLOR_HSV
-        for lo, hi in ranges.get(color, []):
+        for lo, hi in COLOR_HSV.get(color, []):
             mask |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
         k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3)
@@ -319,30 +294,9 @@ class BoxDetectNode(Node):
 
         rgb_roi = rgb[y0:y1, x0:x1]
         depth_roi = depth[y0:y1, x0:x1].astype(np.float32)
-        positive_depth = depth_roi > 0
-        center_depth_m = self.patch_depth_m(depth, u, v)
-        depth_gate = positive_depth
-        if center_depth_m > 0.0:
-            depth_tolerance_m = float(np.clip(
-                RGBD_DEPTH_GATE_SCALE * center_depth_m,
-                RGBD_DEPTH_GATE_MIN_M,
-                RGBD_DEPTH_GATE_MAX_M,
-            ))
-            depth_gate = positive_depth & (
-                np.abs(depth_roi * 1e-3 - center_depth_m) <= depth_tolerance_m
-            )
-
-        # Prefer the original high-saturation mask.  If the rendered box is
-        # pale, retry with the class-specific relaxed mask while retaining the
-        # centre-depth gate that separates the foreground box from the shelf.
-        mask_mode = "strict"
         mask = self.color_mask(rgb_roi, det["class"])
-        valid_mask = ((mask > 0) & depth_gate).astype(np.uint8)
-        if int(np.count_nonzero(valid_mask)) < RGBD_MASK_MIN_POINTS:
-            mask_mode = "relaxed"
-            mask = self.color_mask(rgb_roi, det["class"], relaxed=True)
-            valid_mask = ((mask > 0) & depth_gate).astype(np.uint8)
-        if int(np.count_nonzero(valid_mask)) < RGBD_MASK_MIN_POINTS:
+        valid_mask = ((mask > 0) & (depth_roi > 0)).astype(np.uint8)
+        if int(np.count_nonzero(valid_mask)) < 30:
             return None, u, v, int(np.count_nonzero(valid_mask)), "few_mask_depth"
 
         n, labels, stats, _ = cv2.connectedComponentsWithStats(valid_mask, connectivity=8)
@@ -351,7 +305,7 @@ class BoxDetectNode(Node):
         areas = stats[1:, cv2.CC_STAT_AREA]
         comp_id = int(np.argmax(areas)) + 1
         comp = labels == comp_id
-        if int(np.count_nonzero(comp)) < RGBD_MASK_MIN_POINTS:
+        if int(np.count_nonzero(comp)) < 30:
             return None, u, v, int(np.count_nonzero(comp)), "small_component"
 
         ys_rel, xs_rel = np.nonzero(comp)
@@ -388,17 +342,7 @@ class BoxDetectNode(Node):
         ])
         points_world = (T_cam_world[:3, :3] @ points_cam.T).T + T_cam_world[:3, 3]
         center_world, orientation = self.fit_cuboid_center(points_world, T_cam_world[:3, 3])
-        method_prefix = (
-            "mask_cloud_cuboid" if mask_mode == "strict"
-            else "mask_cloud_cuboid_relaxed"
-        )
-        return (
-            center_world,
-            center_u,
-            center_v,
-            int(len(zs)),
-            f"{method_prefix}_{orientation}",
-        )
+        return center_world, center_u, center_v, int(len(zs)), f"mask_cloud_cuboid_{orientation}"
 
     def shelf_obstacle_world(self, rgb, depth, T_cam_world):
         """Detect any occupied object in the shelf placement slot with RGB-D."""
@@ -659,4 +603,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

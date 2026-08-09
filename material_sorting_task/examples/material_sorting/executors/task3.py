@@ -1,26 +1,45 @@
-"""Integrated task-3 table-top pick and shelf-side placement executor."""
+"""Integrated Task 3 executor.
+
+Task 3:
+    dynamic instruction target_color
+    -> teacher Task-1 table pick / dual-arm grasp / lift
+    -> teacher shelf transport and shelf recognition
+    -> live RGB-D packaging_box reference
+    -> place on packaging-box left side
+    -> release / retreat / return
+
+No GT object pose and no fixed yellow target are used here.
+"""
 
 from __future__ import annotations
 
 import math
-import re
+from dataclasses import replace
+
+import numpy as np
+import desktop_grasp.pregrasp_core as pregrasp_core
+from control_types import ArmCommand
 
 from desktop_grasp.pregrasp_core import (
+    ContactGraspController,
     PregraspInputError,
     PregraspPlanningError,
-    SPINE_MIN,
+    SlideLiftController,
+    _joint_maps,
 )
-from executors.base import ExecutionContext, PlaceholderTaskExecutor, StageResult, TaskStage
-from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
-from executors.transfer_support import stand_from_held_center
-from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
-from navigation.competition_adapter import goal_reached_event
-from navigation.robot_geometry import FootprintMode
-from shelf.manipulation import HeldTransportController
-from shelf.task3_geometry import (
-    TASK3_SAFE_RELEASE_CENTER_INSET_M,
-    task3_safe_release_target,
+from executors.base import (
+    ExecutionContext,
+    StageResult,
+    StageStatus,
+    TaskStage,
 )
+from executors.base import PlaceholderTaskExecutor
+from executors.task1_full import (
+    Task1IntegratedExecutor,
+    stand_from_held_center,
+)
+from shelf.manipulation import ReleaseSpreadController
+from shelf.task_memory import CompetitionTaskMemory
 from shelf.target_center import StableTargetCenterTracker
 
 
@@ -29,1290 +48,2309 @@ class Task3Executor(PlaceholderTaskExecutor):
     name = "task3_table_top_to_shelf_prop_side"
 
 
-class Task3IntegratedExecutor(Task1IntegratedExecutor):
-    """Run task 3 through the formal ``TaskExecutor`` interface.
+class Task3StableOpenPregraspController(
+    pregrasp_core.OpenPregraspController
+):
+    """Task3 open pregrasp with independent measured-seeded arm IK.
 
-    Task 1's calibrated dual-arm pregrasp/contact/lift and release controller
-    are retained.  Task 3 replaces the old arm-insertion/return tail with an
-    explicit base-only push, release, escape, compact, and safe-return route;
-    only the task-specific top-box target lock and packaging-box placement
-    geometry are otherwise overridden.
+    The target geometry is identical to OpenPregraspController.  Only IK
+    branch selection differs: each arm is solved independently using that
+    arm's current measured joints as its 7-element reference pose.
     """
+
+    # Exact high-support pregrasp geometry from the validated Task3 runner:
+    # grip_half=0.130, pre_grasp_fwd=-0.045, grasp_z=-0.010.  The generic
+    # Task1 open pose uses a 0.225 m half width and +0.020 m hand-Z offset;
+    # at the raised white support that route leaves the left arm physically
+    # stalled.  Keep this adjustment strictly inside Task3.
+    PREGRASP_HALF_WIDTH_M = 0.130
+    PREGRASP_X_OFFSET_M = -0.045
+    PREGRASP_Z_OFFSET_M = -0.010
+
+    def plan(self, target_world, odometry, joint_states):
+        adjusted_target = (
+            float(target_world[0]),
+            float(target_world[1]),
+            float(target_world[2])
+            + self.PREGRASP_Z_OFFSET_M
+            - pregrasp_core.HAND_Z_OFFSET,
+        )
+        return self._plan_pose(
+            adjusted_target,
+            odometry,
+            joint_states,
+            center_backoff_x=-self.PREGRASP_X_OFFSET_M,
+            half_width=self.PREGRASP_HALF_WIDTH_M,
+        )
+
+    def _plan_pose(
+        self,
+        target_world,
+        odometry,
+        joint_states,
+        *,
+        center_backoff_x,
+        half_width,
+    ):
+        if not all(math.isfinite(float(value)) for value in target_world):
+            raise PregraspInputError(
+                "Task3 target_world contains non-finite values"
+            )
+        if not math.isfinite(float(center_backoff_x)):
+            raise PregraspInputError(
+                "Task3 center_backoff_x is non-finite"
+            )
+        if (
+            not math.isfinite(float(half_width))
+            or float(half_width) <= 0.0
+        ):
+            raise PregraspInputError(
+                "Task3 half_width must be finite and positive"
+            )
+
+        positions, _velocities = pregrasp_core._joint_maps(joint_states)
+        robot_pose = pregrasp_core._odometry_pose(odometry)
+        box_center_base = pregrasp_core._world_to_base(
+            target_world,
+            robot_pose,
+        )
+        self._target_base = tuple(
+            float(value) for value in box_center_base
+        )
+
+        arm_center_base = box_center_base + np.array(
+            [
+                -float(center_backoff_x),
+                0.0,
+                pregrasp_core.HAND_Z_OFFSET,
+            ],
+            dtype=float,
+        )
+
+        left_target = arm_center_base + np.array(
+            [0.0, float(half_width), 0.0],
+            dtype=float,
+        )
+        right_target = arm_center_base + np.array(
+            [0.0, -float(half_width), 0.0],
+            dtype=float,
+        )
+
+        slide_target = float(
+            np.clip(
+                pregrasp_core.SPINE_REFERENCE_Z
+                - arm_center_base[2],
+                pregrasp_core.SPINE_MIN,
+                pregrasp_core.SPINE_MAX,
+            )
+        )
+
+        # Important difference from the generic dual-arm planner:
+        # seed each arm from its own currently measured configuration.
+        left_ref = np.array(
+            [
+                positions["slide_joint"],
+                *(
+                    positions[f"left_arm_joint{index}"]
+                    for index in range(1, 7)
+                ),
+            ],
+            dtype=float,
+        )
+        right_ref = np.array(
+            [
+                positions["slide_joint"],
+                *(
+                    positions[f"right_arm_joint{index}"]
+                    for index in range(1, 7)
+                ),
+            ],
+            dtype=float,
+        )
+
+        left_solutions = self._kdl.inverse_kinematics(
+            T_left=pregrasp_core._make_transform(
+                left_target,
+                pregrasp_core.LEFT_A_ROT,
+            ),
+            T_right=None,
+            ref_pos=left_ref,
+            target_height=slide_target,
+        )
+        if left_solutions is None or len(left_solutions) == 0:
+            raise PregraspPlanningError(
+                "Task3 independent left-arm pregrasp IK failed; "
+                f"target_base={np.round(box_center_base, 3).tolist()}, "
+                f"left_target={np.round(left_target, 3).tolist()}"
+            )
+
+        right_solutions = self._kdl.inverse_kinematics(
+            T_left=None,
+            T_right=pregrasp_core._make_transform(
+                right_target,
+                pregrasp_core.RIGHT_A_ROT,
+            ),
+            ref_pos=right_ref,
+            target_height=slide_target,
+        )
+        if right_solutions is None or len(right_solutions) == 0:
+            raise PregraspPlanningError(
+                "Task3 independent right-arm pregrasp IK failed; "
+                f"target_base={np.round(box_center_base, 3).tolist()}, "
+                f"right_target={np.round(right_target, 3).tolist()}"
+            )
+
+        left_joints = np.asarray(left_solutions[0], dtype=float)
+        right_joints = np.asarray(right_solutions[0], dtype=float)
+
+        if left_joints.shape != (7,) or not np.all(
+            np.isfinite(left_joints)
+        ):
+            raise PregraspPlanningError(
+                "Task3 left-arm IK returned invalid result "
+                f"shape={left_joints.shape}"
+            )
+
+        if right_joints.shape != (7,) or not np.all(
+            np.isfinite(right_joints)
+        ):
+            raise PregraspPlanningError(
+                "Task3 right-arm IK returned invalid result "
+                f"shape={right_joints.shape}"
+            )
+
+        self._target_vector = np.array(
+            [
+                slide_target,
+                pregrasp_core.HEAD_TARGET[0],
+                pregrasp_core.HEAD_TARGET[1],
+                *left_joints[1:7],
+                pregrasp_core.GRIPPER_OPEN,
+                *right_joints[1:7],
+                pregrasp_core.GRIPPER_OPEN,
+            ],
+            dtype=float,
+        )
+
+        # Start exactly from measured feedback, preserving the existing
+        # OpenPregraspController ramp/update implementation.
+        self._action_vector = np.array(
+            [
+                positions["slide_joint"],
+                positions.get("head_yaw_joint", 0.0),
+                positions.get("head_pitch_joint", 0.0),
+                *(
+                    positions[f"left_arm_joint{index}"]
+                    for index in range(1, 7)
+                ),
+                pregrasp_core.GRIPPER_OPEN,
+                *(
+                    positions[f"right_arm_joint{index}"]
+                    for index in range(1, 7)
+                ),
+                pregrasp_core.GRIPPER_OPEN,
+            ],
+            dtype=float,
+        )
+
+        self._last_update_s = None
+        self._stable_since_s = None
+
+        return self.command()
+
+
+class Task3DirectHugController(
+    pregrasp_core.OpenPregraspController
+):
+    """Reproduce the previously successful Task3 direct symmetric hug.
+
+    Exact old geometry in base frame:
+      grasp_center = box_center + (-0.045, 0.0, -0.010)
+      left  = grasp_center + (0, +0.085, 0)
+      right = grasp_center + (0, -0.085, 0)
+
+    Each arm is solved independently from its measured configuration,
+    matching the old set_arm() branch-selection behaviour.
+    """
+
+    HOLD_HALF_WIDTH_M = 0.080
+    GRASP_X_OFFSET_M = -0.045
+    GRASP_Z_OFFSET_M = -0.010
+
+    # Old Task3 final squeeze was intentionally slower than normal arm motion.
+    COMMAND_RATE_PER_S = 0.45
+    COMMAND_TOLERANCE = 0.020
+    SETTLE_TIME_S = 2.8
+
+    def __init__(self):
+        super().__init__()
+        self._grasp_center_base = None
+
+    @property
+    def grasp_center_base(self):
+        return self._grasp_center_base
+
+    def plan(
+        self,
+        target_world,
+        odometry,
+        joint_states,
+    ):
+        if not all(math.isfinite(float(v)) for v in target_world):
+            raise PregraspInputError(
+                "Task3 direct-hug target contains non-finite values"
+            )
+
+        positions, _velocities = pregrasp_core._joint_maps(joint_states)
+        robot_pose = pregrasp_core._odometry_pose(odometry)
+
+        box_center_base = pregrasp_core._world_to_base(
+            target_world,
+            robot_pose,
+        )
+        self._target_base = tuple(
+            float(v) for v in box_center_base
+        )
+
+        grasp_center = box_center_base + np.array(
+            [
+                self.GRASP_X_OFFSET_M,
+                0.0,
+                self.GRASP_Z_OFFSET_M,
+            ],
+            dtype=float,
+        )
+        self._grasp_center_base = tuple(
+            float(v) for v in grasp_center
+        )
+
+        left_target = grasp_center + np.array(
+            [0.0, self.HOLD_HALF_WIDTH_M, 0.0],
+            dtype=float,
+        )
+        right_target = grasp_center + np.array(
+            [0.0, -self.HOLD_HALF_WIDTH_M, 0.0],
+            dtype=float,
+        )
+
+        slide_target = float(
+            np.clip(
+                pregrasp_core.SPINE_REFERENCE_Z - grasp_center[2],
+                pregrasp_core.SPINE_MIN,
+                pregrasp_core.SPINE_MAX,
+            )
+        )
+
+        # Exactly like the old set_arm(): solve each side from its
+        # own measured 6-joint configuration.
+        left_ref = np.array(
+            [
+                positions["slide_joint"],
+                *(
+                    positions[f"left_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+            ],
+            dtype=float,
+        )
+        right_ref = np.array(
+            [
+                positions["slide_joint"],
+                *(
+                    positions[f"right_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+            ],
+            dtype=float,
+        )
+
+        left_solutions = self._kdl.inverse_kinematics(
+            T_left=pregrasp_core._make_transform(
+                left_target,
+                pregrasp_core.LEFT_A_ROT,
+            ),
+            T_right=None,
+            ref_pos=left_ref,
+            target_height=slide_target,
+        )
+        if left_solutions is None or len(left_solutions) == 0:
+            raise PregraspPlanningError(
+                "Task3 old-hug left IK failed: "
+                f"box_base={np.round(box_center_base,3).tolist()}, "
+                f"left={np.round(left_target,3).tolist()}"
+            )
+
+        right_solutions = self._kdl.inverse_kinematics(
+            T_left=None,
+            T_right=pregrasp_core._make_transform(
+                right_target,
+                pregrasp_core.RIGHT_A_ROT,
+            ),
+            ref_pos=right_ref,
+            target_height=slide_target,
+        )
+        if right_solutions is None or len(right_solutions) == 0:
+            raise PregraspPlanningError(
+                "Task3 old-hug right IK failed: "
+                f"box_base={np.round(box_center_base,3).tolist()}, "
+                f"right={np.round(right_target,3).tolist()}"
+            )
+
+        left_joints = np.asarray(left_solutions[0], dtype=float)
+        right_joints = np.asarray(right_solutions[0], dtype=float)
+
+        if left_joints.shape != (7,) or not np.all(np.isfinite(left_joints)):
+            raise PregraspPlanningError(
+                f"Task3 old-hug left IK invalid: {left_joints.shape}"
+            )
+        if right_joints.shape != (7,) or not np.all(np.isfinite(right_joints)):
+            raise PregraspPlanningError(
+                f"Task3 old-hug right IK invalid: {right_joints.shape}"
+            )
+
+        head_yaw = positions.get("head_yaw_joint", 0.0)
+        head_pitch = positions.get("head_pitch_joint", 0.0)
+
+        self._target_vector = np.array(
+            [
+                slide_target,
+                head_yaw,
+                head_pitch,
+                *left_joints[1:7],
+                pregrasp_core.GRIPPER_OPEN,
+                *right_joints[1:7],
+                pregrasp_core.GRIPPER_OPEN,
+            ],
+            dtype=float,
+        )
+
+        # Begin from measured feedback.
+        self._action_vector = np.array(
+            [
+                positions["slide_joint"],
+                head_yaw,
+                head_pitch,
+                *(
+                    positions[f"left_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+                pregrasp_core.GRIPPER_OPEN,
+                *(
+                    positions[f"right_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+                pregrasp_core.GRIPPER_OPEN,
+            ],
+            dtype=float,
+        )
+
+        self._last_update_s = None
+        self._stable_since_s = None
+        return self.command()
+
+    def update(
+        self,
+        now_s,
+        joint_states,
+    ):
+        if self._target_vector is None or self._action_vector is None:
+            raise PregraspPlanningError(
+                "Task3 direct-hug update before plan"
+            )
+
+        positions, velocities = pregrasp_core._joint_maps(joint_states)
+        now = float(now_s)
+
+        if self._last_update_s is None:
+            dt = 0.05
+        else:
+            dt = min(
+                0.20,
+                max(0.01, now - self._last_update_s),
+            )
+        self._last_update_s = now
+
+        diff = np.abs(
+            self._target_vector - self._action_vector
+        )
+        ratios = diff / (float(np.max(diff)) + 1e-6)
+
+        # Same slow-spine weighting used by the existing controllers.
+        ratios[0] *= pregrasp_core.SLIDE_COMMAND_RATIO
+
+        steps = (
+            ratios
+            * self.COMMAND_RATE_PER_S
+            * dt
+        )
+
+        self._action_vector += np.sign(
+            self._target_vector - self._action_vector
+        ) * np.minimum(diff, steps)
+
+        measured = np.array(
+            [
+                positions["slide_joint"],
+                *(
+                    positions[f"left_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+                *(
+                    positions[f"right_arm_joint{i}"]
+                    for i in range(1, 7)
+                ),
+            ],
+            dtype=float,
+        )
+
+        target = np.concatenate(
+            (
+                self._target_vector[0:1],
+                self._target_vector[3:9],
+                self._target_vector[10:16],
+            )
+        )
+        commanded = np.concatenate(
+            (
+                self._action_vector[0:1],
+                self._action_vector[3:9],
+                self._action_vector[10:16],
+            )
+        )
+
+        errors = np.abs(measured - target)
+
+        slide_error = float(errors[0])
+        left_error = float(np.max(errors[1:7]))
+        right_error = float(np.max(errors[7:13]))
+        command_error = float(
+            np.max(np.abs(commanded - target))
+        )
+
+        max_velocity = max(
+            abs(
+                float(
+                    velocities.get(
+                        f"{side}_arm_joint{i}",
+                        0.0,
+                    )
+                )
+            )
+            for side in ("left", "right")
+            for i in range(1, 7)
+        )
+
+        # IMPORTANT:
+        # The old successful hug did NOT require measured joints to reach
+        # the unconstrained IK goal.  Physical contact is supposed to stop
+        # the arms short and create preload.  We only require the commanded
+        # ramp itself to have reached the target.
+        command_settled = (
+            command_error <= self.COMMAND_TOLERANCE
+        )
+
+        detail = (
+            f"box_base={tuple(round(v,3) for v in self._target_base)}, "
+            f"grasp_center={tuple(round(v,3) for v in self._grasp_center_base)}, "
+            f"half={self.HOLD_HALF_WIDTH_M:.3f}, "
+            f"cmd_err={command_error:.3f}, "
+            f"slide_err={slide_error:.3f}, "
+            f"left_residual={left_error:.3f}, "
+            f"right_residual={right_error:.3f}, "
+            f"max_vel={max_velocity:.3f}"
+        )
+
+        return self.command(), command_settled, detail
+
+
+class Task3ReferenceContactController(ContactGraspController):
+    """Task-1 contact motion with the validated old Task-3 hold width."""
+
+    HOLD_HALF_WIDTH_M = 0.080
+    CENTER_BACKOFF_X_M = 0.0
+
+    def plan(
+        self,
+        target_world,
+        orientation,
+        odometry,
+        joint_states,
+    ):
+        self._orientation = str(orientation)
+        self._half_width = self.HOLD_HALF_WIDTH_M
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=self.CENTER_BACKOFF_X_M,
+            half_width=self._half_width,
+        )
+
+    def tighten(
+        self,
+        target_world,
+        inward_offset,
+        odometry,
+        joint_states,
+    ):
+        if self._orientation is None:
+            raise PregraspPlanningError(
+                "Task3 contact tighten requested before initial plan"
+            )
+        offset = float(inward_offset)
+        if not math.isfinite(offset) or offset < 0.0:
+            raise PregraspInputError(
+                "Task3 inward_offset must be finite and non-negative"
+            )
+        self._half_width = max(self.HOLD_HALF_WIDTH_M - offset, 0.01)
+        return self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=self.CENTER_BACKOFF_X_M,
+            half_width=self._half_width,
+        )
+
+    def contact_metrics(self, joint_states):
+        """Return measured bilateral IK residuals and joint speed."""
+
+        if self._target_vector is None:
+            return None
+        positions, velocities = _joint_maps(joint_states)
+        left_error = max(
+            abs(
+                float(positions[f"left_arm_joint{index}"])
+                - float(self._target_vector[2 + index])
+            )
+            for index in range(1, 7)
+        )
+        right_error = max(
+            abs(
+                float(positions[f"right_arm_joint{index}"])
+                - float(self._target_vector[9 + index])
+            )
+            for index in range(1, 7)
+        )
+        max_velocity = max(
+            abs(float(velocities.get(f"{side}_arm_joint{index}", 0.0)))
+            for side in ("left", "right")
+            for index in range(1, 7)
+        )
+        return left_error, right_error, max_velocity
+
+
+class Task3GripperOnlyReleaseController:
+    """Open both grippers without sweeping either arm farther into the shelf."""
+
+    SETTLE_S = 0.8
+
+    def __init__(self) -> None:
+        self._command: ArmCommand | None = None
+        self._started_s: float | None = None
+
+    @property
+    def planned(self) -> bool:
+        return self._command is not None
+
+    def reset(self) -> None:
+        self._command = None
+        self._started_s = None
+
+    def plan(
+        self,
+        target_world,
+        odometry,
+        joint_states,
+        *,
+        half_width=0.18,
+    ):
+        # Freeze every measured arm joint at its current shallow-place pose.
+        # Only the two gripper actuators open, so there is no forward IK sweep
+        # capable of shoving the box deeper or striking the shelf frame.
+        positions, _velocities = _joint_maps(joint_states)
+        self._command = ArmCommand(
+            spine_position=float(positions["slide_joint"]),
+            head_positions=(
+                float(positions.get("head_yaw_joint", 0.0)),
+                float(positions.get("head_pitch_joint", 0.0)),
+            ),
+            left_arm_positions=tuple(
+                float(positions[f"left_arm_joint{index}"])
+                for index in range(1, 7)
+            ),
+            left_gripper_position=float(pregrasp_core.GRIPPER_OPEN),
+            right_arm_positions=tuple(
+                float(positions[f"right_arm_joint{index}"])
+                for index in range(1, 7)
+            ),
+            right_gripper_position=float(pregrasp_core.GRIPPER_OPEN),
+        )
+        self._started_s = None
+        return self._command
+
+    def update(self, now_s, joint_states):
+        if self._command is None:
+            raise PregraspPlanningError(
+                "Task3 gripper-only release update called before plan"
+            )
+        now = float(now_s)
+        if self._started_s is None:
+            self._started_s = now
+        elapsed = max(0.0, now - self._started_s)
+        reached = elapsed >= self.SETTLE_S
+        return (
+            self._command,
+            reached,
+            f"grippers_open_with_arms_fixed; settle={elapsed:.2f}/{self.SETTLE_S:.2f}s",
+        )
+
+
+class Task3IntegratedExecutor(Task1IntegratedExecutor):
+    """Reuse the proven Task-1 manipulation chain for formal Task 3."""
 
     task_id = 3
     name = "task3_integrated_table_top_to_packaging_left"
 
+    # Reuse Task1's contact controller, but feed it Task3's physical box
+    # orientation.  The white-support target is yaw90 in the competition
+    # scene; Task1's yaw0 default leaves the arms about 42 mm too far apart
+    # and can lift empty.
     SOURCE_ORIENTATION = "yaw90"
-    # The official rules forbid hard-coding initial positions.  On the first
-    # attempt, the coloured target must agree with the current RGB-D location
-    # of the fixed white cube.  After a failed attempt the object is not reset,
-    # so retries accept its new fresh colour observation anywhere inside the
-    # bounded competition workspace.
-    TASK3_REFERENCE_MAX_AGE_S = 600.0
-    TASK3_REFERENCE_XY_TOLERANCE_M = 0.30
-    TASK3_TARGET_ABOVE_REFERENCE_Z_RANGE_M = (0.08, 0.35)
-    TASK3_PICK_YAW = math.pi / 2.0
-    TASK3_PICK_STANDOFF_M = 0.65
-    TASK3_TARGET_TIMEOUT_S = 25.0
-    TASK3_TARGET_MAX_AGE_S = 1.5
-    # A held top box can keep the arm joints in small contact oscillation even
-    # after the commanded 15 cm spine lift has physically completed.  Keep the
-    # shared task-1 completion rule unchanged and add this bounded task-3-only
-    # fallback for the measured remote behaviour.
-    TASK3_LIFT_SLIDE_TOLERANCE_M = 0.012
-    TASK3_LIFT_ARM_TOLERANCE_RAD = 0.10
-    TASK3_LIFT_COMMAND_TOLERANCE = 0.012
-    TASK3_LIFT_MAX_VELOCITY = 0.10
-    TASK3_LIFT_STABLE_TIME_S = 0.50
-    # Task 3 may need the full rotate-drive-restore sequence for a measured
-    # packaging-left offset.  The remote run was still converging its final
-    # yaw at the shared 20 s default, so give only this task enough time while
-    # retaining all position/yaw/collision completion checks.
-    TASK3_LATERAL_TIMEOUT_S = 35.0
-    TASK3_LATERAL_POSITION_TOLERANCE_M = 0.015
-    TASK3_SHELF_TURN_TOLERANCE_RAD = 0.06
-    TASK3_SHELF_TURN_MIN_ANGULAR_Z = 0.10
-    TASK3_SHELF_TURN_MAX_ANGULAR_Z = 0.35
-    # The shallow stand remains a conservative shelf-front reference.  The
-    # current task-3 strategy does not insert the box with arm IK: after the
-    # chassis reaches this stand it makes one additional short straight base
-    # advance, releases, then performs a separate post-release push.
-    TASK3_INSERT_CLEARANCE_M = 0.120
-    # Kept as compatibility/calibration names for the pre-existing shallow
-    # stand and wiring tests.  No arm-insertion controller is executed now.
-    TASK3_ARM_INSERTION_M = 0.240
-    TASK3_ARM_INSERT_TIMEOUT_S = 20.0
-    TASK3_EXTRA_BASE_ADVANCE_M = 0.20
-    TASK3_POST_RELEASE_RETREAT_M = 0.40
-    # ``ReleaseSpreadController`` interprets this as the per-arm half-width,
-    # matching the competition client's gripper-width convention.
-    TASK3_POST_RELEASE_HALF_WIDTH_M = 0.065
-    TASK3_POST_RELEASE_PUSH_M = 0.45
-    TASK3_POST_PUSH_RETREAT_M = 0.45
-    TASK3_RETURN_SEQUENCE_TIMEOUT_S = 90.0
-    TASK3_RAISE_SPINE_TIMEOUT_S = 30.0
-    TASK3_MIN_PROP_CENTER_SEPARATION_M = 0.150
-    # Release only far enough to clear the coloured box.  The inherited task-1
-    # release opens to 0.18 m and recomputes a world-frame IK pose, which is
-    # unnecessary and too wide beside the fixed white packaging box.
-    TASK3_RELEASE_SPREAD_M = 0.040
-    TASK3_RELEASE_MIN_HALF_WIDTH_M = 0.110
-    TASK3_RELEASE_MAX_HALF_WIDTH_M = 0.140
-    # Keep the arms/box in the verified grasp pose.  After the reverse retreat,
-    # drive directly to a shelf-front pre-place stand that is this far east of
-    # the measured observation stand.  The 0.15 m offset keeps the carried
-    # envelope clear while staying on the previously validated central route;
-    # The later 0.20 m base advance supplies the insertion that used to be
-    # attempted by the arms, so this stand remains the safer pre-release pose.
-    TASK3_SHELF_PREALIGN_STANDOFF_M = 0.45
-    TASK3_WORKSPACE_ROI = (
-        (-3.20, 0.80),
-        (-0.20, 3.20),
-        (0.30, 1.50),
+
+    # With a near-edge grip the box remains far in front of the base.  Reverse
+    # all the way to the safe turn row before allowing any yaw motion; the
+    # shorter Task1 retreat lets the planned arc sweep the carried box back
+    # through the source table and stalls the chassis.
+    TABLE_RETREAT_M = 0.80
+    # After the straight table retreat, navigate directly to the shelf-front
+    # placement row.  Starting from the north-facing retreat pose makes the
+    # navigation controller enter its rotate-in-place gate for the south-west
+    # route, then follow the single diagonal cleanly.  The inherited forced
+    # west turn was redundant and immediately followed by another path turn;
+    # in GS that arc stopped at (-0.899, 0.635) with 5 cm carry clearance.
+    FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION = False
+    # Task3 is centred on the raised white support, not beside the east wall.
+    # Navigate directly to the real 0.620 m dual-arm working distance.
+    TABLE_STANDOFF_M = 0.620
+    TABLE_WALL_CLEARANCE_OFFSET_M = 0.0
+
+    # Task3 starts on the coloured block resting on the white material_box,
+    # between Task1's two calibrated table slots. This broad gate accepts
+    # only client RGB-D observations in that source region.
+    TASK3_SOURCE_ROI = (
+        (-0.90, -0.10),
+        (2.00, 2.55),
+        (0.80, 1.25),
     )
+    TASK3_SUPPORT_COLOR = "material_box"
+    TASK3_SOURCE_MAX_AGE_S = 0.75
+    TASK3_SOURCE_ACQUIRE_TIMEOUT_S = 12.0
+    # On a client-only Task3 retry the YOLO process starts after the referee
+    # stage clock.  Leave enough time for model loading and the first frames.
+    TARGET_WAIT_TIMEOUT_S = 90.0
+    # In a Task3-only diagnostic the detector process starts at the same time
+    # as this executor and needs several seconds to load its model.  Stay
+    # still first so the initial table view is not lost, then scan in short
+    # increments separated by stationary collection windows.
+    TASK3_DETECTOR_STARTUP_HOLD_S = 12.0
+    TASK3_SCAN_TURN_S = 1.0
+    TASK3_SCAN_HOLD_S = 2.0
+    # The first navigation goal is made from the earliest usable detector
+    # frame.  After the multi-frame lock, refine the stand so the target is
+    # centred between both arms and remains inside their shared workspace.
+    # Keep Task1's stable dual-arm sequence, but reproduce the validated old
+    # Task3 grasp geometry.  The inherited controller adds +20 mm in approach
+    # X; shifting its target 65 mm toward the robot leaves the actual hand
+    # centre 45 mm behind the detected box centre (JY_YELLOW_GRASP_FWD=-0.045).
+    # Its +20 mm hand-Z offset plus -30 mm here yields the old -10 mm Z.
+    TASK3_PICK_STANDOFF_M = 0.620
+    TASK3_PICK_STAND_TOLERANCE_M = 0.015
+    TASK3_SHALLOW_GRIP_OFFSET_M = 0.045
+    TASK3_GRASP_Z_OFFSET_M = -0.010
+    TASK3_SOURCE_CENTER_Z = 1.004
+    TASK3_REQUIRED_CONTACT_SEARCH_M = 0.004
 
-    def __init__(self, memory) -> None:
-        super().__init__(memory)
-        self._task3_target_tracker = StableTargetCenterTracker(
-            window_size=15,
-            required_samples=7,
-            required_inliers=6,
-            min_sample_interval_s=0.15,
-            min_collection_duration_s=0.80,
-            max_observation_age_s=0.75,
-            max_axis_deviation=(0.050, 0.050, 0.050),
-            shelf_roi=self.TASK3_WORKSPACE_ROI,
-            layer_z_gate_m=0.30,
-        )
-        self._task3_target_center: tuple[float, float, float] | None = None
-        self._task3_source_anchor_world: tuple[float, float, float] | None = None
-        self._task3_table_reference_world: tuple[float, float, float] | None = None
-        self._task3_scoring_place: tuple[float, float, float] | None = None
-        self._task3_release_place: tuple[float, float, float] | None = None
-        self._task3_white_layer: int | None = None
-        self._task3_place_radius_m: float | None = None
-        self._held_insert = HeldTransportController(
-            allow_extension=True,
-            max_translation_m=0.30,
-        )
-        self._task3_release_lateral_inset_m = 0.0
-        self._task3_shallow_place_stand: tuple[float, float] | None = None
-        self._task3_insert_target_base: tuple[float, float, float] | None = None
-        self._task3_safe_front_stand: tuple[float, float] | None = None
-        self._task3_lift_fallback_since_s: float | None = None
+    # Unlike Task1's formal lift executor, Task3 may not lift merely because
+    # the bounded IK target stopped moving.  The shallow grasp must first be
+    # reported as stable bilateral target contact.
+    REQUIRE_SERVER_CONTACT = True
+    ALLOW_SETTLED_MAX_SEARCH = False
+    CONTACT_TIMEOUT_S = 25.0
 
-    def reset(self) -> None:
-        super().reset()
-        self._task3_target_tracker.reset()
-        self._task3_target_center = None
-        self._task3_source_anchor_world = None
-        self._task3_table_reference_world = None
-        self._task3_scoring_place = None
-        self._task3_release_place = None
-        self._task3_white_layer = None
-        self._task3_place_radius_m = None
-        self._held_insert.reset()
-        self._task3_release_lateral_inset_m = 0.0
-        self._task3_shallow_place_stand = None
-        self._task3_insert_target_base = None
-        self._task3_safe_front_stand = None
-        self._task3_lift_fallback_since_s = None
+    @classmethod
+    def _calibrated_table_source(
+        cls,
+        observation_world: tuple[float, float, float],
+    ) -> tuple[float, float, float] | None:
+        """Accept a live RGB-D source point in Task3's support-table ROI."""
 
-    def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
-        super().enter_stage(stage, context)
+        try:
+            point = tuple(float(value) for value in observation_world)
+        except (TypeError, ValueError):
+            return None
+        if len(point) != 3 or not all(math.isfinite(value) for value in point):
+            return None
+        if not all(
+            limits[0] <= value <= limits[1]
+            for value, limits in zip(point, cls.TASK3_SOURCE_ROI)
+        ):
+            return None
+        return point
+
+    def _task1_compat_context(
+        self,
+        context: ExecutionContext,
+    ) -> ExecutionContext:
+        """Adapt Task3 to the inherited Task1 manipulation machinery.
+
+        The inherited Task1 executor requires the instruction task to match
+        the executor task_id and the place type to be shelf_point. Task3
+        reuses that proven mechanical chain while the referee remains Task3.
+
+        Preserve the real Task3 target_color and all sensor/runtime data.
+        """
+        instruction = dict(context.instruction)
+        instruction["task"] = self.task_id
+        instruction["place_type"] = "shelf_point"
+        return replace(context, instruction=instruction)
+
+    def tick(
+        self,
+        stage: TaskStage,
+        context: ExecutionContext,
+    ) -> StageResult:
+        compat_context = self._task1_compat_context(context)
+
         if stage is TaskStage.NAVIGATE_TO_PICK:
-            self._task3_target_tracker.reset()
-            self._task3_target_center = None
-            self._task3_source_anchor_world = None
-            self._task3_table_reference_world = None
-            self._task3_scoring_place = None
-            self._task3_release_place = None
-            self._task3_white_layer = None
-            self._task3_place_radius_m = None
-            self._held_insert.reset()
-            self._task3_release_lateral_inset_m = 0.0
-            self._task3_shallow_place_stand = None
-            self._task3_insert_target_base = None
-            self._task3_safe_front_stand = None
-            self._locked_target_world = None
-            self._locked_target_orientation = None
-        elif stage is TaskStage.ACQUIRE_TARGET:
-            # Keep samples collected while navigating.  The target remains
-            # fixed on the table, so throwing away the navigation-stage
-            # observations can leave this stage with no fresh frames after
-            # the camera/arms settle at the pick stand.
-            pass
-        elif stage is TaskStage.LIFT:
-            self._task3_lift_fallback_since_s = None
-        elif stage is TaskStage.ALIGN_FOR_PLACE:
-            # Task 1's align-for-place stage starts a shelf scan.  Task 3 has
-            # already inherited the stable shelf snapshot from task 1, so it
-            # goes directly to the measured packaging-box placement target.
-            self._phase = "task3_clearance"
-            self._phase_started_s = float(context.now_s)
-            self._motion_started = False
-            self._transfer.reset()
-            self._held_insert.reset()
-            self._task3_shallow_place_stand = None
-            self._task3_insert_target_base = None
-        elif stage is TaskStage.RETURN_TO_END:
-            # Task 3 has a different post-release safety sequence from task 1:
-            # retreat, compact the open arms, make a short second push, retreat
-            # again, then retract and raise before using the inherited end-zone
-            # navigation.
-            self._phase = "task3_post_release_retreat"
-            self._motion_started = False
-            self._transfer.reset()
-            self._release.reset()
-            self._slide_hold.reset()
-            self._arm_retract.reset()
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            support_observation = context.target_observations.get(
+                self.TASK3_SUPPORT_COLOR
+            )
+            if support_observation is not None:
+                support_age_s = max(
+                    0.0,
+                    float(context.now_s)
+                    - float(support_observation.received_at_s),
+                )
+                support_point = tuple(
+                    float(value)
+                    for value in support_observation.position_world
+                )
+                if (
+                    support_age_s <= self.TASK3_SOURCE_MAX_AGE_S
+                    and len(support_point) == 3
+                    and all(math.isfinite(value) for value in support_point)
+                    and self.TASK3_SOURCE_ROI[0][0]
+                    <= support_point[0]
+                    <= self.TASK3_SOURCE_ROI[0][1]
+                    and self.TASK3_SOURCE_ROI[1][0]
+                    <= support_point[1]
+                    <= self.TASK3_SOURCE_ROI[1][1]
+                ):
+                    self._task3_support_world = support_point
+            observation = context.target_observations.get(target_color)
+            estimate = self._task3_source_tracker.update(
+                observation,
+                now_s=context.now_s,
+            )
+            if (
+                estimate is not None
+                and self._task3_source_estimate is None
+            ):
+                self._task3_source_estimate = estimate
 
-    def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
-        if context.unsafe_collision:
-            return StageResult.blocked(
-                f"task 3 integrated motion stopped on unsafe collision at {stage.value}",
-                arm_command=self._held_arm_command,
-            )
-        if stage is not self.active_stage:
-            return StageResult.blocked(
-                f"task 3 integrated stage mismatch: active={self.active_stage}, "
-                f"requested={stage}",
-                arm_command=self._held_arm_command,
-            )
-        if stage is TaskStage.NAVIGATE_TO_PICK:
-            return self._tick_task3_navigate_to_pick(context)
+            # A normal full run sees the table target immediately.  On a
+            # client-only Task3 retry the base can begin facing away from it;
+            # actively scan in yaw until the first fresh in-ROI frame exists,
+            # then let the inherited navigator move while this tracker keeps
+            # collecting samples.
+            usable_observation = False
+            if observation is not None:
+                age_s = max(
+                    0.0,
+                    float(context.now_s) - float(observation.received_at_s),
+                )
+                usable_observation = (
+                    age_s <= self.TARGET_MAX_AGE_S
+                    and self._calibrated_table_source(
+                        observation.position_world
+                    )
+                    is not None
+                )
+            if self._goal is None and not usable_observation:
+                waited_s = max(
+                    0.0,
+                    float(context.now_s) - self._stage_started_s,
+                )
+                if waited_s >= self.TARGET_WAIT_TIMEOUT_S:
+                    return StageResult.blocked(
+                        f"Task3 timed out actively scanning for {target_color!r}"
+                    )
+                if waited_s < self.TASK3_DETECTOR_STARTUP_HOLD_S:
+                    return StageResult.running(
+                        f"Task3 holding initial view while detector starts for "
+                        f"{target_color!r}; waited={waited_s:.1f}s",
+                        base_command=(0.0, 0.0),
+                    )
+                scan_cycle_s = self.TASK3_SCAN_TURN_S + self.TASK3_SCAN_HOLD_S
+                scan_phase_s = (
+                    waited_s - self.TASK3_DETECTOR_STARTUP_HOLD_S
+                ) % scan_cycle_s
+                if scan_phase_s >= self.TASK3_SCAN_TURN_S:
+                    return StageResult.running(
+                        f"Task3 paused to collect {target_color!r} RGB-D frames",
+                        base_command=(0.0, 0.0),
+                    )
+                return StageResult.running(
+                    f"Task3 stepping yaw scan for first {target_color!r} "
+                    "RGB-D frames",
+                    base_command=(0.0, 0.40),
+                )
+            if self._goal is None and self._task3_source_estimate is None:
+                return StageResult.running(
+                    f"Task3 holding for stable {target_color!r} source centre "
+                    f"before navigation; {self._task3_source_tracker.status()}",
+                    base_command=(0.0, 0.0),
+                )
+
+            # Feed the inherited table navigator the stable multi-frame centre,
+            # preferring the static white support XY used by manipulation.
+            # This makes its one navigation goal equal the real grasp stand
+            # instead of correcting a noisy first detector frame afterwards.
+            if self._goal is None:
+                assert observation is not None
+                assert self._task3_source_estimate is not None
+                stable_xy = (
+                    self._task3_support_world[:2]
+                    if self._task3_support_world is not None
+                    else self._task3_source_estimate.center_world[:2]
+                )
+                stable_observation = replace(
+                    observation,
+                    position_world=(
+                        float(stable_xy[0]),
+                        float(stable_xy[1]),
+                        self.TASK3_SOURCE_CENTER_Z,
+                    ),
+                )
+                stable_observations = dict(compat_context.target_observations)
+                stable_observations[target_color] = stable_observation
+                compat_context = replace(
+                    compat_context, target_observations=stable_observations
+                )
+
         if stage is TaskStage.ACQUIRE_TARGET:
             return self._tick_task3_acquire_target(context)
-        if stage in {
-            TaskStage.ALIGN_FOR_PICK,
-            TaskStage.GRASP,
-            TaskStage.LIFT,
-        }:
-            # Task 1's extracted calibrated desktop grasp is the single source
-            # of truth for task-3 arm commands as well.
-            return super().tick(stage, context)
+
+        if stage is TaskStage.ALIGN_FOR_PICK:
+            return self._tick_task3_align_for_pick(compat_context)
+
+        if stage is TaskStage.GRASP:
+            return self._tick_task3_direct_hug(context)
+
+        if stage is TaskStage.LIFT:
+            result = super().tick(stage, compat_context)
+            if result.status is not StageStatus.SUCCEEDED:
+                if result.status is StageStatus.RUNNING:
+                    return result
+                # The inherited Task1 lift may time out on arm-pose residuals
+                # even though the randomized Task3 block visibly rose with the
+                # grippers. Physical RGB-D displacement is the stronger proof:
+                # accept it before propagating a mechanical timeout.
+                target_color = str(
+                    context.instruction.get("target_color", "")
+                ).strip().lower()
+                observation = context.target_observations.get(target_color)
+                baseline_z = getattr(
+                    self, "_task3_pre_lift_observed_z", None
+                )
+                if observation is not None and baseline_z is not None:
+                    age_s = max(
+                        0.0,
+                        float(context.now_s)
+                        - float(observation.received_at_s),
+                    )
+                    observed_z = float(observation.position_world[2])
+                    rise = observed_z - float(baseline_z)
+                    if (
+                        age_s <= self.TASK3_SOURCE_MAX_AGE_S
+                        and rise >= 0.065
+                    ):
+                        self._capture_held_center(compat_context)
+                        self._task3_lift_verified = True
+                        self._task3_transport_retreat_seen = False
+                        self._task3_left_turn_active = False
+                        self._task3_left_turn_done = False
+                        return StageResult.succeeded(
+                            "Task3 RGB-D lift proof overrode inherited arm "
+                            f"residual timeout: {target_color} z={observed_z:.3f}, "
+                            f"rise={rise:.3f} m; real grasp confirmed",
+                            arm_command=(
+                                result.arm_command or self._held_arm_command
+                            ),
+                        )
+                return result
+
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            observation = context.target_observations.get(target_color)
+            elapsed = max(
+                0.0,
+                float(context.now_s) - float(self._stage_started_s),
+            )
+
+            if observation is not None:
+                age_s = max(
+                    0.0,
+                    float(context.now_s) - float(observation.received_at_s),
+                )
+                observed = tuple(
+                    float(value) for value in observation.position_world
+                )
+                baseline_z = getattr(
+                    self, "_task3_pre_lift_observed_z", None
+                )
+                rise = (
+                    observed[2] - float(baseline_z)
+                    if baseline_z is not None
+                    else float("-inf")
+                )
+
+                if (
+                    baseline_z is not None
+                    and age_s <= self.TASK3_SOURCE_MAX_AGE_S
+                    and rise >= 0.045
+                ):
+                    self._task3_lift_verified = True
+                    self._task3_transport_retreat_seen = False
+                    self._task3_left_turn_active = False
+                    self._task3_left_turn_done = False
+                    return replace(
+                        result,
+                        message=(
+                            "Task3 RGB-D lift proof passed: "
+                            f"{target_color} z={observed[2]:.3f}, "
+                            f"rise={rise:.3f} m; real grasp confirmed"
+                        ),
+                    )
+
+                if baseline_z is None:
+                    detail = (
+                        f"{target_color} z={observed[2]:.3f}, "
+                        "pre-lift RGB-D baseline missing"
+                    )
+                else:
+                    detail = (
+                        f"{target_color} pre_z={baseline_z:.3f}, "
+                        f"post_z={observed[2]:.3f}, "
+                        f"rise={rise:.3f} m"
+                    )
+            else:
+                detail = f"no fresh {target_color!r} observation"
+
+            if elapsed >= 12.0:
+                return StageResult.blocked(
+                    "Task3 lift finished mechanically but RGB-D did not "
+                    f"confirm the box was lifted: {detail}",
+                    arm_command=result.arm_command,
+                )
+
+            return StageResult.running(
+                "Task3 holding lifted pose while verifying real object lift; "
+                + detail,
+                base_command=(0.0, 0.0),
+                arm_command=result.arm_command,
+            )
+
         if stage is TaskStage.TRANSPORT:
-            return self._tick_task3_transport(context)
-        if stage is TaskStage.ALIGN_FOR_PLACE:
-            return self._tick_task3_align_for_place(context)
+            if not getattr(self, "_task3_lift_verified", False):
+                return StageResult.blocked(
+                    "Task3 refused transport because real RGB-D lift proof "
+                    "was not obtained",
+                    arm_command=self._held_arm_command,
+                )
+            # The parent now plans directly from the cleared table retreat to
+            # the shelf scan stand.  No extra forced turn or intermediate
+            # waypoint is needed, so the carry footprint follows one route.
+            return super().tick(stage, compat_context)
+
         if stage is TaskStage.PLACE:
-            return self._tick_task3_place(context)
-        if stage is TaskStage.RETURN_TO_END:
-            return self._tick_task3_return_to_end(context)
-        # The inherited release, verification and safe retreat sequence is
-        # retained for verification and other stages.
-        return super().tick(stage, context)
+            return self._tick_task3_place(compat_context)
 
-    def _tick_lift(self, context: ExecutionContext) -> StageResult:
-        """Lift with a task-3-only bounded-contact completion fallback."""
+        result = super().tick(stage, compat_context)
+        if (
+            stage is TaskStage.NAVIGATE_TO_PICK
+            and result.status is StageStatus.RUNNING
+        ):
+            pose = self._odometry_pose(context.odometry)
+            if pose is not None:
+                return replace(
+                    result,
+                    message=(
+                        f"{result.message}; "
+                        f"pose=({pose[0]:.2f},{pose[1]:.2f},{pose[2]:.2f}), "
+                        f"cmd=({result.base_linear_x:.3f},"
+                        f"{result.base_angular_z:.3f})"
+                    ),
+                )
+        return result
 
-        if self._held_arm_command is None:
-            return StageResult.blocked("task 3 lift has no held grasp command")
-        if not self._lift.planned:
+    def _tick_task3_direct_hug(
+        self,
+        context: ExecutionContext,
+    ) -> StageResult:
+        """Run the previously successful direct symmetric Task3 hug."""
+
+        if context.unsafe_collision:
+            return StageResult.blocked(
+                "Task3 direct hug stopped on unsafe collision",
+                arm_command=self._held_arm_command,
+            )
+
+        if self._locked_target_world is None:
+            return StageResult.blocked(
+                "Task3 direct hug has no locked RGB-D box centre",
+                arm_command=self._held_arm_command,
+            )
+
+        if not self._task3_direct_hug.planned:
             try:
-                self._held_arm_command = self._lift.plan(
-                    self._held_arm_command,
+                self._held_arm_command = self._task3_direct_hug.plan(
+                    self._locked_target_world,
+                    context.odometry,
                     context.joint_states,
                 )
-            except PregraspInputError as exc:
-                return self._wait_for_lift_inputs(context, str(exc))
-            except PregraspPlanningError as exc:
+            except (PregraspInputError, PregraspPlanningError) as exc:
                 return StageResult.blocked(
-                    f"task 3 slide-lift planning failed: {exc}",
+                    f"Task3 direct old-style hug planning failed: {exc}",
                     arm_command=self._held_arm_command,
                 )
 
         try:
-            command, reached, detail = self._lift.update(
-                context.now_s,
-                context.joint_states,
+            command, command_settled, detail = (
+                self._task3_direct_hug.update(
+                    context.now_s,
+                    context.joint_states,
+                )
             )
-        except PregraspInputError as exc:
-            return self._wait_for_lift_inputs(context, str(exc))
-        except PregraspPlanningError as exc:
+        except (PregraspInputError, PregraspPlanningError) as exc:
             return StageResult.blocked(
-                f"task 3 slide-lift control failed: {exc}",
+                f"Task3 direct old-style hug control failed: {exc}",
                 arm_command=self._held_arm_command,
             )
-        self._held_arm_command = command
-        if reached:
-            return StageResult.succeeded(
-                f"task 3 lifted the held box {self._lift.actual_lift_m:.3f} m; "
-                "holding before transport",
-                arm_command=command,
-            )
 
-        metrics = _task3_lift_metrics(detail)
-        bounded_contact = metrics is not None and (
-            metrics[0] <= self.TASK3_LIFT_SLIDE_TOLERANCE_M
-            and metrics[1] <= self.TASK3_LIFT_ARM_TOLERANCE_RAD
-            and metrics[2] <= self.TASK3_LIFT_ARM_TOLERANCE_RAD
-            and metrics[3] <= self.TASK3_LIFT_COMMAND_TOLERANCE
-            and metrics[4] <= self.TASK3_LIFT_MAX_VELOCITY
+        self._held_arm_command = command
+
+        elapsed = max(
+            0.0,
+            float(context.now_s) - float(self._stage_started_s),
         )
-        now_s = float(context.now_s)
-        if bounded_contact:
-            if self._task3_lift_fallback_since_s is None:
-                self._task3_lift_fallback_since_s = now_s
-            elif (
-                now_s - self._task3_lift_fallback_since_s
-                >= self.TASK3_LIFT_STABLE_TIME_S
-            ):
-                return StageResult.succeeded(
-                    "task 3 accepted the completed 0.15 m lift with bounded "
-                    f"held-box contact motion; {detail}",
+
+        # Reproduce the old Task3 state-6 behaviour:
+        # finish commanding the hug, then leave the bilateral preload
+        # settled for about 2.8 s.  Do NOT demand zero measured joint
+        # residual: contact with the box is expected to stop the arms short.
+        if (
+            not command_settled
+            or elapsed < self._task3_direct_hug.SETTLE_TIME_S
+        ):
+            if elapsed >= self.CONTACT_TIMEOUT_S:
+                return StageResult.blocked(
+                    "Task3 direct old-style hug timed out: "
+                    f"{detail}",
                     arm_command=command,
                 )
-        else:
-            self._task3_lift_fallback_since_s = None
-
-        elapsed_s = max(0.0, now_s - self._stage_started_s)
-        if elapsed_s >= self.LIFT_TIMEOUT_S:
-            return StageResult.blocked(
-                f"task 3 slide lift timed out after {elapsed_s:.1f}s: {detail}",
+            return StageResult.running(
+                "Task3 old-style direct symmetric hug; "
+                f"settle={elapsed:.1f}/"
+                f"{self._task3_direct_hug.SETTLE_TIME_S:.1f}s; "
+                f"{detail}",
                 arm_command=command,
             )
-        return StageResult.running(
-            "task 3 raising the spine while preserving arm preload; "
-            f"bounded_contact={bounded_contact}; {detail}",
+
+        # Save a fresh RAW detector Z immediately before lift.
+        # Lift itself still has to prove >=45 mm real object rise.
+        target_color = str(
+            context.instruction.get("target_color", "")
+        ).strip().lower()
+
+        observation = context.target_observations.get(target_color)
+
+        if observation is None:
+            if elapsed >= self.CONTACT_TIMEOUT_S:
+                return StageResult.blocked(
+                    "Task3 direct hug settled but no fresh RGB-D "
+                    "pre-lift observation was available",
+                    arm_command=command,
+                )
+            return StageResult.running(
+                "Task3 direct hug settled; holding preload while "
+                f"waiting for fresh {target_color!r} pre-lift RGB-D",
+                arm_command=command,
+            )
+
+        age_s = max(
+            0.0,
+            float(context.now_s)
+            - float(observation.received_at_s),
+        )
+
+        if age_s > self.TASK3_SOURCE_MAX_AGE_S:
+            return StageResult.running(
+                "Task3 direct hug settled; holding preload while "
+                f"waiting for fresh {target_color!r} RGB-D "
+                f"(age={age_s:.2f}s)",
+                arm_command=command,
+            )
+
+        observed = tuple(
+            float(v) for v in observation.position_world
+        )
+        self._task3_pre_lift_observed_z = observed[2]
+        self._task3_lift_verified = False
+
+        return StageResult.succeeded(
+            "Task3 OLD direct symmetric hug settled; "
+            f"{detail}; "
+            f"pre_lift_z={observed[2]:.3f}; "
+            "proceeding to real RGB-D lift proof",
             arm_command=command,
         )
 
-    def _instruction_target_color(self, context: ExecutionContext) -> str:
-        task_id = int(context.instruction.get("task", self.task_id))
-        place_type = str(context.instruction.get("place_type", "")).strip().lower()
-        if task_id != self.task_id or place_type != "shelf_prop_side":
-            raise RuntimeError(
-                "task 3 rejected incompatible instruction: "
-                f"task={task_id}, place_type={place_type!r}"
-            )
-        color = str(context.instruction.get("target_color", "")).strip().lower()
-        if color not in {"pink", "yellow", "brown"}:
-            raise RuntimeError(f"task 3 has invalid target color {color!r}")
-        return color
 
-    def _top_box_observation(self, context: ExecutionContext):
-        color = self._instruction_target_color(context)
-        self._update_table_reference(context)
-        observation = context.target_observations.get(color)
-        if observation is None:
-            return color, None, "no fresh target observation"
-        age_s = max(0.0, float(context.now_s) - float(observation.received_at_s))
-        if age_s > self.TASK3_TARGET_MAX_AGE_S:
-            return color, None, f"latest observation is {age_s:.2f}s old"
-        point = tuple(float(value) for value in observation.position_world)
-        if len(point) != 3 or not all(math.isfinite(value) for value in point):
-            return color, None, "observation contains non-finite coordinates"
-        if not all(
-            limits[0] <= value <= limits[1]
-            for value, limits in zip(point, self.TASK3_WORKSPACE_ROI)
-        ):
-            return color, None, "observation is outside the competition workspace"
-        if int(context.attempt) <= 1:
-            reference = self._task3_table_reference_world
-            if reference is None:
-                return color, None, "waiting for current white-cube RGB-D reference"
-            xy_error_m = math.hypot(point[0] - reference[0], point[1] - reference[1])
-            z_above_m = point[2] - reference[2]
-            z_min, z_max = self.TASK3_TARGET_ABOVE_REFERENCE_Z_RANGE_M
-            if (
-                xy_error_m > self.TASK3_REFERENCE_XY_TOLERANCE_M
-                or not (z_min <= z_above_m <= z_max)
-            ):
-                return (
-                    color,
-                    None,
-                    "target does not match the current white-cube top "
-                    f"(xy_error={xy_error_m:.3f}m, dz={z_above_m:.3f}m)",
-                )
-        return color, observation, "ready"
-
-    def _update_table_reference(self, context: ExecutionContext) -> None:
-        observation = context.target_observations.get("material_box")
-        if observation is None:
-            return
-        age_s = max(0.0, float(context.now_s) - float(observation.received_at_s))
-        if age_s > self.TASK3_REFERENCE_MAX_AGE_S:
-            return
-        try:
-            point = tuple(float(value) for value in observation.position_world)
-        except (TypeError, ValueError):
-            return
-        if len(point) == 3 and all(math.isfinite(value) for value in point):
-            self._task3_table_reference_world = point
-
-    def _source_center_from_observation(
-        self,
-        observed_world: tuple[float, float, float],
-        *,
-        first_attempt: bool,
-    ) -> tuple[float, float, float] | None:
-        """Freeze a dynamic far-view source point for navigation and grasp."""
-
-        try:
-            observed_x, observed_y, observed_z = (
-                float(value) for value in observed_world
-            )
-        except (TypeError, ValueError):
-            return None
-        if not all(math.isfinite(value) for value in (observed_x, observed_y, observed_z)):
-            return None
-        reference = self._task3_table_reference_world
-        if first_attempt:
-            if reference is None:
-                return None
-            error_m = math.hypot(observed_x - reference[0], observed_y - reference[1])
-            if error_m > self.TASK3_REFERENCE_XY_TOLERANCE_M:
-                return None
-            # The fixed white cube supplies the reliable far-view XY.  Keep Z
-            # from the coloured target itself so this does not assume a fixed
-            # cube height or target initial height.
-            return float(reference[0]), float(reference[1]), observed_z
-        # Objects are not restored between attempts.  A retry must follow the
-        # target's new fresh RGB-D location instead of snapping it back.
-        return observed_x, observed_y, observed_z
-
-    def _tick_task3_navigate_to_pick(self, context: ExecutionContext) -> StageResult:
-        try:
-            color, observation, detail = self._top_box_observation(context)
-        except RuntimeError as exc:
-            return StageResult.blocked(str(exc))
-        if observation is not None:
-            if self._task3_source_anchor_world is None:
-                self._task3_source_anchor_world = self._source_center_from_observation(
-                    observation.position_world,
-                    first_attempt=int(context.attempt) <= 1,
-                )
-            estimate = self._task3_target_tracker.update(
-                observation,
-                now_s=context.now_s,
-                reference_layer_z=None,
-            )
-            if estimate is not None and self._task3_source_anchor_world is not None:
-                center = (
-                    self._task3_source_anchor_world[0],
-                    self._task3_source_anchor_world[1],
-                    float(estimate.center_world[2]),
-                )
-                self._task3_target_center = center
-                self._locked_target_world = center
-                self._locked_target_orientation = self.SOURCE_ORIENTATION
-        if self._goal is None:
-            if observation is None:
-                elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-                if elapsed >= self.TASK3_TARGET_TIMEOUT_S:
-                    return StageResult.blocked(
-                        f"task 3 timed out waiting for top-box {color} detection: {detail}"
-                    )
-                return StageResult.running(
-                    f"task 3 waiting for top-box {color} detection: {detail}"
-                )
-            pose = self._odometry_pose(context.odometry)
-            if pose is None:
-                return StageResult.running("task 3 waiting for valid odometry")
-            if self._task3_source_anchor_world is None:
-                return StageResult.running(
-                    f"task 3 waiting for top-box {color} detection: "
-                    "source anchor is not yet validated"
-                )
-            target_x, target_y, _target_z = self._task3_source_anchor_world
-            self._coarse_target_world = self._task3_source_anchor_world
-            self._goal = NavigationGoal(
-                x=float(target_x),
-                y=float(target_y) - self.TASK3_PICK_STANDOFF_M,
-                yaw=self.TASK3_PICK_YAW,
-                position_tolerance=self.POSITION_TOLERANCE_M,
-                yaw_tolerance=self.YAW_TOLERANCE_RAD,
-                safety_radius=self.TASK3_PICK_STANDOFF_M,
-                segment=NavigationSegment.NAV_TABLE,
-                source_tag="task3_top_box_rgbd",
-            )
-            if not self._navigation.set_goal(self._goal, pose[0], pose[1]):
-                return StageResult.blocked(
-                    "task 3 could not plan a collision-free path to the top-box pick stand"
-                )
-        pose = self._odometry_pose(context.odometry)
-        if pose is None:
-            return StageResult.running("task 3 waiting for valid odometry")
-        command = self._navigation.update(
-            pose[0], pose[1], pose[2], self._control_dt(context.now_s), obs=None
-        )
-        status = self._navigation.status
-        if status is NavigationStatus.GOAL_REACHED:
-            return StageResult.succeeded(
-                f"task 3 reached the detected {color} top-box pick stand; "
-                f"{goal_reached_event(self._goal)}"
-            )
-        if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-            return StageResult.blocked(
-                f"task 3 top-box navigation stopped safely with status={status.value}"
-            )
-        return StageResult.running(
-            f"task 3 navigating to top-box {color} pick stand; "
-            f"nav_status={status.value}",
-            base_command=(command.linear_x, command.angular_z),
-        )
-
-    def _tick_task3_acquire_target(self, context: ExecutionContext) -> StageResult:
-        try:
-            color, observation, detail = self._top_box_observation(context)
-        except RuntimeError as exc:
-            return StageResult.blocked(str(exc))
-        if self._task3_target_center is not None and observation is None:
-            return StageResult.succeeded(
-                "task 3 reused the stable top-box center collected during navigation: "
-                f"center={tuple(round(value, 3) for value in self._locked_target_world or ())}, "
-                f"orientation={self.SOURCE_ORIENTATION}"
-            )
-        estimate = self._task3_target_tracker.update(
-            observation,
-            now_s=context.now_s,
-            reference_layer_z=None,
-        )
-        if estimate is not None:
-            if self._task3_source_anchor_world is None:
-                self._task3_source_anchor_world = self._source_center_from_observation(
-                    estimate.center_world,
-                    first_attempt=int(context.attempt) <= 1,
-                )
-            if self._task3_source_anchor_world is None:
-                return StageResult.running(
-                    "task 3 stable RGB-D center has no validated source anchor"
-                )
-            center = (
-                self._task3_source_anchor_world[0],
-                self._task3_source_anchor_world[1],
-                float(estimate.center_world[2]),
-            )
-            self._task3_target_center = center
-            self._locked_target_world = center
-            self._locked_target_orientation = self.SOURCE_ORIENTATION
-            return StageResult.succeeded(
-                "task 3 locked the top-box RGB-D center for desktop grasp: "
-                f"color={color}, center="
-                f"{tuple(round(value, 3) for value in self._locked_target_world)}, "
-                f"orientation={self.SOURCE_ORIENTATION}, "
-                f"samples={estimate.sample_count}"
-            )
-        elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-        if elapsed >= self.TASK3_TARGET_TIMEOUT_S:
-            return StageResult.blocked(
-                f"task 3 timed out locking top-box {color} center after "
-                f"{elapsed:.1f}s: {detail}; {self._task3_target_tracker.status()}"
-            )
-        return StageResult.running(
-            f"task 3 collecting fresh top-box {color} center; "
-            f"{self._task3_target_tracker.status()}"
-        )
-
-    def _ensure_task3_place_target(self, context: ExecutionContext) -> None:
-        if self._task3_release_place is not None:
-            return
-        state = self._memory.require_shelf_state()
-        packaging_center = self._memory.require_task3_packaging_box_center()
-        place_type = str(context.instruction.get("place_type", "")).strip().lower()
-        direction = str(context.instruction.get("direction", "")).strip().lower()
-        raw_place = context.instruction.get("place_world")
-        try:
-            scoring_target = tuple(float(value) for value in raw_place)
-            place_radius = float(context.instruction.get("place_radius"))
-        except (TypeError, ValueError):
-            raise ValueError("task 3 requires finite place_world/place_radius fields")
-        if (
-            place_type != "shelf_prop_side"
-            or direction != "left"
-            or len(scoring_target) != 3
-            or not all(math.isfinite(value) for value in scoring_target)
-            or not math.isfinite(place_radius)
-            or place_radius <= 0.0
-        ):
-            raise ValueError(
-                "task 3 rejected incompatible formal placement instruction: "
-                f"place_type={place_type!r}, direction={direction!r}, "
-                f"place_world={raw_place!r}, place_radius={place_radius!r}"
-            )
-
-        # Cross-check the formal destination against the measured fixed prop
-        # and the shelf layer remembered from task 1.  The instruction remains
-        # authoritative; these checks only fail closed on stale/mismatched
-        # cross-task state.
-        opening_yaw = float(self._shelf_tracker.geometry.opening_yaw)
-        # Robot faces into the opening (opening_yaw + pi); its left axis is
-        # therefore [sin(opening_yaw), -cos(opening_yaw)] in world XY.
-        left_axis = (math.sin(opening_yaw), -math.cos(opening_yaw))
-        relative_xy = (
-            scoring_target[0] - float(packaging_center[0]),
-            scoring_target[1] - float(packaging_center[1]),
-        )
-        left_separation = (
-            relative_xy[0] * left_axis[0] + relative_xy[1] * left_axis[1]
-        )
-        if left_separation <= 0.0:
-            raise ValueError(
-                "task 3 formal target is not left of the measured packaging box"
-            )
-        expected_z = self._shelf_tracker.geometry.object_center_z_on_board(
-            int(state.white_obstacle_layer),
-            half_z=0.095,
-        )
-        if abs(scoring_target[2] - expected_z) > 0.16:
-            raise ValueError(
-                "task 3 formal target layer disagrees with task-1 shelf state: "
-                f"instruction_z={scoring_target[2]:.3f}, expected_z={expected_z:.3f}"
-            )
-        # Move slightly toward the fixed prop so the box is not balanced on
-        # the shelf's lateral edge, but preserve a measured centre-to-centre
-        # gap.  This keeps the rule general when perception shifts either
-        # object or a future round changes the formal target.
-        lateral_inset = min(
-            TASK3_SAFE_RELEASE_CENTER_INSET_M,
-            max(0.0, left_separation - self.TASK3_MIN_PROP_CENTER_SEPARATION_M),
-        )
-        release_target = task3_safe_release_target(
-            scoring_target,
-            place_radius_m=place_radius,
-            opening_yaw=opening_yaw,
-            center_inset_m=lateral_inset,
-        )
-        self._task3_white_layer = int(state.white_obstacle_layer)
-        self._task3_scoring_place = scoring_target
-        self._task3_release_place = release_target
-        self._task3_place_radius_m = place_radius
-        self._task3_release_lateral_inset_m = lateral_inset
-        # Task 1's inherited placement controller acts on _place_world.  Keep
-        # the nominal score target separately so the robot can release at the
-        # bounded shallow/inset point and still remain inside the referee's
-        # placement radius.
-        self._place_world = release_target
-
-    def _tick_task3_transport(self, context: ExecutionContext) -> StageResult:
-        if self._held_arm_command is None or self._held_center_base is None:
-            return StageResult.blocked("task 3 transport has no stable held-object state")
-        try:
-            self._ensure_task3_place_target(context)
-        except (RuntimeError, ValueError) as exc:
-            return StageResult.blocked(f"task 3 cannot prepare shelf placement: {exc}")
-
-        if self._phase == "retreat_table":
-            if not self._motion_started:
-                if not self._transfer.begin_retreat(
-                    context.odometry, self.TABLE_RETREAT_M
-                ):
-                    return StageResult.running(
-                        "task 3 waiting for odometry before table retreat",
-                        arm_command=self._held_arm_command,
-                    )
-                self._motion_started = True
-            done, command, detail = self._transfer.tick_retreat(context.odometry)
-            if not done:
-                return StageResult.running(
-                    f"task 3 holding the top-box and retreating from table; {detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
-            self._phase = "task3_turn_ccw_to_shelf"
-            self._motion_started = False
-            self._transfer.reset()
-
-        if self._phase == "task3_turn_ccw_to_shelf":
-            if self._shelf_scan_stand is None:
-                packaging_center = self._memory.require_task3_packaging_box_center()
-                self._shelf_scan_stand = shelf_observation_stand(
-                    self._held_center_base,
-                    shelf_front_x=self.SHELF_FRONT_X,
-                    shelf_y=max(0.58, min(0.98, float(packaging_center[1]))),
-                    center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
-                    shelf_yaw=self.SHELF_YAW,
-                )
-            pose = self._odometry_pose(context.odometry)
-            if pose is None:
-                return StageResult.running(
-                    "task 3 waiting for odometry before turning toward shelf",
-                    arm_command=self._held_arm_command,
-                )
-            yaw_error = _wrap_task3_angle(self.SHELF_YAW - pose[2])
-            if abs(yaw_error) <= self.TASK3_SHELF_TURN_TOLERANCE_RAD:
-                self._task3_safe_front_stand = (
-                    self._shelf_scan_stand[0],
-                    pose[1],
-                )
-                self._phase = "task3_advance_shelfward"
-                self._motion_started = False
-                self._transfer.reset()
-            elif yaw_error < 0.0:
-                return StageResult.blocked(
-                    "task 3 refused a clockwise wall-side turn after table "
-                    f"retreat: shelf_yaw_error={yaw_error:.3f}",
-                    arm_command=self._held_arm_command,
-                )
-            else:
-                angular = min(
-                    self.TASK3_SHELF_TURN_MAX_ANGULAR_Z,
-                    max(
-                        self.TASK3_SHELF_TURN_MIN_ANGULAR_Z,
-                        1.2 * yaw_error,
-                    ),
-                )
-                return StageResult.running(
-                    "task 3 turning counter-clockwise toward the shelf before "
-                    f"translation; yaw_error={yaw_error:.3f}",
-                    base_command=(0.0, angular),
-                    arm_command=self._held_arm_command,
-                )
-
-        if self._phase == "task3_advance_shelfward":
-            assert self._task3_safe_front_stand is not None
-            done, running = self._tick_straight_advance(
-                context,
-                self._task3_safe_front_stand,
-                action="advancing shelfward with the safe west-facing heading",
-            )
-            if running is not None:
-                return running
-            if done:
-                self._phase = "task3_lateral_to_shelf_scan"
-                self._motion_started = False
-                self._transfer.reset()
-
-        if self._phase == "task3_lateral_to_shelf_scan":
-            assert self._shelf_scan_stand is not None
-            if not self._motion_started:
-                if not self._transfer.begin_lateral_alignment(
-                    self._shelf_scan_stand,
-                    self.SHELF_YAW,
-                    context.odometry,
-                    context.now_s,
-                    position_tolerance_m=self.TASK3_LATERAL_POSITION_TOLERANCE_M,
-                    yaw_tolerance_rad=self.TASK3_SHELF_TURN_TOLERANCE_RAD,
-                    timeout_s=self.TASK3_LATERAL_TIMEOUT_S,
-                ):
-                    return StageResult.blocked(
-                        "task 3 could not start bounded lateral motion at the "
-                        "safe shelf-front clearance",
-                        arm_command=self._held_arm_command,
-                    )
-                self._motion_started = True
-            status, command, detail = self._transfer.tick_lateral_alignment(
-                context.odometry,
-                context.now_s,
-            )
-            if status is NavigationStatus.GOAL_REACHED:
-                self._phase = "approach_shelf_scan"
-                self._motion_started = False
-                self._transfer.reset()
-            elif status in (
-                NavigationStatus.FAILED,
-                NavigationStatus.EMERGENCY_STOP,
-            ):
-                return StageResult.blocked(
-                    "task 3 bounded shelf-front lateral motion stopped safely: "
-                    f"{detail}",
-                    arm_command=self._held_arm_command,
-                )
-            else:
-                return StageResult.running(
-                    "task 3 moving laterally at the safe shelf-front clearance; "
-                    f"{detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
-
-        if self._phase == "approach_shelf_scan":
-            self._shelf_state = self._memory.require_shelf_state()
-            return super()._tick_transport(context)
-
-        return StageResult.blocked(
-            f"task 3 invalid transport phase {self._phase!r}",
-            arm_command=self._held_arm_command,
-        )
-
-    def _tick_task3_transport_navigation(
+    def _tick_straight_advance(
         self,
         context: ExecutionContext,
-        goal: NavigationGoal,
+        target_xy: tuple[float, float],
         *,
-        next_phase: str,
         action: str,
-    ) -> StageResult | None:
-        """Run one explicit task-3 transport waypoint without a turn shortcut."""
+    ):
+        """Task3-only final shelf-entry tolerance.
 
-        if not self._motion_started:
-            if not self._transfer.begin_navigation(
-                goal,
-                context.odometry,
-                footprint_mode=FootprintMode.TRANSIT_CARRY,
-                observations=context.target_observations,
-                exclude_color=str(context.instruction.get("target_color", "")),
-            ):
-                return StageResult.blocked(
-                    f"task 3 could not plan a collision-free route while {action}",
-                    arm_command=self._held_arm_command,
+        The inherited Task1 helper requires about 15 mm final forward error.
+        During Task3 the carried box can already be correctly seated while
+        physical shelf/object contact prevents the chassis from closing the
+        last few centimetres.  Accept <=50 mm only for the final Task3 shelf
+        entry; all Task1/Task2 behaviour remains unchanged.
+        """
+
+        if action == "entering the recognized empty shelf layer":
+            # The shallow Task3 grip flexes under shelf contact, so the frozen
+            # held-center transform no longer predicts the real box X/Y to
+            # centimetre accuracy.  Stop from the carried box itself before
+            # contact can shove it deeper or sideways into packaging_box.
+            if self._place_world is not None:
+                target_color = str(
+                    context.instruction.get("target_color", "")
+                ).strip().lower()
+                observation = context.target_observations.get(target_color)
+                if observation is not None:
+                    age_s = max(
+                        0.0,
+                        float(context.now_s)
+                        - float(observation.received_at_s),
+                    )
+                    observed = tuple(
+                        float(value)
+                        for value in observation.position_world
+                    )
+                    target_clearance_z = (
+                        float(self._place_world[2]) + self.SHELF_CLEARANCE_M
+                    )
+                    x_error = observed[0] - float(self._place_world[0])
+                    y_error = observed[1] - float(self._place_world[1])
+                    z_error = observed[2] - target_clearance_z
+                    if (
+                        age_s <= self.TASK3_SOURCE_MAX_AGE_S
+                        and -self.TASK3_LIVE_ENTRY_INSIDE_X_TOLERANCE_M
+                        <= x_error
+                        <= self.TASK3_LIVE_ENTRY_OUTSIDE_X_TOLERANCE_M
+                        and abs(y_error)
+                        <= self.TASK3_LIVE_ENTRY_Y_TOLERANCE_M
+                        and abs(z_error)
+                        <= self.TASK3_LIVE_ENTRY_Z_TOLERANCE_M
+                    ):
+                        self._task3_live_entry_detail = (
+                            f"live_box=({observed[0]:.3f},"
+                            f"{observed[1]:.3f},{observed[2]:.3f}), "
+                            f"errors=({x_error:+.3f},"
+                            f"{y_error:+.3f},{z_error:+.3f})"
+                        )
+                        self._transfer.reset()
+                        self._motion_started = False
+                        return True, None
+
+            pose = self._odometry_pose(context.odometry)
+            if pose is not None:
+                robot_x, robot_y, _robot_yaw = pose
+                dx = float(target_xy[0]) - robot_x
+                dy = float(target_xy[1]) - robot_y
+
+                forward_m = (
+                    math.cos(self.SHELF_YAW) * dx
+                    + math.sin(self.SHELF_YAW) * dy
                 )
-            self._motion_started = True
-        status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+                lateral_m = (
+                    -math.sin(self.SHELF_YAW) * dx
+                    + math.cos(self.SHELF_YAW) * dy
+                )
+
+                if (
+                    -0.03 <= forward_m <= 0.050
+                    and abs(lateral_m) <= 0.09
+                ):
+                    self._transfer.reset()
+                    self._motion_started = False
+                    return True, None
+
+        return super()._tick_straight_advance(
+            context,
+            target_xy,
+            action=action,
         )
-        if status is NavigationStatus.GOAL_REACHED:
-            self._phase = next_phase
-            self._motion_started = False
-            self._transfer.reset()
+
+
+    def _task3_verified_shallow_contact(
+        self,
+        result: StageResult,
+        context: ExecutionContext,
+        actual_target,
+    ) -> StageResult | None:
+        """Accept a settled shallow grasp when Task3-only has no contact bit."""
+
+        if (
+            result.status is not StageStatus.RUNNING
+            or self._contact_search_used_m
+              < self.TASK3_REQUIRED_CONTACT_SEARCH_M - 1e-9
+            or actual_target is None
+        ):
             return None
-        if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+        metrics = self._contact.contact_metrics(context.joint_states)
+        if metrics is None:
+            return None
+        left_error, right_error, max_velocity = metrics
+        if not (
+            0.035 <= left_error <= 0.180
+            and 0.035 <= right_error <= 0.180
+            and abs(left_error - right_error) <= 0.080
+            and max_velocity <= 0.050
+        ):
+            return None
+
+        target_color = str(
+            context.instruction.get("target_color", "")
+        ).strip().lower()
+        observation = context.target_observations.get(target_color)
+        if observation is None:
+            return None
+        age_s = max(
+            0.0,
+            float(context.now_s) - float(observation.received_at_s),
+        )
+        observed = tuple(float(value) for value in observation.position_world)
+        xy_displacement = math.hypot(
+            observed[0] - float(actual_target[0]),
+            observed[1] - float(actual_target[1]),
+        )
+        if age_s > self.TASK3_SOURCE_MAX_AGE_S:
+            return None
+        if xy_displacement > 0.080:
+            return None
+
+        # Save RAW RGB-D Z immediately before lift.  Different classes/backends
+        # have a systematic absolute-Z bias, so lift proof must compare
+        # pre-lift and post-lift observations from the same detector.
+        self._task3_pre_lift_observed_z = observed[2]
+
+        return StageResult.succeeded(
+            "Task3 contact pose settled; allowing diagnostic lift: "
+            f"arm_residuals=({left_error:.3f}/{right_error:.3f} m), "
+            f"xy_response={xy_displacement:.3f} m, "
+            f"pre_lift_z={observed[2]:.3f}",
+            arm_command=result.arm_command,
+        )
+
+    def _tick_task3_align_for_pick(
+        self,
+        context: ExecutionContext,
+    ) -> StageResult:
+        """Centre the final RGB-D lock with a bounded short local motion."""
+
+        if context.unsafe_collision:
             return StageResult.blocked(
-                f"task 3 transport navigation stopped safely while {action}: {detail}",
+                "Task3 pick alignment stopped on unsafe collision",
                 arm_command=self._held_arm_command,
             )
-        return StageResult.running(
-            f"task 3 {action}; {detail}",
-            base_command=command,
-            arm_command=self._held_arm_command,
+        if self._locked_target_world is None:
+            return StageResult.blocked(
+                "Task3 pick alignment has no locked RGB-D target"
+            )
+
+        pose = self._odometry_pose(context.odometry)
+        if pose is None:
+            return StageResult.running("Task3 waiting for odometry during pick alignment")
+
+        elapsed = max(0.0, float(context.now_s) - self._task3_pick_align_started_s)
+        if elapsed > 75.0 and self._task3_pick_phase != "open_pregrasp":
+            return StageResult.blocked(
+                f"Task3 short pick-stand refinement timed out after {elapsed:.1f}s"
+            )
+
+        robot_x, robot_y, robot_yaw = pose
+        target_x, target_y, _target_z = self._locked_target_world
+        stand_x = float(target_x)
+        stand_y = float(target_y) - self.TASK3_PICK_STANDOFF_M
+        dx = stand_x - robot_x
+        dy = stand_y - robot_y
+        distance = math.hypot(dx, dy)
+
+        if self._task3_pick_phase == "rotate_to_stand":
+            if distance <= self.TASK3_PICK_STAND_TOLERANCE_M:
+                self._task3_pick_phase = "face_target"
+                return StageResult.running("Task3 reached refined stand; preparing final yaw")
+            heading = math.atan2(dy, dx)
+            heading_error = self._wrap_angle(heading - robot_yaw)
+            if abs(heading_error) <= 0.06:
+                self._task3_pick_phase = "drive_to_stand"
+                return StageResult.running("Task3 aligned for short straight pick correction")
+            angular = math.copysign(
+                max(0.08, min(0.55, 1.4 * abs(heading_error))),
+                heading_error,
+            )
+            return StageResult.running(
+                f"Task3 rotating toward refined pick stand; "
+                f"yaw_err={heading_error:.3f}",
+                base_command=(0.0, angular),
+            )
+
+        if self._task3_pick_phase == "drive_to_stand":
+            if distance <= self.TASK3_PICK_STAND_TOLERANCE_M:
+                self._task3_pick_phase = "face_target"
+                return StageResult.running("Task3 reached refined stand; preparing final yaw")
+            heading = math.atan2(dy, dx)
+            heading_error = self._wrap_angle(heading - robot_yaw)
+            if abs(heading_error) > 0.20:
+                self._task3_pick_phase = "rotate_to_stand"
+                return StageResult.running("Task3 correcting heading before short advance")
+            linear = min(0.18, max(0.06, 0.9 * distance))
+            angular = max(-0.22, min(0.22, 1.2 * heading_error))
+            return StageResult.running(
+                f"Task3 driving straight to refined pick stand; "
+                f"remaining={distance:.3f}m",
+                base_command=(linear, angular),
+            )
+
+        if self._task3_pick_phase == "face_target":
+            # Coarse navigation uses the stable far-view lock, but final
+            # centring MUST use the current RGB-D XY.  Otherwise the base can
+            # be perfectly centred on an old point while the real box is
+            # visibly several centimetres to one side.
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            observation = context.target_observations.get(target_color)
+
+            # Near the table the coloured box can leave the reliable RGB-D
+            # view.  Final centring is therefore best-effort:
+            #   fresh RGB-D -> refine with it
+            #   missing/stale RGB-D -> fall back to the already validated
+            #   multi-frame far-view lock instead of waiting forever.
+            use_live = False
+            age_s = float("inf")
+
+            if observation is not None:
+                age_s = max(
+                    0.0,
+                    float(context.now_s)
+                    - float(observation.received_at_s),
+                )
+                if age_s <= self.TASK3_SOURCE_MAX_AGE_S:
+                    observed = tuple(
+                        float(value)
+                        for value in observation.position_world
+                    )
+                    live_x = observed[0]
+                    live_y = observed[1]
+                    use_live = True
+
+            if not use_live:
+                live_x = float(target_x)
+                live_y = float(target_y)
+
+            # Reject a clearly unrelated/noisy near-field detection.
+            aim_source = "LIVE" if use_live else "LOCKED_FALLBACK"
+            lock_shift = math.hypot(
+                live_x - float(target_x),
+                live_y - float(target_y),
+            )
+            if lock_shift > 0.100:
+                return StageResult.running(
+                    "Task3 rejecting implausible live final-centre sample; "
+                    f"lock_shift={lock_shift:.3f}m",
+                    base_command=(0.0, 0.0),
+                )
+
+            # Light low-pass filtering prevents yaw0/yaw90 cuboid estimates
+            # from making the base twitch between adjacent RGB-D centres.
+            previous = getattr(self, "_task3_live_aim_xy", None)
+            if previous is None:
+                aim_x, aim_y = live_x, live_y
+            else:
+                alpha = 0.35
+                aim_x = (1.0 - alpha) * float(previous[0]) + alpha * live_x
+                aim_y = (1.0 - alpha) * float(previous[1]) + alpha * live_y
+            self._task3_live_aim_xy = (aim_x, aim_y)
+
+            rel_x = aim_x - robot_x
+            rel_y = aim_y - robot_y
+            distance = math.hypot(rel_x, rel_y)
+            target_heading = math.atan2(rel_y, rel_x)
+            yaw_error = self._wrap_angle(target_heading - robot_yaw)
+
+            forward = (
+                math.cos(robot_yaw) * rel_x
+                + math.sin(robot_yaw) * rel_y
+            )
+            lateral = (
+                -math.sin(robot_yaw) * rel_x
+                + math.cos(robot_yaw) * rel_y
+            )
+            range_error = distance - self.TASK3_PICK_STANDOFF_M
+
+            # First point the chassis centreline through the LIVE box centre.
+            if abs(yaw_error) > 0.008 or abs(lateral) > 0.005:
+                angular = math.copysign(
+                    max(0.035, min(0.18, 1.8 * abs(yaw_error))),
+                    yaw_error,
+                )
+                return StageResult.running(
+                    "Task3 LIVE fine-centring target before pregrasp; "
+                    f"forward={forward:.3f}, lateral={lateral:.3f}, "
+                    f"yaw_err={yaw_error:.4f}, "
+                    f"lock_shift={lock_shift:.3f}, source={aim_source}",
+                    base_command=(0.0, angular),
+                )
+
+            # Then recover the intended ~0.620 m arm working distance using
+            # the same LIVE centre, rather than the stale far-view centre.
+            if abs(range_error) > self.TASK3_PICK_STAND_TOLERANCE_M:
+                linear = math.copysign(
+                    max(0.025, min(0.070, 0.8 * abs(range_error))),
+                    range_error,
+                )
+                return StageResult.running(
+                    "Task3 LIVE range refinement before pregrasp; "
+                    f"distance={distance:.3f}, "
+                    f"range_err={range_error:.3f}, "
+                    f"lateral={lateral:.3f}",
+                    base_command=(linear, 0.0),
+                )
+
+            # Final accepted RGB-D XY becomes the manipulation centre.
+            # Preserve the calibrated/frozen Z so near-field depth bias does
+            # not change grasp height.
+            locked_z = float(self._locked_target_world[2])
+            self._locked_target_world = (
+                float(aim_x),
+                float(aim_y),
+                locked_z,
+            )
+
+            self._pregrasp.reset()
+            self._stage_started_s = float(context.now_s)
+            self._task3_pick_phase = "open_pregrasp"
+            return StageResult.running(
+                "Task3 LIVE target centred between both arms; "
+                f"forward={forward:.3f}, lateral={lateral:.3f}, "
+                f"distance={distance:.3f}, "
+                f"xy_shift={lock_shift:.3f}, source={aim_source}; "
+                "freezing corrected XY for pregrasp",
+                base_command=(0.0, 0.0),
+            )
+
+        if self._task3_pick_phase == "open_pregrasp":
+            return super().tick(TaskStage.ALIGN_FOR_PICK, context)
+
+        return StageResult.blocked(
+            f"Task3 invalid pick-alignment phase {self._task3_pick_phase!r}"
         )
 
-    def _update_shelf_state(self, context: ExecutionContext):
-        """Keep task-1's stable shelf snapshot; task 3 does not rescan it."""
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
 
-        return self._shelf_state
 
-    def _tick_task3_align_for_place(self, context: ExecutionContext) -> StageResult:
+    # Competition geometry.
+    COLORED_HALF_Z = 0.095
+    PACKAGING_HALF_Z = 0.117
+
+    # Official left-side displacement is -0.238 world Y.
+    TASK3_LEFT_DY = 0.238
+
+    # Keep the released object slightly away from the shelf side wall.
+    # This matches the previously successful Task3 safe-release idea.
+    TASK3_SAFE_Y_OFFSET = 0.040
+
+    # Task1's integrated shelf insertion is already proven around x=-2.64.
+    # Its existing SHELF_PLACE_DEPTH_BIAS_M then provides the deeper insertion.
+    # Leave only part of the box supported by the shelf. The visual pusher
+    # completes the move from this outside release to the official final x.
+    TASK3_RELEASE_X = -2.560
+    TASK3_SAFE_RELEASE_Y = 0.540
+    # Route directly to the final packaging-left row.  Using the same Y for
+    # transport and placement avoids a rotate-drive-rotate shelf-front detour.
+    TASK3_SHELF_TURN_Y = TASK3_SAFE_RELEASE_Y
+    TASK3_LIVE_ENTRY_OUTSIDE_X_TOLERANCE_M = 0.040
+    TASK3_LIVE_ENTRY_INSIDE_X_TOLERANCE_M = 0.180
+    TASK3_LIVE_ENTRY_Y_TOLERANCE_M = 0.060
+    TASK3_LIVE_ENTRY_Z_TOLERANCE_M = 0.120
+    # Hand the last shelf-facing correction to the explicit lateral/final
+    # alignment controller.  The direct navigator reaches this safe staging
+    # point within 6 cm and 0.12 rad; demanding 1 cm/0.01 rad makes it rotate
+    # the long carry footprint beside transient RGB-D overlays.
+    TASK3_SHELF_Y_TOLERANCE_M = 0.060
+    SHELF_TURN_POSITION_TOLERANCE_M = TASK3_SHELF_Y_TOLERANCE_M
+    SHELF_SCAN_YAW_TOLERANCE_RAD = 0.120
+    # Match the Master post-release sequence: back out 0.40 m, then return
+    # exactly 0.40 m with open arms.  This only brings the pusher back to the
+    # release plane; it does not add the old extra 0.05 m shove.
+    TASK3_RELEASE_BACKOFF_M = 0.40
+    TASK3_POST_RELEASE_PUSH_M = 0.40
+    TASK3_RELEASE_SETTLE_S = 1.0
+    # Master task-3 release calibration: open only 40 mm beyond the achieved
+    # grasp and clamp the resulting per-arm half-width to a safe local range.
+    TASK3_RELEASE_SPREAD_M = 0.040
+    TASK3_RELEASE_MIN_HALF_WIDTH_M = 0.110
+    TASK3_RELEASE_MAX_HALF_WIDTH_M = 0.140
+    # The old master branch used a fixed 0.45 m base push.  Keep the safer
+    # RGB-D closed loop already present in this executor and request only a
+    # short correction after the shallow release.
+    TASK3_ENABLE_PUSH = True
+    TASK3_PUSHER_HALF_WIDTH_M = 0.065
+    # Only give the released box a gentle final nudge.  The shelf placement
+    # itself already carries almost all of the box over the board.
+    TASK3_PUSH_DESIRED_M = 0.010
+    TASK3_FINAL_CENTER_X = -2.680
+    TASK3_PUSH_X_TOLERANCE_M = 0.004
+    TASK3_PUSH_OVERSHOOT_M = 0.004
+    TASK3_PUSH_MAX_DISTANCE_M = 0.020
+    TASK3_PUSH_TIMEOUT_S = 10.0
+    TASK3_PUSH_LOST_TIMEOUT_S = 1.0
+    TASK3_PUSH_BASE_SPEED_MPS = 0.008
+    TASK3_PUSH_MAX_SPEED_MPS = 0.010
+
+    def _shelf_observation_target_y(self, context: ExecutionContext) -> float:
+        """Align the shelf observation stand with the packaging-left target."""
+
+        del context
+        return float(self.TASK3_SAFE_RELEASE_Y)
+
+    # packaging_box is a static shelf obstacle.  It is often visible during
+    # the safe turn but occluded by the carried box at the final scan stand;
+    # retain that validated RGB-D layer measurement for the current run.
+    PACKAGING_MAX_AGE_S = 120.0
+
+    def __init__(self, memory: CompetitionTaskMemory) -> None:
+        super().__init__(memory)
+
+        # Task3's raised white support needs the validated narrower, lower
+        # pregrasp route; Task1 and Task2 keep their own controllers unchanged.
+        self._pregrasp = Task3StableOpenPregraspController()
+        self._task3_direct_hug = Task3DirectHugController()
+        # Task 3 follows the master branch's relative release strategy.  It
+        # spreads around the achieved held centre and never recomputes a
+        # world-frame shelf IK target.
+        self._release = ReleaseSpreadController()
+        self._task3_pusher = ReleaseSpreadController()
+
+        # Preserve Task1's contact-search state machine while using the old
+        # Task3 reference's proven 85 mm half-width.
+        self._contact = Task3ReferenceContactController()
+        self._lift = SlideLiftController(lift_height=0.10)
+        self._navigation._timeout = 120.0
+        # Task3's carried box is intentionally held at the near edge, so the
+        # shelf-front three-part lateral manoeuvre is kept cautious.  Give
+        # only this executor enough time to finish and accept the measured
+        # 0.08 rad shelf-facing yaw instead of failing at 90 s by a hair.
+        self._transfer.LATERAL_TIMEOUT_S = 120.0
+        self._transfer.LATERAL_POSITION_TOLERANCE_M = (
+            self.TASK3_SHELF_Y_TOLERANCE_M
+        )
+        self._transfer.LATERAL_YAW_TOLERANCE_RAD = 0.08
+        self._task3_source_tracker = StableTargetCenterTracker(
+            window_size=12,
+            required_samples=5,
+            required_inliers=4,
+            min_sample_interval_s=0.10,
+            min_collection_duration_s=0.45,
+            max_observation_age_s=self.TASK3_SOURCE_MAX_AGE_S,
+            max_axis_deviation=(0.060, 0.050, 0.050),
+            shelf_roi=self.TASK3_SOURCE_ROI,
+            layer_z_gate_m=0.20,
+        )
+        self._task3_source_estimate = None
+        self._task3_support_world: tuple[float, float, float] | None = None
+        self._task3_grasp_target_world: tuple[float, float, float] | None = None
+        self._task3_pick_phase = "idle"
+        self._task3_pick_align_started_s = 0.0
+        self._task3_place_locked = False
+        self._task3_packaging_world: tuple[float, float, float] | None = None
+        self._task3_place_phase = "idle"
+        self._task3_place_phase_started_s = 0.0
+        self._task3_push_started_s = 0.0
+        self._task3_push_start_x: float | None = None
+        self._task3_push_target_x: float | None = None
+        self._task3_push_last_seen_s = 0.0
+        self._task3_push_confirm_count = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self._task3_direct_hug.reset()
+        self._task3_pusher.reset()
+        self._task3_source_tracker.reset()
+        self._task3_source_estimate = None
+        self._task3_support_world = None
+        self._task3_grasp_target_world = None
+        self._task3_pick_phase = "idle"
+        self._task3_pick_align_started_s = 0.0
+        self._task3_place_locked = False
+        self._task3_packaging_world = None
+        self._task3_place_phase = "idle"
+        self._task3_place_phase_started_s = 0.0
+        self._task3_push_started_s = 0.0
+        self._task3_push_start_x = None
+        self._task3_push_target_x = None
+        self._task3_push_last_seen_s = 0.0
+        self._task3_push_confirm_count = 0
+
+    def enter_stage(
+        self,
+        stage: TaskStage,
+        context: ExecutionContext,
+    ) -> None:
+        super().enter_stage(stage, self._task1_compat_context(context))
+        if stage is TaskStage.NAVIGATE_TO_PICK:
+            self._task3_source_tracker.reset(
+                accept_after_s=float(context.now_s),
+            )
+            self._task3_source_estimate = None
+        elif stage is TaskStage.ALIGN_FOR_PICK:
+            self._transfer.reset()
+            self._motion_started = False
+            self._task3_pick_phase = "face_target"
+            self._task3_pick_align_started_s = float(context.now_s)
+            self._task3_live_aim_xy = None
+        elif stage is TaskStage.GRASP:
+            self._task3_direct_hug.reset()
+            self._task3_lift_verified = False
+            self._task3_pre_lift_observed_z = None
+        elif stage is TaskStage.PLACE:
+            self._task3_place_phase = "parent_release"
+            self._task3_place_phase_started_s = float(context.now_s)
+            self._task3_push_started_s = 0.0
+            self._task3_push_start_x = None
+            self._task3_push_target_x = None
+            self._task3_push_last_seen_s = float(context.now_s)
+            self._task3_push_confirm_count = 0
+
+    def _tick_task3_acquire_target(
+        self,
+        context: ExecutionContext,
+    ) -> StageResult:
+        """Reacquire the instructed block after stopping by its support."""
+
+        target_color = str(
+            context.instruction.get("target_color", "")
+        ).strip().lower()
+        if not target_color:
+            return StageResult.blocked("Task3 instruction has no target_color")
+
+        observation = context.target_observations.get(target_color)
+
+        # Prefer the stable source centre acquired from the farther initial
+        # view.  Near-field RGB-D depth/centroid geometry drifts strongly as
+        # the robot approaches the white support and must not overwrite it.
+        estimate = self._task3_source_estimate
+
+        if estimate is None:
+            fresh_estimate = self._task3_source_tracker.update(
+                observation,
+                now_s=context.now_s,
+            )
+            if fresh_estimate is not None:
+                self._task3_source_estimate = fresh_estimate
+                estimate = fresh_estimate
+        if estimate is None:
+            waited_s = max(
+                0.0,
+                float(context.now_s) - self._stage_started_s,
+            )
+            detail = self._task3_source_tracker.status()
+            if waited_s >= self.TASK3_SOURCE_ACQUIRE_TIMEOUT_S:
+                return StageResult.blocked(
+                    f"Task3 timed out reacquiring {target_color!r} above "
+                    f"material_box: {detail}"
+                )
+            return StageResult.running(
+                f"Task3 collecting fresh {target_color!r} RGB-D centre above "
+                f"material_box; {detail}"
+            )
+
+        center = tuple(float(value) for value in estimate.center_world)
+        # Task3 source sits on the fixed white material_box top.
+        # Near-field RGB-D Z drifted upward by ~4 cm in testing, so retain
+        # dynamic RGB-D X/Y but use the validated source centre height.
+        center = (
+            center[0],
+            center[1],
+            self.TASK3_SOURCE_CENTER_Z,
+        )
+        support = context.target_observations.get(self.TASK3_SUPPORT_COLOR)
+        if support is not None:
+            support_age = max(
+                0.0,
+                float(context.now_s) - float(support.received_at_s),
+            )
+            if support_age <= self.TASK3_SOURCE_MAX_AGE_S:
+                support_center = tuple(
+                    float(value) for value in support.position_world
+                )
+                xy_error = math.hypot(
+                    center[0] - support_center[0],
+                    center[1] - support_center[1],
+                )
+                z_clearance = center[2] - support_center[2]
+                if xy_error > 0.30 or z_clearance < 0.04:
+                    return StageResult.blocked(
+                        "Task3 RGB-D target is inconsistent with material_box: "
+                        f"xy_error={xy_error:.3f}, "
+                        f"z_clearance={z_clearance:.3f}"
+                    )
+
+        # The target-color centroid can jump to a tabletop instance or drift
+        # badly when the raised block fills the near-field image. The white
+        # support is static and its far-view RGB-D centre is substantially more
+        # stable. Task3's block is centred on that support in every randomized
+        # scene, so use the cached support X/Y for manipulation geometry while
+        # still using target_color to select and verify the carried object.
+        if self._task3_support_world is not None:
+            center = (
+                float(self._task3_support_world[0]),
+                float(self._task3_support_world[1]),
+                self.TASK3_SOURCE_CENTER_Z,
+            )
+
+        pose = self._odometry_pose(context.odometry)
+        if pose is None:
+            return StageResult.running(
+                "Task3 waiting for odometry before computing shallow grip point"
+            )
+        approach_dx = center[0] - pose[0]
+        approach_dy = center[1] - pose[1]
+        approach_norm = math.hypot(approach_dx, approach_dy)
+        if approach_norm <= 1e-6:
+            return StageResult.blocked(
+                "Task3 cannot compute shallow grip direction at zero range"
+            )
+        shallow_center = (
+            center[0]
+            - self.TASK3_SHALLOW_GRIP_OFFSET_M * approach_dx / approach_norm,
+            center[1]
+            - self.TASK3_SHALLOW_GRIP_OFFSET_M * approach_dy / approach_norm,
+            center[2] + self.TASK3_GRASP_Z_OFFSET_M,
+        )
+        self._locked_target_world = center
+        self._task3_grasp_target_world = shallow_center
+        self._locked_target_orientation = estimate.orientation or "yaw0"
+
+        return StageResult.succeeded(
+            f"Task3 locked fresh {target_color!r} RGB-D source centre: "
+            f"center={tuple(round(value, 3) for value in center)}, "
+            f"shallow_grip={tuple(round(value, 3) for value in shallow_center)}, "
+            f"orientation={self._locked_target_orientation}, "
+            f"samples={estimate.sample_count}"
+        )
+
+    def _task3_place_from_rgbd(
+        self,
+        context: ExecutionContext,
+    ) -> tuple[float, float, float]:
+        """Build Task3 place target from live packaging_box RGB-D center."""
+
+        observation = context.target_observations.get("packaging_box")
+        if observation is None:
+            raise RuntimeError(
+                "Task3 has no live packaging_box RGB-D observation"
+            )
+
+        age = max(
+            0.0,
+            float(context.now_s) - float(observation.received_at_s),
+        )
+        if age > self.PACKAGING_MAX_AGE_S:
+            raise RuntimeError(
+                f"Task3 packaging_box RGB-D observation is stale: {age:.2f}s"
+            )
+
+        point = tuple(
+            float(value) for value in observation.position_world
+        )
+        if len(point) != 3 or not all(math.isfinite(v) for v in point):
+            raise RuntimeError(
+                "Task3 packaging_box RGB-D center is invalid"
+            )
+
+        px, py, pz = point
+
+        # Fail closed if the detected white obstacle is not actually in
+        # the shelf workspace.
+        if not (-3.10 <= px <= -2.20):
+            raise RuntimeError(
+                f"Task3 packaging_box x outside shelf ROI: {px:.3f}"
+            )
+        if not (0.30 <= py <= 1.30):
+            raise RuntimeError(
+                f"Task3 packaging_box y outside shelf ROI: {py:.3f}"
+            )
+        if not (0.30 <= pz <= 1.40):
+            raise RuntimeError(
+                f"Task3 packaging_box z outside shelf ROI: {pz:.3f}"
+            )
+
+        # packaging_box and colored box sit on the same shelf board.
+        # Convert packaging center Z to colored-box center Z.
+        target_z = (
+            pz
+            - self.PACKAGING_HALF_Z
+            + self.COLORED_HALF_Z
+        )
+
+        # "Left" for the official west-facing shelf is negative world Y.
+        # The calibrated shelf centre is y=0.778 and the official left offset is
+        # 0.238 m, so y=0.540 leaves about 4 cm between the two cuboids.
+        # Do not bias this back toward the packaging box: y=0.600 overlaps
+        # their physical Y extents even though it remains inside referee radius.
+        target_y = self.TASK3_SAFE_RELEASE_Y
+
+        self._task3_packaging_world = (px, py, pz)
+
+        return (
+            self.TASK3_RELEASE_X,
+            target_y,
+            target_z,
+        )
+
+    def _tick_align_for_place(
+        self,
+        context: ExecutionContext,
+    ) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
-            return StageResult.blocked("task 3 shelf alignment has no held object")
-        try:
-            self._ensure_task3_place_target(context)
-        except (RuntimeError, ValueError) as exc:
-            return StageResult.blocked(f"task 3 cannot prepare shelf placement: {exc}")
-        assert self._place_world is not None
-        assert self._shelf_scan_stand is not None
+            return StageResult.blocked(
+                "Task3 lost held object center before shelf placement"
+            )
 
-        if self._phase == "task3_clearance":
-            if not self._slide_hold.planned:
-                target_held_z = self._place_world[2] + self.TASK3_INSERT_CLEARANCE_M
+        # Lock Task3's real packaging-left target before the parent is allowed
+        # to plan clearance or enter the shelf.  The previous ordering let the
+        # parent finish a Task1 empty-layer approach and replaced the target
+        # only afterward.
+        if not self._task3_place_locked:
+            # Formal T1->T2->T3 already has a validated shelf state from Task1.
+            # Reuse it instead of forcing Task3 to rediscover two occupied
+            # layers while carrying the object at the shelf.
+            state = self._shelf_state
+            if state is None:
+                try:
+                    state = self._memory.require_shelf_state()
+                except Exception:
+                    state = None
+
+            # Keep live recognition only as a fallback for standalone runs.
+            if state is None:
+                state = self._update_shelf_state(context)
+
+            if state is None:
+                return StageResult.running(
+                    "Task3 waiting for existing Task1 shelf memory or one fresh "
+                    "shelf-state estimate; refusing redundant semantic scan",
+                    base_command=(0.0, 0.0),
+                    arm_command=self._held_arm_command,
+                )
+
+            self._shelf_state = state
+            self._memory.record_shelf_state(state)
+            try:
+                self._place_world = self._task3_place_from_rgbd(context)
+                target_held_z = self._place_world[2] + self.SHELF_CLEARANCE_M
                 target_slide = (
                     self._held_arm_command.spine_position
                     + self._held_center_base[2]
                     - target_held_z
                 )
-                try:
-                    self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
-                        self._held_arm_command,
-                        target_slide,
-                        context.joint_states,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        f"task 3 could not plan shelf-clearance height: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            result = self._tick_slide(
-                context, "moving held top-box to task-3 shelf clearance height"
-            )
-            if result is not None:
-                return result
-            self._phase = "task3_lateral"
-            self._motion_started = False
-            self._transfer.reset()
-
-        if self._phase == "task3_lateral":
-            if self._final_place_stand is None:
-                self._final_place_stand = stand_from_held_center(
-                    self._place_world,
-                    self._held_center_base,
-                    self.SHELF_YAW,
-                )
-                self._final_place_stand = (
-                    self._final_place_stand[0],
-                    max(0.58, min(0.98, self._final_place_stand[1])),
-                )
-                opening_yaw = float(self._shelf_tracker.geometry.opening_yaw)
-                self._task3_shallow_place_stand = (
-                    self._final_place_stand[0]
-                    + self.TASK3_ARM_INSERTION_M * math.cos(opening_yaw),
-                    self._final_place_stand[1]
-                    + self.TASK3_ARM_INSERTION_M * math.sin(opening_yaw),
-                )
-            assert self._task3_shallow_place_stand is not None
-            if not self._motion_started:
-                if not self._transfer.begin_lateral_alignment(
-                    (
-                        self._shelf_scan_stand[0],
-                        self._task3_shallow_place_stand[1],
-                    ),
-                    self.SHELF_YAW,
-                    context.odometry,
-                    context.now_s,
-                    position_tolerance_m=(
-                        self.TASK3_LATERAL_POSITION_TOLERANCE_M
-                    ),
-                    timeout_s=self.TASK3_LATERAL_TIMEOUT_S,
-                ):
-                    return StageResult.blocked(
-                        "task 3 could not plan safe lateral alignment outside shelf",
-                        arm_command=self._held_arm_command,
-                    )
-                self._motion_started = True
-            status, command, detail = self._transfer.tick_lateral_alignment(
-                context.odometry, context.now_s
-            )
-            if status is NavigationStatus.GOAL_REACHED:
-                self._phase = "task3_advance"
-                self._motion_started = False
-                self._transfer.reset()
-            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-                return StageResult.blocked(
-                    f"task 3 shelf lateral alignment stopped safely: {detail}",
-                    arm_command=self._held_arm_command,
-                )
-            else:
-                return StageResult.running(
-                    f"task 3 aligning outside shelf for packaging-box left placement; "
-                    f"{detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
-
-        if self._phase == "task3_advance":
-            assert self._task3_shallow_place_stand is not None
-            done, running = self._tick_straight_advance(
-                context,
-                self._task3_shallow_place_stand,
-                action="advancing to the shallow task-3 insertion stand",
-            )
-            if running is not None:
-                return running
-            if done:
-                self._phase = "task3_extra_base_advance"
-                self._phase_started_s = float(context.now_s)
-                self._motion_started = False
-                self._transfer.reset()
-                self._held_insert.reset()
-
-        if self._phase == "task3_extra_base_advance":
-            if not self._motion_started:
-                if not self._transfer.begin_advance(
-                    context.odometry,
-                    self.TASK3_EXTRA_BASE_ADVANCE_M,
-                    heading_yaw=self.SHELF_YAW,
-                ):
-                    return StageResult.running(
-                        "task 3 waiting for odometry before the extra "
-                        f"{self.TASK3_EXTRA_BASE_ADVANCE_M:.2f} m shelf advance",
-                        arm_command=self._held_arm_command,
-                    )
-                self._motion_started = True
-            done, command, detail = self._transfer.tick_advance(context.odometry)
-            if not done:
-                return StageResult.running(
-                    "task 3 advancing the base an additional "
-                    f"{self.TASK3_EXTRA_BASE_ADVANCE_M:.2f} m before release; "
-                    f"{detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
-            self._phase = "task3_extra_base_advance_done"
-            self._motion_started = False
-            self._transfer.reset()
-            return StageResult.succeeded(
-                "task 3 reached the direct base-release position without arm "
-                f"insertion; extra advance={self.TASK3_EXTRA_BASE_ADVANCE_M:.2f} m",
-                arm_command=self._held_arm_command,
-            )
-        return StageResult.blocked(
-            f"task 3 invalid shelf-alignment phase {self._phase!r}",
-            arm_command=self._held_arm_command,
-        )
-
-    def _task3_release_half_width(self) -> float:
-        grasp_half_width = self._contact.half_width
-        if grasp_half_width is None or not math.isfinite(float(grasp_half_width)):
-            raise PregraspInputError(
-                "task 3 relative release has no measured grasp half-width"
-            )
-        return min(
-            self.TASK3_RELEASE_MAX_HALF_WIDTH_M,
-            max(
-                self.TASK3_RELEASE_MIN_HALF_WIDTH_M,
-                float(grasp_half_width) + self.TASK3_RELEASE_SPREAD_M,
-            ),
-        )
-
-    def _tick_task3_place(self, context: ExecutionContext) -> StageResult:
-        """Lower vertically, then release around the achieved held centre."""
-
-        if self._held_arm_command is None or self._held_center_base is None:
-            return StageResult.blocked("task 3 placement has no held object")
-        if self._place_world is None:
-            return StageResult.blocked("task 3 placement has no formal target")
-        if self._phase == "lower":
-            if not self._slide_hold.planned:
-                target_slide = (
-                    self._held_arm_command.spine_position
-                    + self._held_center_base[2]
-                    - self._place_world[2]
-                )
-                try:
-                    self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
-                        self._held_arm_command,
-                        target_slide,
-                        context.joint_states,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        f"task 3 could not plan vertical shelf lowering: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            result = self._tick_slide(
-                context,
-                "lowering task-3 box vertically onto the shelf board",
-            )
-            if result is not None:
-                return result
-            self._phase = "release"
-            self._phase_started_s = float(context.now_s)
-
-        if self._phase == "release":
-            if not self._release.planned:
-                try:
-                    release_half_width = self._task3_release_half_width()
-                    self._held_arm_command = self._release.plan_from_held(
-                        self._held_arm_command,
-                        self._held_center_base,
-                        context.joint_states,
-                        half_width=release_half_width,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        f"task 3 relative shelf release planning failed: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._release.update(
-                    context.now_s,
+                self._slide_hold.reset()
+                self._slide_start = self._held_arm_command.spine_position
+                self._held_arm_command = self._slide_hold.plan(
+                    self._held_arm_command,
+                    target_slide,
                     context.joint_states,
+                )
+            except RuntimeError as exc:
+                return StageResult.blocked(
+                    str(exc), arm_command=self._held_arm_command
                 )
             except (PregraspInputError, PregraspPlanningError) as exc:
                 return StageResult.blocked(
-                    f"task 3 relative shelf release control failed: {exc}",
+                    f"Task3 could not plan packaging-left clearance: {exc}",
                     arm_command=self._held_arm_command,
                 )
-            self._held_arm_command = command
-            if reached:
-                return StageResult.succeeded(
-                    "task 3 released the box from the achieved insertion pose "
-                    "without world-frame IK recomputation",
-                    arm_command=command,
+
+            self._final_place_stand = stand_from_held_center(
+                self._place_world,
+                self._held_center_base,
+                self.SHELF_YAW,
+            )
+            self._final_place_stand = (
+                self._final_place_stand[0],
+                max(0.50, min(0.98, self._final_place_stand[1])),
+            )
+            self._phase = "clearance"
+            self._motion_started = False
+            self._transfer.reset()
+            self._task3_place_locked = True
+
+        result = super()._tick_align_for_place(context)
+        if result.status is StageStatus.SUCCEEDED:
+            px, py, pz = self._task3_packaging_world
+            tx, ty, tz = self._place_world
+            return StageResult.succeeded(
+                "Task3 entered shallow packaging-left release pose: "
+                f"packaging=({px:.3f},{py:.3f},{pz:.3f}), "
+                f"release=({tx:.3f},{ty:.3f},{tz:.3f})",
+                arm_command=self._held_arm_command,
+            )
+        return result
+
+    def _tick_task3_place(self, context: ExecutionContext) -> StageResult:
+        """Shallow release, back out, then RGB-D closed-loop centre push."""
+
+        if self._held_arm_command is None or self._place_world is None:
+            return StageResult.blocked("Task3 placement has no held object/target")
+
+        phase = self._task3_place_phase
+        if phase == "parent_release":
+            # Reproduce master's task-3 placement locally instead of calling
+            # Task1's two-step shelf release.  First lower vertically, then
+            # spread around the *achieved held centre*.  This keeps both arms
+            # outside the shelf-depth IK path and avoids the Task1 0.18 m
+            # final spread.
+            if self._phase == "lower":
+                if not self._slide_hold.planned:
+                    target_slide = (
+                        self._held_arm_command.spine_position
+                        + self._held_center_base[2]
+                        - self._place_world[2]
+                    )
+                    try:
+                        self._slide_start = self._held_arm_command.spine_position
+                        self._held_arm_command = self._slide_hold.plan(
+                            self._held_arm_command,
+                            target_slide,
+                            context.joint_states,
+                        )
+                    except (PregraspInputError, PregraspPlanningError) as exc:
+                        return StageResult.blocked(
+                            f"Task3 could not plan master vertical lowering: {exc}",
+                            arm_command=self._held_arm_command,
+                        )
+                lower_result = self._tick_slide(
+                    context,
+                    "lowering task-3 box vertically onto the shelf board",
                 )
-            if float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
-                return StageResult.blocked(
-                    f"task 3 relative shelf release timed out: {detail}",
-                    arm_command=command,
-                )
+                if lower_result is not None:
+                    return lower_result
+                self._phase = "release"
+                self._phase_started_s = float(context.now_s)
+
+            if self._phase == "release":
+                if not self._release.planned:
+                    # Task3 is held by the dedicated direct-hug controller,
+                    # not Task1/Task2's contact controller.  Use the actual
+                    # calibrated shallow-grasp width that produced the held
+                    # command (0.080 m per side).
+                    grasp_half = self._task3_direct_hug.HOLD_HALF_WIDTH_M
+                    if grasp_half is None or not math.isfinite(float(grasp_half)):
+                        return StageResult.blocked(
+                            "Task3 master relative release has no measured grasp width",
+                            arm_command=self._held_arm_command,
+                        )
+                    release_half = min(
+                        self.TASK3_RELEASE_MAX_HALF_WIDTH_M,
+                        max(
+                            self.TASK3_RELEASE_MIN_HALF_WIDTH_M,
+                            float(grasp_half) + self.TASK3_RELEASE_SPREAD_M,
+                        ),
+                    )
+                    try:
+                        self._held_arm_command = self._release.plan_from_held(
+                            self._held_arm_command,
+                            self._held_center_base,
+                            context.joint_states,
+                            half_width=release_half,
+                        )
+                    except (PregraspInputError, PregraspPlanningError) as exc:
+                        return StageResult.blocked(
+                            f"Task3 master relative release planning failed: {exc}",
+                            arm_command=self._held_arm_command,
+                        )
+                try:
+                    command, reached, detail = self._release.update(
+                        context.now_s,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        f"Task3 master relative release control failed: {exc}",
+                        arm_command=self._held_arm_command,
+                    )
+                self._held_arm_command = command
+                if not reached:
+                    if float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
+                        return StageResult.blocked(
+                            f"Task3 master relative release timed out: {detail}",
+                            arm_command=command,
+                        )
+                    return StageResult.running(
+                        f"Task3 master local symmetric release; {detail}",
+                        arm_command=command,
+                    )
+            self._task3_place_phase = "back_after_release"
+            self._task3_place_phase_started_s = float(context.now_s)
+            self._motion_started = False
+            self._transfer.reset()
             return StageResult.running(
-                f"task 3 spreading both arms locally to release; {detail}",
-                arm_command=command,
-            )
-        return StageResult.blocked(
-            f"task 3 invalid placement phase {self._phase!r}",
-            arm_command=self._held_arm_command,
-        )
-
-    def _tick_task3_return_to_end(self, context: ExecutionContext) -> StageResult:
-        """Execute task-3's post-release push/escape sequence.
-
-        The box has already been released by :meth:`_tick_task3_place`.  The
-        chassis therefore backs away before changing the arm width, makes the
-        requested short push with the compact open arms, backs away again,
-        retracts the arms, raises the spine to its maximum, and only then
-        delegates the final end-zone navigation to task 1's checked route.
-        """
-
-        if self._held_arm_command is None:
-            return StageResult.blocked(
-                "task 3 post-release sequence has no arm command"
-            )
-        elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-        if elapsed >= self.TASK3_RETURN_SEQUENCE_TIMEOUT_S:
-            return StageResult.blocked(
-                "task 3 post-release safety sequence timed out after "
-                f"{elapsed:.1f}s",
+                "Task3 shallow release complete; backing out before centre push",
                 arm_command=self._held_arm_command,
             )
 
-        if self._phase == "task3_post_release_retreat":
+        if phase == "back_after_release":
             if not self._motion_started:
                 if not self._transfer.begin_retreat(
                     context.odometry,
-                    self.TASK3_POST_RELEASE_RETREAT_M,
+                    self.TASK3_RELEASE_BACKOFF_M,
                     heading_yaw=self.SHELF_YAW,
                 ):
                     return StageResult.running(
-                        "task 3 waiting for odometry before the post-release "
-                        f"{self.TASK3_POST_RELEASE_RETREAT_M:.2f} m retreat",
+                        "Task3 waiting to start post-release back-out",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
             done, command, detail = self._transfer.tick_retreat(context.odometry)
             if not done:
                 return StageResult.running(
-                    "task 3 retreating the base "
-                    f"{self.TASK3_POST_RELEASE_RETREAT_M:.2f} m after release; "
-                    f"{detail}",
+                    f"Task3 backing out after shallow release; {detail}",
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "task3_compact_arms"
+            self._task3_place_phase = "prepare_open_pusher"
+            self._task3_place_phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
-            self._release.reset()
-
-        if self._phase == "task3_compact_arms":
-            if self._held_center_base is None:
-                return StageResult.blocked(
-                    "task 3 cannot compact arms without the achieved box centre",
+            self._task3_pusher.reset()
+            if not self.TASK3_ENABLE_PUSH:
+                return StageResult.succeeded(
+                    "Task3 shallow placement complete: grippers opened in "
+                    "place and arms backed clear; visual push intentionally "
+                    "disabled",
                     arm_command=self._held_arm_command,
                 )
-            if not self._release.planned:
-                try:
-                    self._held_arm_command = self._release.plan_from_held(
+
+        if self._task3_place_phase == "prepare_open_pusher":
+            if self._held_center_base is None:
+                return StageResult.blocked(
+                    "Task3 cannot form the master outside pusher without the held centre",
+                    arm_command=self._held_arm_command,
+                )
+            try:
+                if not self._task3_pusher.planned:
+                    # Master strategy: after the 0.40 m base retreat, reshape
+                    # the already-extracted arms around their achieved held
+                    # centre.  Do not solve another world-frame shelf target,
+                    # which would extend the arms back into the rack before
+                    # the explicit base push starts.
+                    self._held_arm_command = self._task3_pusher.plan_from_held(
                         self._held_arm_command,
                         self._held_center_base,
                         context.joint_states,
-                        half_width=self.TASK3_POST_RELEASE_HALF_WIDTH_M,
+                        half_width=self.TASK3_PUSHER_HALF_WIDTH_M,
                     )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        "task 3 post-release arm compaction planning failed: "
-                        f"{exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._release.update(
+                command, reached, detail = self._task3_pusher.update(
                     context.now_s,
                     context.joint_states,
                 )
             except (PregraspInputError, PregraspPlanningError) as exc:
                 return StageResult.blocked(
-                    "task 3 post-release arm compaction control failed: "
-                    f"{exc}",
+                    f"Task3 could not prepare open centre pusher: {exc}",
                     arm_command=self._held_arm_command,
                 )
             self._held_arm_command = command
             if not reached:
+                if (
+                    float(context.now_s) - self._task3_place_phase_started_s
+                    >= 15.0
+                ):
+                    return StageResult.blocked(
+                        f"Task3 open centre pusher timed out: {detail}",
+                        arm_command=command,
+                    )
                 return StageResult.running(
-                    "task 3 compacting open arms to half-width "
-                    f"{self.TASK3_POST_RELEASE_HALF_WIDTH_M:.3f} m; {detail}",
+                    f"Task3 forming open centre pusher; {detail}",
                     arm_command=command,
                 )
-            self._phase = "task3_post_release_push"
-            self._motion_started = False
-            self._transfer.reset()
-            self._release.reset()
+            pose = self._odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "Task3 waiting for odometry before visual push",
+                    arm_command=command,
+                )
+            self._task3_place_phase = "fixed_gentle_push"
+            self._task3_push_started_s = float(context.now_s)
+            self._task3_push_start_x = pose[0]
+            self._task3_push_target_x = None
+            self._task3_push_last_seen_s = float(context.now_s)
+            self._task3_push_confirm_count = 0
+            return StageResult.running(
+                "Task3 open centre pusher ready; gently returning 0.40 m to the release plane",
+                arm_command=command,
+            )
 
-        if self._phase == "task3_post_release_push":
+        if self._task3_place_phase == "fixed_gentle_push":
+            pose = self._odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "Task3 gentle push waiting for odometry",
+                    base_command=(0.0, 0.0),
+                    arm_command=self._held_arm_command,
+                )
             if not self._motion_started:
                 if not self._transfer.begin_advance(
                     context.odometry,
                     self.TASK3_POST_RELEASE_PUSH_M,
                     heading_yaw=self.SHELF_YAW,
+                    completion_tolerance_m=0.004,
                 ):
                     return StageResult.running(
-                        "task 3 waiting for odometry before the post-release "
-                        f"{self.TASK3_POST_RELEASE_PUSH_M:.2f} m push",
+                        "Task3 waiting to start the 0.40 m gentle return",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
-            done, command, detail = self._transfer.tick_advance(context.odometry)
-            if not done:
-                return StageResult.running(
-                    "task 3 pushing the released box farther into the shelf by "
-                    f"{self.TASK3_POST_RELEASE_PUSH_M:.2f} m; {detail}",
-                    base_command=command,
+                self._task3_push_start_x = pose[0]
+            done, base_command, detail = self._transfer.tick_advance(context.odometry)
+            if done:
+                return StageResult.succeeded(
+                    "Task3 gentle 0.40 m return reached the release plane; push complete",
+                    base_command=(0.0, 0.0),
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "task3_post_push_retreat"
-            self._motion_started = False
-            self._transfer.reset()
+            # Limit the whole return and slow down again for the final 6 cm,
+            # where the open hands can first touch the released box.
+            traveled = max(0.0, self._task3_push_start_x - pose[0])
+            remaining = max(0.0, self.TASK3_POST_RELEASE_PUSH_M - traveled)
+            speed = 0.060 if remaining > 0.060 else max(0.008, min(0.020, 0.40 * remaining))
+            return StageResult.running(
+                f"Task3 gentle 0.40 m return; remaining={remaining:.3f} m; {detail}",
+                base_command=(speed, base_command[1]),
+                arm_command=self._held_arm_command,
+            )
 
-        if self._phase == "task3_post_push_retreat":
-            if not self._motion_started:
-                if not self._transfer.begin_retreat(
-                    context.odometry,
-                    self.TASK3_POST_PUSH_RETREAT_M,
-                    heading_yaw=self.SHELF_YAW,
+        if self._task3_place_phase == "visual_push":
+            now_s = float(context.now_s)
+            elapsed = max(0.0, now_s - self._task3_push_started_s)
+            if elapsed >= self.TASK3_PUSH_TIMEOUT_S:
+                return StageResult.blocked(
+                    "Task3 visual push timed out before final x confirmation",
+                    arm_command=self._held_arm_command,
+                )
+            pose = self._odometry_pose(context.odometry)
+            if pose is None or self._task3_push_start_x is None:
+                return StageResult.running(
+                    "Task3 visual push waiting for odometry",
+                    arm_command=self._held_arm_command,
+                )
+            traveled = max(0.0, self._task3_push_start_x - pose[0])
+            if traveled >= self.TASK3_PUSH_MAX_DISTANCE_M:
+                return StageResult.blocked(
+                    f"Task3 visual push exceeded {traveled:.3f} m safety limit",
+                    arm_command=self._held_arm_command,
+                )
+
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            observation = context.target_observations.get(target_color)
+            center_x = None
+            if observation is not None:
+                age_s = max(0.0, now_s - float(observation.received_at_s))
+                point = tuple(float(value) for value in observation.position_world)
+                if (
+                    age_s <= self.TASK3_PUSH_LOST_TIMEOUT_S
+                    and len(point) == 3
+                    and -3.10 <= point[0] <= -2.20
+                    and 0.30 <= point[1] <= 1.30
+                    and abs(point[2] - self._place_world[2]) <= 0.20
                 ):
-                    return StageResult.running(
-                        "task 3 waiting for odometry before retreating from "
-                        "the post-release push",
-                        arm_command=self._held_arm_command,
-                    )
-                self._motion_started = True
-            done, command, detail = self._transfer.tick_retreat(context.odometry)
-            if not done:
+                    center_x = point[0]
+                    self._task3_push_last_seen_s = now_s
+
+            if center_x is None:
+                self._task3_push_confirm_count = 0
                 return StageResult.running(
-                    "task 3 retreating after the post-release push; "
-                    f"{detail}",
-                    base_command=command,
+                    f"Task3 visual push paused for fresh {target_color!r} frame",
+                    base_command=(0.0, 0.0),
                     arm_command=self._held_arm_command,
                 )
-            self._phase = "task3_retract_arms"
-            self._motion_started = False
-            self._transfer.reset()
-            self._arm_retract.reset()
 
-        if self._phase == "task3_retract_arms":
-            if not self._arm_retract.planned:
-                try:
-                    self._held_arm_command = self._arm_retract.plan(
-                        self._held_arm_command,
-                        context.joint_states,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        "task 3 post-release arm retraction planning failed: "
-                        f"{exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._arm_retract.update(
-                    context.now_s,
-                    context.joint_states,
+            if self._task3_push_target_x is None:
+                # World X decreases while advancing into the shelf.  Never
+                # command deeper than the validated final-centre bound, and
+                # never ask for more than the small desired correction from
+                # the first post-release RGB-D observation.
+                self._task3_push_target_x = max(
+                    self.TASK3_FINAL_CENTER_X,
+                    center_x - self.TASK3_PUSH_DESIRED_M,
                 )
-            except (PregraspInputError, PregraspPlanningError) as exc:
-                return StageResult.blocked(
-                    "task 3 post-release arm retraction control failed: "
-                    f"{exc}",
+            target_x = self._task3_push_target_x
+            error_x = center_x - target_x
+            if abs(error_x) <= self.TASK3_PUSH_X_TOLERANCE_M:
+                self._task3_push_confirm_count += 1
+            else:
+                self._task3_push_confirm_count = 0
+            if self._task3_push_confirm_count >= 3:
+                return StageResult.succeeded(
+                    f"Task3 RGB-D push confirmed final centre x={center_x:.3f}; "
+                    f"short-push target={target_x:.3f}",
                     arm_command=self._held_arm_command,
                 )
-            self._held_arm_command = command
-            if not reached:
-                return StageResult.running(
-                    "task 3 retracting both arms after the post-release push; "
-                    f"{detail}",
-                    arm_command=command,
-                )
-            self._phase = "task3_raise_spine"
-            self._phase_started_s = float(context.now_s)
-            self._motion_started = False
-            self._slide_hold.reset()
-            self._slide_start = None
-            # The object is already released, so this local spine phase must
-            # not apply any delta to the stale held-object transform.
-            self._slide_applied = True
-
-        if self._phase == "task3_raise_spine":
-            if not self._slide_hold.planned:
-                try:
-                    self._held_arm_command = self._slide_hold.plan(
-                        self._held_arm_command,
-                        # MMK2's slide coordinate increases downward.  The
-                        # physical highest transport pose is therefore the
-                        # minimum joint value, not ``SPINE_MAX``.
-                        SPINE_MIN,
-                        context.joint_states,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        "task 3 could not plan maximum spine height after arm "
-                        f"retraction: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._slide_hold.update(
-                    context.now_s,
-                    context.joint_states,
-                )
-            except (PregraspInputError, PregraspPlanningError) as exc:
-                return StageResult.blocked(
-                    "task 3 maximum-height spine control failed after arm "
-                    f"retraction: {exc}",
+            if error_x < -self.TASK3_PUSH_OVERSHOOT_M:
+                return StageResult.succeeded(
+                    f"Task3 overshoot protection stopped push at x={center_x:.3f}",
                     arm_command=self._held_arm_command,
                 )
-            self._held_arm_command = command
-            if not reached:
-                raise_elapsed = max(
-                    0.0,
-                    float(context.now_s) - self._phase_started_s,
-                )
-                if raise_elapsed >= self.TASK3_RAISE_SPINE_TIMEOUT_S:
-                    return StageResult.blocked(
-                        "task 3 maximum-height spine motion timed out after "
-                        f"{raise_elapsed:.1f}s: {detail}",
-                        arm_command=command,
-                    )
-                return StageResult.running(
-                    "task 3 raising the retracted arms to maximum transport "
-                    f"height; {detail}",
-                    arm_command=command,
-                )
-            self._phase = "navigate_end"
-            self._motion_started = False
-            self._transfer.reset()
 
-        if self._phase == "navigate_end":
-            return super()._tick_return_to_end(context)
+            speed = min(
+                self.TASK3_PUSH_MAX_SPEED_MPS,
+                self.TASK3_PUSH_BASE_SPEED_MPS + 0.010 * int(elapsed / 1.5),
+            )
+            return StageResult.running(
+                f"Task3 RGB-D centre push; x={center_x:.3f}, "
+                f"short-push target={target_x:.3f}, "
+                f"traveled={traveled:.3f}m",
+                base_command=(speed, 0.0),
+                arm_command=self._held_arm_command,
+            )
 
         return StageResult.blocked(
-            f"task 3 invalid post-release return phase {self._phase!r}",
+            f"Task3 invalid placement phase {self._task3_place_phase!r}",
             arm_command=self._held_arm_command,
         )
-
-
-def _wrap_task3_angle(angle: float) -> float:
-    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _task3_lift_metrics(
-    detail: str,
-) -> tuple[float, float, float, float, float] | None:
-    """Extract the shared lift controller's measured completion metrics."""
-
-    values: list[float] = []
-    for name in ("slide_err", "left_err", "right_err", "cmd_err", "max_vel"):
-        match = re.search(rf"(?:^|[ ,]){name}=([+-]?(?:\d+(?:\.\d*)?|\.\d+))", detail)
-        if match is None:
-            return None
-        values.append(float(match.group(1)))
-    return tuple(values)
-
-
-__all__ = ["Task3Executor", "Task3IntegratedExecutor"]

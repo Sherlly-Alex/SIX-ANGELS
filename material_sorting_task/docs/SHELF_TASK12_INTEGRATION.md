@@ -41,19 +41,12 @@ Implemented flow:
    navigation and layer selection. At the
    farther arm-staging stand it opens/lowers both arms, waits for the camera to
    settle, and locks the target box's complete 3-D geometric center from fresh
-   time-separated RGB-D detections. The client clears that color's rolling
-   detector history when task 2 enters arm staging and uses the RGB-D frame
-   timestamp, so old task-1/early-navigation frames cannot be mixed into the
-   final shelf view. A component-median/inlier gate rejects edge and
-   arm-occlusion frames; visible-surface `bbox_depth_center` fallbacks are
-   rejected for this final lock and counted in the diagnostic status. While
-   still outside the shelf, the base first
+   time-separated RGB-D detections. A component-median/inlier gate rejects edge
+   and arm-occlusion frames. While still outside the shelf, the base first
    aligns laterally with that detected object center and then advances straight
    until the detected center reaches the verified 0.75 m base-frame reach.
    Shelf pregrasp uses a narrower symmetric 0.18 m half-width; contact width is
    still derived from the box orientation. It then performs the shelf grasp and
-   After the straight final approach, it repeats the shelf-row/yaw check once
-   to remove odometry drift before the final arm pregrasp. It then performs the
    bounded 0.08 m lift, retreats the held shelf box farther clear of the shelf,
    and raises the spine to the maximum transport height while stationary. The
    successful shelf grasp is then kept completely unchanged: there is no
@@ -61,10 +54,7 @@ Implemented flow:
    still facing west, the base reverses east along the shelf aisle to the table
    column derived from the saved task-1 origin, turns only west-to-north there,
    and advances straight to the south table entry before final placement. This
-   ordering keeps the extended payload away from the east wall. The task-2
-   final robot-frame lateral gate is 0.02 m; its shelf-row alignment uses an
-   8 mm world-row tolerance and a 0.015 rad final-yaw tolerance, with one
-   bounded re-alignment retry before failing closed. Every straight
+   ordering keeps the extended payload away from the east wall. Every straight
    translation and in-place turn is rejected before motion if its swept
    body/arm/box envelope intersects the shelf or perimeter walls, and the same
    envelope is predicted over every live velocity command. The table-entry and
