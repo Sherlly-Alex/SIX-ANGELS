@@ -283,8 +283,20 @@ class OpenPregraspController:
 
     ARM_POSITION_TOL = FEEDBACK_POS_TOL
 
-    def __init__(self, kdl: MMK2Kdl | None = None) -> None:
+    def __init__(
+        self,
+        kdl: MMK2Kdl | None = None,
+        *,
+        command_rate_per_s: float | None = None,
+    ) -> None:
         self._kdl = kdl or MMK2Kdl()
+        self._command_rate_per_s = float(
+            COMMAND_RATE_PER_S
+            if command_rate_per_s is None
+            else command_rate_per_s
+        )
+        if not math.isfinite(self._command_rate_per_s) or self._command_rate_per_s <= 0.0:
+            raise ValueError("command_rate_per_s must be finite and positive")
         self._target_vector: np.ndarray | None = None
         self._action_vector: np.ndarray | None = None
         self._last_update_s: float | None = None
@@ -298,6 +310,10 @@ class OpenPregraspController:
     @property
     def target_base(self) -> tuple[float, float, float] | None:
         return self._target_base
+
+    @property
+    def command_rate_per_s(self) -> float:
+        return self._command_rate_per_s
 
     def reset(self) -> None:
         self._target_vector = None
@@ -445,7 +461,7 @@ class OpenPregraspController:
         diff = np.abs(self._target_vector - self._action_vector)
         ratios = diff / (float(np.max(diff)) + 1e-6)
         ratios[0] *= SLIDE_COMMAND_RATIO
-        steps = ratios * COMMAND_RATE_PER_S * dt
+        steps = ratios * self._command_rate_per_s * dt
         self._action_vector += np.sign(
             self._target_vector - self._action_vector
         ) * np.minimum(diff, steps)

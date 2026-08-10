@@ -36,6 +36,15 @@ class DesktopGraspIntegrationTests(unittest.TestCase):
         self.assertIn("depth_gate = positive_depth", source)
         self.assertIn("mask_cloud_cuboid_relaxed", source)
 
+    def test_yellow_rgbd_center_compares_strict_and_relaxed_masks(self) -> None:
+        source = (TASK / "perception" / "box_detect.py").read_text(encoding="utf-8")
+
+        self.assertIn("strict_candidate = component_candidate(relaxed=False)", source)
+        self.assertIn("relaxed_candidate = component_candidate(relaxed=True)", source)
+        self.assertIn("RGBD_MASK_MIN_WIDTH_COVERAGE", source)
+        self.assertIn("RGBD_MASK_MAX_CENTER_OFFSET_RATIO", source)
+        self.assertIn("RGBD_MASK_MAX_LEFT_RIGHT_IMBALANCE", source)
+
     def test_orientation_from_box_dimensions(self) -> None:
         self.assertEqual(infer_box_orientation(0.24, 0.16, 0.0, 0.0), "yaw0")
         self.assertEqual(infer_box_orientation(0.16, 0.24, 0.0, 0.0), "yaw90")

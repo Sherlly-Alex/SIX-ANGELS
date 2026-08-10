@@ -66,6 +66,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     SHELF_SCAN_PITCH_DWELL_S = 3.0
     PLACE_TIMEOUT_S = 25.0
     ARM_RETRACT_TIMEOUT_S = 15.0
+    RELEASE_SUPPORT_SETTLE_S = 0.40
+    RELEASE_STAGE_SETTLE_S = 0.25
+    RELEASE_UNLOAD_M = 0.006
+    RELEASE_MIDDLE_HALF_WIDTH_M = 0.14
+    RELEASE_FINAL_HALF_WIDTH_M = 0.18
+    RELEASE_COMMAND_RATE_PER_S = 0.30
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         super().__init__()
@@ -87,7 +93,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
         )
         self._slide_hold = SlideHoldController()
-        self._release = ReleaseSpreadController()
+        # Task 1 releases inside the shelf and therefore uses a dedicated slow
+        # rate.  Tasks 2/3 retain the existing release speed.
+        self._release = ReleaseSpreadController(
+            command_rate_per_s=self.RELEASE_COMMAND_RATE_PER_S
+        )
         self._arm_retract = ArmRetractController()
         self._shelf_state: ShelfState | None = None
         self._held_center_base: tuple[float, float, float] | None = None
@@ -102,6 +112,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         # Keep a phase-local deadline so a slow lowering motion cannot consume
         # the whole release timeout before the grippers even start to open.
         self._phase_started_s = 0.0
+        self._release_half_widths: tuple[float, ...] = ()
+        self._release_stage_index = 0
+        self._release_settle_started_s: float | None = None
         self._legacy_shelf_route_used = False
 
     def configure_instructions(self, instructions: Sequence[Mapping]) -> None:
@@ -141,6 +154,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._slide_start = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._release_half_widths = ()
+        self._release_stage_index = 0
+        self._release_settle_started_s = None
         self._legacy_shelf_route_used = False
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
@@ -173,6 +189,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             self._release.reset()
             self._phase = "lower"
             self._phase_started_s = float(context.now_s)
+            self._release_half_widths = ()
+            self._release_stage_index = 0
+            self._release_settle_started_s = None
         elif stage is TaskStage.VERIFY_PLACE:
             self._phase = "verify"
         elif stage is TaskStage.RETURN_TO_END:
@@ -409,19 +428,28 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-        if self._phase == "approach_shelf_scan_fallback":
+        if self._phase in {
+            "approach_shelf_scan_fallback",
+            # Compatibility alias used by task 3 when it delegates its final
+            # safe shelf approach to this inherited helper.
+            "approach_shelf_scan",
+        }:
             assert self._shelf_scan_stand is not None
+            legacy_fallback = self._phase == "approach_shelf_scan_fallback"
             done, running = self._tick_straight_advance(
                 context,
                 self._shelf_scan_stand,
-                action="approaching the shelf pre-place stand by legacy fallback",
+                action=(
+                    "approaching the shelf pre-place stand by legacy fallback"
+                    if legacy_fallback
+                    else "approaching the shelf scan stand"
+                ),
             )
             if running is not None:
                 return running
             if done:
                 return StageResult.succeeded(
-                    "task 1 reached the safe shelf pre-place stand through the "
-                    "legacy fallback with the "
+                    "task 1 reached the safe shelf pre-place stand with the "
                     f"carried center still {self.SHELF_SCAN_CENTER_CLEARANCE_M:.2f} m "
                     "in front of the shelf",
                     arm_command=self._held_arm_command,
@@ -712,20 +740,75 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             result = self._tick_slide(context, "lowering box onto shelf board")
             if result is not None:
                 return result
-            self._phase = "release"
+            self._phase = "release_support_settle"
             # Start a fresh deadline for the release motion.  The lowering
             # controller has its own bounded timer and may legitimately take
             # most of the placement stage budget in simulation.
             self._phase_started_s = float(context.now_s)
 
+        if self._phase == "release_support_settle":
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed < self.RELEASE_SUPPORT_SETTLE_S:
+                return StageResult.running(
+                    "task 1 holding the placed box on the shelf before "
+                    f"unloading bilateral preload ({elapsed:.2f}/"
+                    f"{self.RELEASE_SUPPORT_SETTLE_S:.2f}s)",
+                    arm_command=self._held_arm_command,
+                )
+            try:
+                held_half_width = float(self._contact.half_width)
+            except (TypeError, ValueError):
+                return StageResult.blocked(
+                    "task 1 lost the held half-width before shelf release",
+                    arm_command=self._held_arm_command,
+                )
+            if not math.isfinite(held_half_width) or held_half_width <= 0.0:
+                return StageResult.blocked(
+                    "task 1 held half-width is invalid before shelf release",
+                    arm_command=self._held_arm_command,
+                )
+            candidates = (
+                min(
+                    held_half_width + self.RELEASE_UNLOAD_M,
+                    self.RELEASE_FINAL_HALF_WIDTH_M,
+                ),
+                self.RELEASE_MIDDLE_HALF_WIDTH_M,
+                self.RELEASE_FINAL_HALF_WIDTH_M,
+            )
+            widths: list[float] = []
+            previous = held_half_width
+            for width in candidates:
+                width = float(width)
+                if width > previous + 1e-6:
+                    widths.append(width)
+                    previous = width
+            if not widths:
+                return StageResult.blocked(
+                    "task 1 shelf release has no outward half-width waypoint",
+                    arm_command=self._held_arm_command,
+                )
+            self._release_half_widths = tuple(widths)
+            self._release_stage_index = 0
+            self._release_settle_started_s = None
+            self._release.reset()
+            self._phase = "release"
+            self._phase_started_s = float(context.now_s)
+
         if self._phase == "release":
+            if self._release_stage_index >= len(self._release_half_widths):
+                return StageResult.succeeded(
+                    "task 1 gently unloaded preload and opened both arms on "
+                    "the empty shelf layer",
+                    arm_command=self._held_arm_command,
+                )
+            target_half_width = self._release_half_widths[self._release_stage_index]
             if not self._release.planned:
                 try:
-                    self._held_arm_command = self._release.plan(
-                        self._place_world,
-                        context.odometry,
+                    self._held_arm_command = self._release.plan_from_held(
+                        self._held_arm_command,
+                        self._held_center_base,
                         context.joint_states,
-                        half_width=0.18,
+                        half_width=target_half_width,
                     )
                 except (PregraspInputError, PregraspPlanningError) as exc:
                     return StageResult.blocked(
@@ -743,8 +826,34 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
             self._held_arm_command = command
             if reached:
-                return StageResult.succeeded(
-                    "task 1 opened both arms and released the box on the empty shelf layer",
+                if self._release_settle_started_s is None:
+                    self._release_settle_started_s = float(context.now_s)
+                settle_elapsed = max(
+                    0.0,
+                    float(context.now_s) - self._release_settle_started_s,
+                )
+                if settle_elapsed < self.RELEASE_STAGE_SETTLE_S:
+                    return StageResult.running(
+                        "task 1 holding gentle shelf-release waypoint "
+                        f"{self._release_stage_index + 1}/"
+                        f"{len(self._release_half_widths)} at half_width="
+                        f"{target_half_width:.3f} m ({settle_elapsed:.2f}/"
+                        f"{self.RELEASE_STAGE_SETTLE_S:.2f}s)",
+                        arm_command=command,
+                    )
+                self._release_stage_index += 1
+                self._release_settle_started_s = None
+                self._release.reset()
+                if self._release_stage_index >= len(self._release_half_widths):
+                    return StageResult.succeeded(
+                        "task 1 gently unloaded preload and opened both arms "
+                        "on the empty shelf layer",
+                        arm_command=command,
+                    )
+                return StageResult.running(
+                    "task 1 advancing to the next gentle shelf-release "
+                    f"waypoint ({self._release_stage_index + 1}/"
+                    f"{len(self._release_half_widths)})",
                     arm_command=command,
                 )
             if float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
@@ -753,7 +862,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=command,
                 )
             return StageResult.running(
-                f"task 1 spreading both arms to release on shelf; {detail}",
+                "task 1 gently spreading both arms to release on shelf; "
+                f"stage={self._release_stage_index + 1}/"
+                f"{len(self._release_half_widths)}, half_width="
+                f"{target_half_width:.3f} m; {detail}",
                 arm_command=command,
             )
         return StageResult.blocked(

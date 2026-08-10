@@ -274,6 +274,22 @@ class SlideHoldControllerTests(unittest.TestCase):
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):
+    def test_task1_uses_slow_staged_shelf_release(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+
+        self.assertAlmostEqual(executor.RELEASE_UNLOAD_M, 0.006)
+        self.assertAlmostEqual(executor.RELEASE_MIDDLE_HALF_WIDTH_M, 0.14)
+        self.assertAlmostEqual(executor.RELEASE_FINAL_HALF_WIDTH_M, 0.18)
+        self.assertLess(
+            executor._release.command_rate_per_s,
+            1.20,
+        )
+
+    def test_task2_does_not_lift_without_bilateral_alignment(self) -> None:
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+
+        self.assertFalse(executor.ALLOW_SETTLED_MAX_SEARCH)
+
     def test_task1_records_stable_shelf_state_during_transport_updates(self) -> None:
         memory = CompetitionTaskMemory()
         memory.record_task1_origin((-0.22, 2.20, 0.84), "yellow")
@@ -428,6 +444,33 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertEqual(executor._phase, "approach_place_final")
         self.assertIn("entering the recognized empty shelf layer", result.message)
+
+    def test_task1_transport_keeps_task3_approach_phase_compatibility(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._shelf_scan_stand = (-1.015, 0.808)
+        executor._phase = "approach_shelf_scan"
+
+        result = executor._tick_transport(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 3, "target_color": "pink"},
+                task_index=3,
+                attempt=1,
+                odometry=_odom(-1.015, 0.808, executor.SHELF_YAW),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.SUCCEEDED)
+        self.assertNotIn("invalid transport phase", result.message)
 
     def test_task1_alignment_preserves_transport_shelf_state(self) -> None:
         memory = CompetitionTaskMemory()

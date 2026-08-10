@@ -54,6 +54,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     task_id = 2
     name = "task2_integrated_shelf_to_original_table_point"
     SOURCE_ORIENTATION = "yaw90"
+    # A shelf pick must not be promoted to lift merely because the maximum
+    # four-millimetre inward search settled.  In particular, a biased yellow
+    # mask can put both hands beside the box while joint feedback still looks
+    # stable.  Require the inherited bilateral compliant alignment path.
+    ALLOW_SETTLED_MAX_SEARCH = False
 
     # First stop well outside the shelf, lock the RGB-D object centre, and
     # advance straight with the arms retracted.  The base turns and the arms

@@ -78,6 +78,9 @@ RGBD_RELAXED_COLOR_HSV = {
     "brown": [((3, 15, 25), (30, 230, 230))],
 }
 RGBD_MASK_MIN_POINTS = 30
+RGBD_MASK_MIN_WIDTH_COVERAGE = 0.55
+RGBD_MASK_MAX_CENTER_OFFSET_RATIO = 0.12
+RGBD_MASK_MAX_LEFT_RIGHT_IMBALANCE = 0.35
 RGBD_DEPTH_GATE_MIN_M = 0.035
 RGBD_DEPTH_GATE_SCALE = 0.045
 RGBD_DEPTH_GATE_MAX_M = 0.080
@@ -332,27 +335,91 @@ class BoxDetectNode(Node):
                 np.abs(depth_roi * 1e-3 - center_depth_m) <= depth_tolerance_m
             )
 
-        # Prefer the original high-saturation mask.  If the rendered box is
-        # pale, retry with the class-specific relaxed mask while retaining the
-        # centre-depth gate that separates the foreground box from the shelf.
-        mask_mode = "strict"
-        mask = self.color_mask(rgb_roi, det["class"])
-        valid_mask = ((mask > 0) & depth_gate).astype(np.uint8)
-        if int(np.count_nonzero(valid_mask)) < RGBD_MASK_MIN_POINTS:
-            mask_mode = "relaxed"
-            mask = self.color_mask(rgb_roi, det["class"], relaxed=True)
-            valid_mask = ((mask > 0) & depth_gate).astype(np.uint8)
-        if int(np.count_nonzero(valid_mask)) < RGBD_MASK_MIN_POINTS:
-            return None, u, v, int(np.count_nonzero(valid_mask)), "few_mask_depth"
+        # Evaluate both masks.  A textured yellow face can leave more than the
+        # old 30-pixel minimum in only one bright patch, so accepting the
+        # strict mask by point count alone produces a stable but laterally
+        # biased grasp centre.  Depth gating still prevents the relaxed mask
+        # from absorbing the shelf behind the target.
+        detector_center_x = float(u - x0)
 
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(valid_mask, connectivity=8)
-        if n <= 1:
-            return None, u, v, 0, "no_component"
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        comp_id = int(np.argmax(areas)) + 1
-        comp = labels == comp_id
-        if int(np.count_nonzero(comp)) < RGBD_MASK_MIN_POINTS:
-            return None, u, v, int(np.count_nonzero(comp)), "small_component"
+        def component_candidate(*, relaxed: bool):
+            mask = self.color_mask(
+                rgb_roi,
+                det["class"],
+                relaxed=relaxed,
+            )
+            valid = ((mask > 0) & depth_gate).astype(np.uint8)
+            if int(np.count_nonzero(valid)) < RGBD_MASK_MIN_POINTS:
+                return None
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                valid,
+                connectivity=8,
+            )
+            if n <= 1:
+                return None
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            comp_id = int(np.argmax(areas)) + 1
+            comp = labels == comp_id
+            area = int(np.count_nonzero(comp))
+            if area < RGBD_MASK_MIN_POINTS:
+                return None
+            ys_comp, xs_comp = np.nonzero(comp)
+            width = float(np.max(xs_comp) - np.min(xs_comp) + 1)
+            width_coverage = width / max(float(bw), 1.0)
+            component_center_x = 0.5 * (
+                float(np.min(xs_comp)) + float(np.max(xs_comp))
+            )
+            center_offset_ratio = abs(
+                component_center_x - detector_center_x
+            ) / max(float(bw), 1.0)
+            left_count = int(np.count_nonzero(xs_comp < detector_center_x))
+            right_count = int(np.count_nonzero(xs_comp > detector_center_x))
+            left_right_imbalance = abs(left_count - right_count) / max(
+                float(left_count + right_count),
+                1.0,
+            )
+            return {
+                "comp": comp,
+                "area": area,
+                "width_coverage": width_coverage,
+                "center_offset_ratio": center_offset_ratio,
+                "left_right_imbalance": left_right_imbalance,
+                "mode": "relaxed" if relaxed else "strict",
+            }
+
+        strict_candidate = component_candidate(relaxed=False)
+        relaxed_candidate = component_candidate(relaxed=True)
+        candidate = strict_candidate
+        if candidate is None:
+            candidate = relaxed_candidate
+        elif str(det["class"]).strip().lower() == "yellow" and relaxed_candidate is not None:
+            strict_is_partial = (
+                strict_candidate["width_coverage"]
+                < RGBD_MASK_MIN_WIDTH_COVERAGE
+                or strict_candidate["center_offset_ratio"]
+                > RGBD_MASK_MAX_CENTER_OFFSET_RATIO
+                or strict_candidate["left_right_imbalance"]
+                > RGBD_MASK_MAX_LEFT_RIGHT_IMBALANCE
+            )
+            relaxed_is_balanced = (
+                relaxed_candidate["center_offset_ratio"]
+                <= RGBD_MASK_MAX_CENTER_OFFSET_RATIO + 0.06
+                and relaxed_candidate["left_right_imbalance"]
+                <= RGBD_MASK_MAX_LEFT_RIGHT_IMBALANCE + 0.15
+            )
+            relaxed_adds_face_coverage = (
+                relaxed_candidate["width_coverage"]
+                >= strict_candidate["width_coverage"] + 0.08
+            )
+            if relaxed_is_balanced and (
+                strict_is_partial or relaxed_adds_face_coverage
+            ):
+                candidate = relaxed_candidate
+        if candidate is None:
+            return None, u, v, 0, "few_mask_depth"
+
+        comp = candidate["comp"]
+        mask_mode = candidate["mode"]
 
         ys_rel, xs_rel = np.nonzero(comp)
         zs = depth_roi[ys_rel, xs_rel] * 1e-3
