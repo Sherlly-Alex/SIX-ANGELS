@@ -81,8 +81,8 @@ class TransferMotion:
     LATERAL_YAW_TOLERANCE_RAD = 0.06
     LATERAL_TIMEOUT_S = 30.0
 
-    def __init__(self) -> None:
-        limits = SpeedLimits(
+    def __init__(self, speed_limits: SpeedLimits | None = None) -> None:
+        limits = speed_limits or SpeedLimits(
             max_linear=0.18,
             max_angular=0.55,
             max_linear_accel=0.30,

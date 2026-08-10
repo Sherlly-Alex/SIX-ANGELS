@@ -47,11 +47,12 @@ class CompetitionTaskMemory:
         )
 
     def clear_shelf_state(self) -> None:
-        """Discard a provisional shelf interpretation before a fresh scan.
+        """Discard the previous scene before task 1 starts a fresh epoch.
 
-        The task-1 transport path can expose a partial shelf view.  That is
-        useful for warm-up, but it must never become the state handed to the
-        later formal tasks before the dedicated shelf scan has stabilised.
+        The new epoch spans retreat, direct shelf navigation and any
+        conditional stationary scan.  A complete stable state may therefore
+        be recorded during transport; arriving at the pre-place stand must not
+        clear it again.
         """
 
         self.shelf_state = None

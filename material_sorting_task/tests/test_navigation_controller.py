@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 
 from navigation.navigation_controller import NavigationController
+from navigation.local_goal_selector import select_local_goal
 from navigation.navigation_types import (
     NavigationGoal,
     NavigationSegment,
@@ -37,6 +38,20 @@ def material_grid_with_cached_distance_map():
 
 
 class NavigationControllerTests(unittest.TestCase):
+    def test_long_segment_lookahead_starts_from_robot_projection(self) -> None:
+        goal = select_local_goal(
+            4.0,
+            0.0,
+            ((0.0, 0.0), (10.0, 0.0)),
+            lookahead_distance=1.0,
+            closest_index=0,
+        )
+
+        # Walking from waypoint 0 would return x=1 behind the robot.  The
+        # projected implementation must put the carrot one metre ahead.
+        self.assertAlmostEqual(goal[0], 5.0, places=6)
+        self.assertAlmostEqual(goal[1], 0.0, places=6)
+
     def test_reaches_randomized_table_pick_stands_without_static_estop(self) -> None:
         # y=1.67 covers the deeper randomized target that previously put the
         # 0.56 m stand inside the table's 0.20 m emergency-clearance band.

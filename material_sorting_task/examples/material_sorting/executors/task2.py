@@ -1587,10 +1587,24 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
         self._held_arm_command = command
         if not reached:
-            elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-            if elapsed >= self.PLACE_TIMEOUT_S:
+            # TRANSPORT contains a shelf retreat before the maximum-height
+            # slide motion begins.  Measuring this lift from the stage start
+            # incorrectly charges the retreat time against the slide, which
+            # can stop an otherwise settled lift just before its 0.5 s
+            # feedback-stability window completes.  Give the transport slide
+            # its own phase-local deadline; retain the existing stage-wide
+            # placement deadline for all non-transport callers.
+            if self.active_stage is TaskStage.TRANSPORT:
+                started_s = self._phase_started_s
+                timeout_s = self.TRANSPORT_SEGMENT_TIMEOUT_S
+            else:
+                started_s = self._stage_started_s
+                timeout_s = self.PLACE_TIMEOUT_S
+            elapsed = max(0.0, float(context.now_s) - started_s)
+            if elapsed >= timeout_s:
                 return StageResult.blocked(
-                    f"task 2 {action} timed out after {elapsed:.1f}s: {detail}",
+                    f"task 2 {action} timed out after {elapsed:.1f}s "
+                    f"(limit={timeout_s:.1f}s): {detail}",
                     arm_command=command,
                 )
             return StageResult.running(

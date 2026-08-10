@@ -274,6 +274,161 @@ class SlideHoldControllerTests(unittest.TestCase):
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):
+    def test_task1_records_stable_shelf_state_during_transport_updates(self) -> None:
+        memory = CompetitionTaskMemory()
+        memory.record_task1_origin((-0.22, 2.20, 0.84), "yellow")
+        executor = Task1IntegratedExecutor(memory)
+        executor.configure_instructions(
+            (
+                {"task": 1, "target_color": "yellow"},
+                {"task": 2, "target_color": "brown"},
+            )
+        )
+
+        state = None
+        for stamp in (1.0, 2.0, 3.0):
+            state = executor._update_shelf_state(
+                ExecutionContext(
+                    now_s=stamp,
+                    instruction={"task": 1, "target_color": "yellow"},
+                    task_index=1,
+                    attempt=1,
+                    target_observations={
+                        "brown": observation(
+                            "brown", (-2.55, 0.81, 0.837), stamp
+                        ),
+                        "packaging_box": observation(
+                            "packaging_box", (-2.54, 0.78, 0.530), stamp
+                        ),
+                    },
+                )
+            )
+
+        self.assertIsNotNone(state)
+        self.assertIs(memory.shelf_state, state)
+        self.assertEqual(
+            memory.require_task2_target_center(),
+            (-2.55, 0.81, 0.837),
+        )
+        self.assertEqual(
+            memory.require_task3_packaging_box_center(),
+            (-2.54, 0.78, 0.530),
+        )
+
+    def test_task1_direct_route_uses_project_geometry_not_legacy_turn_point(self) -> None:
+        memory = CompetitionTaskMemory()
+        memory.record_task1_origin((-0.22, 2.20, 0.84), "yellow")
+        executor = Task1IntegratedExecutor(memory)
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._phase = "navigate_shelf_direct"
+        fake = _DirectRouteTransfer()
+        executor._direct_shelf_transfer = fake
+
+        result = executor._tick_transport(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=_odom(-0.20, 1.20, math.pi / 2.0),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.SUCCEEDED)
+        assert fake.goal is not None
+        self.assertNotAlmostEqual(fake.goal.x, executor.SHELF_TURN_X, places=3)
+        self.assertAlmostEqual(
+            executor._shelf_observation_target_y(),
+            executor._shelf_tracker.geometry.shelf_xy[1],
+            places=6,
+        )
+        self.assertEqual(
+            fake.goal.source_tag,
+            "integrated_task1_direct_shelf_preplace",
+        )
+
+    def test_task1_direct_plan_failure_uses_legacy_route_once(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._phase = "navigate_shelf_direct"
+        executor._direct_shelf_transfer = _FailingDirectRouteTransfer()
+        legacy = _RunningLegacyRouteTransfer()
+        executor._transfer = legacy
+
+        result = executor._tick_transport(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=_odom(-0.20, 1.20, math.pi / 2.0),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertTrue(executor._legacy_shelf_route_used)
+        self.assertEqual(executor._phase, "navigate_shelf_turn_fallback")
+        assert legacy.goal is not None
+        self.assertEqual(
+            legacy.goal.source_tag,
+            "integrated_task1_legacy_shelf_turn_fallback",
+        )
+
+    def test_task1_direct_arrival_skips_three_step_lateral_alignment(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._place_world = (-2.63, 0.778, 0.84)
+        executor._shelf_scan_stand = shelf_observation_stand(
+            executor._held_center_base,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=0.778,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        executor._phase = "check_place_alignment"
+
+        result = executor._tick_align_for_place(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=_odom(
+                    executor._shelf_scan_stand[0],
+                    executor._shelf_scan_stand[1],
+                    executor.SHELF_YAW,
+                ),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "approach_place_final")
+        self.assertIn("entering the recognized empty shelf layer", result.message)
+
     def test_task1_alignment_preserves_transport_shelf_state(self) -> None:
         memory = CompetitionTaskMemory()
         executor = Task1IntegratedExecutor(memory)
@@ -604,10 +759,10 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
             )
         )
         status, _command, detail = motion.tick_lateral_alignment(
-            _odom(-1.30, 0.85, math.pi), 20.1
+            _odom(-1.30, 0.85, math.pi), 30.1
         )
         self.assertEqual(status, NavigationStatus.FAILED)
-        self.assertIn("limit=20.0s", detail)
+        self.assertIn("limit=30.0s", detail)
 
     def test_transfer_lateral_alignment_accepts_task_specific_timeout(self) -> None:
         motion = TransferMotion()
@@ -711,6 +866,11 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         )
         executor.enter_stage(TaskStage.TRANSPORT, context)
         executor._phase = "lift_for_table_transport"
+        # The shelf retreat may already have consumed more than the old
+        # stage-wide 25 s deadline.  The maximum-height slide must use its own
+        # freshly started phase timer instead of failing immediately.
+        executor._stage_started_s = -100.0
+        executor._phase_started_s = context.now_s
         executor._held_arm_command = hold
         executor._held_center_base = (0.82, 0.0, 0.58)
         recording_slide = RecordingSlideHold()
@@ -994,6 +1154,34 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
                 final_check.safe,
                 msg=f"final placement: {final_check.detail}",
             )
+
+
+class _DirectRouteTransfer:
+    def __init__(self) -> None:
+        self.goal = None
+
+    def reset(self) -> None:
+        return None
+
+    def begin_navigation(self, goal, _odometry, **_kwargs) -> bool:
+        self.goal = goal
+        return True
+
+    def tick_navigation(self, _odometry, _now_s):
+        return NavigationStatus.GOAL_REACHED, (0.0, 0.0), "test goal reached"
+
+
+class _FailingDirectRouteTransfer:
+    def reset(self) -> None:
+        return None
+
+    def begin_navigation(self, _goal, _odometry, **_kwargs) -> bool:
+        return False
+
+
+class _RunningLegacyRouteTransfer(_DirectRouteTransfer):
+    def tick_navigation(self, _odometry, _now_s):
+        return NavigationStatus.NAVIGATING, (0.05, 0.10), "legacy running"
 
 
 def _odom(x: float, y: float, yaw: float):
