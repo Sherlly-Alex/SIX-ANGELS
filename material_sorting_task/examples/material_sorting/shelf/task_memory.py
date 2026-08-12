@@ -14,7 +14,7 @@ class CompetitionTaskMemory:
     Executors receive the same instance from ``build_task_executors``.  The
     top-level controller may reset an individual executor between attempts,
     but a successful task-1 origin and shelf scan must remain available to
-    task 2.
+    tasks 2 and 3.
     """
 
     task1_origin_world: tuple[float, float, float] | None = None
@@ -45,6 +45,20 @@ class CompetitionTaskMemory:
         self.task3_packaging_box_center_world = (
             state.task3_packaging_box_center_world
         )
+
+    def clear_shelf_state(self) -> None:
+        """Discard the previous scene before task 1 starts a fresh epoch.
+
+        The new epoch spans retreat, direct shelf navigation and any
+        conditional stationary scan.  A complete stable state may therefore
+        be recorded during transport; arriving at the pre-place stand must not
+        clear it again.
+        """
+
+        self.shelf_state = None
+        self.shelf_empty_center_world = None
+        self.task2_target_center_world = None
+        self.task3_packaging_box_center_world = None
 
     def require_task1_origin(self) -> tuple[float, float, float]:
         if self.task1_origin_world is None:

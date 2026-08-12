@@ -34,6 +34,32 @@ def current_instruction(
     return tasks[task_index]
 
 
+def startup_target_color(
+    instructions: Sequence[Mapping[str, Any]] | None,
+    gameinfo: Mapping[str, Any] | None,
+) -> str:
+    """Target colour required for a fresh task-1 start.
+
+    Later tasks first navigate to their calibrated observation stands, where
+    their executors wait for a fresh target.  Requiring those detections before
+    startup deadlocks recovery when the current camera view cannot see them.
+    """
+
+    tasks = sorted_instructions(instructions)
+    if not tasks:
+        return ""
+    ordinal = 1
+    if gameinfo:
+        try:
+            ordinal = int(gameinfo.get("task_ordinal", 1))
+        except (TypeError, ValueError):
+            ordinal = 1
+    index = min(len(tasks) - 1, max(0, ordinal - 1))
+    if index > 0:
+        return ""
+    return str(tasks[index].get("target_color", "")).strip().lower()
+
+
 def is_shelf_pick_task(ins: Mapping[str, Any] | None) -> bool:
     """Task 2 picks from the shelf; tasks 1/3 pick from the table."""
     if ins is None:
@@ -109,6 +135,27 @@ def parse_gameinfo(text: str) -> dict[str, Any]:
     if step:
         out["step"] = step.group(1)
     return out
+
+
+def referee_place_confirmed(
+    gameinfo: Mapping[str, Any] | None,
+    task_index: int,
+) -> bool:
+    """True when the official referee reports ``step=place`` for this task.
+
+    The current official offline Server does not publish a
+    ``/material/place_confirmed`` topic.  Its supported placement event is the
+    ``step=place`` field in ``/referee/gameinfo``.
+    """
+
+    if not gameinfo:
+        return False
+    try:
+        ordinal = int(gameinfo.get("task_ordinal", -1))
+    except (TypeError, ValueError):
+        return False
+    step = str(gameinfo.get("step", "")).strip().lower()
+    return ordinal == int(task_index) + 1 and step == "place"
 
 
 def parse_taskinfo_task_id(text: str) -> int | None:

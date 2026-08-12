@@ -344,9 +344,6 @@ class ReleaseSpreadController(OpenPregraspController):
     """Move the two open grippers away from a placed object."""
 
     MAX_RELATIVE_RELEASE_JOINT_DELTA = 0.75
-    # Shelf release must not kick the box sideways.  The normal pregrasp ramp
-    # is intentionally fast; release uses a much slower, symmetric ramp.
-    COMMAND_RATE_PER_S = 0.20
 
     def plan(
         self,
@@ -451,25 +448,6 @@ class ReleaseSpreadController(OpenPregraspController):
         self._last_update_s = None
         self._stable_since_s = None
         return self.command()
-
-    def update(
-        self,
-        now_s: float,
-        joint_states: Any,
-    ) -> tuple[ArmCommand, bool, str]:
-        command, reached, detail = super().update(now_s, joint_states)
-        if self._action_vector is None or self._target_vector is None:
-            raise PregraspPlanningError("release update lost its planned command")
-        gripper_error = max(
-            abs(float(self._target_vector[9] - self._action_vector[9])),
-            abs(float(self._target_vector[16] - self._action_vector[16])),
-        )
-        if gripper_error > FEEDBACK_POS_TOL:
-            # Do not finish merely because the arms have settled: the gripper
-            # opening is ramped too and must complete before shelf retreat.
-            self._stable_since_s = None
-            reached = False
-        return command, reached, f"{detail}, gripper_err={gripper_error:.3f}"
 
 
 class ArmRetractController:

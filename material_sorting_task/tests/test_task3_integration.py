@@ -109,6 +109,28 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         )
         self.assertEqual(center, (0.25, 1.80, 1.01))
 
+    def test_observation_stand_uses_live_target_when_white_cube_is_occluded(self) -> None:
+        executor = Task3IntegratedExecutor(self._memory())
+        executor._task3_using_observation_stand = True
+
+        center = executor._source_center_from_observation(
+            (-0.52, 2.29, 1.01),
+            first_attempt=True,
+        )
+
+        self.assertEqual(center, (-0.52, 2.29, 1.01))
+
+    def test_missing_far_view_target_uses_white_cube_observation_stand(self) -> None:
+        executor = Task3IntegratedExecutor(self._memory())
+
+        self.assertEqual(executor.TASK3_OBSERVE_STAND, (-0.54, 1.55))
+        self.assertLessEqual(
+            executor.TASK3_TARGET_ABOVE_REFERENCE_Z_RANGE_M[0],
+            0.039,
+        )
+        self.assertGreaterEqual(executor.TASK3_TARGET_TIMEOUT_S, 45.0)
+        self.assertIsNone(executor._task3_observe_reached_s)
+
     def test_transport_keeps_post_lift_arm_pose_without_compaction(self) -> None:
         executor = Task3IntegratedExecutor(self._memory())
         hold = ArmCommand(

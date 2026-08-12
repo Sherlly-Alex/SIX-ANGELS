@@ -24,9 +24,10 @@ from desktop_grasp.pregrasp_core import (
     PregraspPlanningError,
     SlideLiftController,
 )
-from executors.transfer_support import (
-    TransferMotion,
-    navigation_overlay_from_context,
+from navigation.competition_adapter import (
+    format_nav_telemetry,
+    goal_reached_event,
+    refresh_dynamic_overlay,
 )
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import (
@@ -63,55 +64,36 @@ class Task1NavigationExecutor:
     TABLE_SOURCE_SLOTS_M = ((-1.00, 2.20), (-0.18, 2.20))
     TABLE_SOURCE_SNAP_MAX_M = 0.18
     TABLE_SOURCE_ORIENTATION = "yaw0"
-    # Finish the generic route south of the arm stand, then make the last
-    # approach on a fixed north heading.  This prevents a late corner-cut at
-    # the east-wall slot from being handed directly to the dual-arm planner.
-    TABLE_FINAL_APPROACH_M = 0.30
-    TABLE_WALL_CLEARANCE_OFFSET_M = 0.040
-    # Leave generic navigation as soon as it has entered this exact,
-    # north-facing approach lane.  The remaining motion is straight and cannot
-    # cut the east-wall corner while the arms are subsequently opened.
-    TABLE_ROUTE_CAPTURE_Y_MIN_M = 0.95
-    TABLE_ROUTE_CAPTURE_X_TOLERANCE_M = 0.020
-    TABLE_ROUTE_CAPTURE_YAW_TOLERANCE_RAD = 0.040
-    POSITION_TOLERANCE_M = 0.015
-    YAW_TOLERANCE_RAD = 0.010
-    TABLE_HANDOFF_X_TOLERANCE_M = 0.020
-    TABLE_HANDOFF_Y_TOLERANCE_M = 0.008
-    TABLE_HANDOFF_YAW_TOLERANCE_RAD = 0.012
-    TABLE_FINAL_ADVANCE_TOLERANCE_M = 0.005
-    TABLE_PRETURN_POSITION_TOLERANCE_M = 0.030
-    TABLE_PRETURN_YAW_TOLERANCE_RAD = 0.015
+    POSITION_TOLERANCE_M = 0.08
+    YAW_TOLERANCE_RAD = 0.05
     TARGET_MAX_AGE_S = 1.5
     TARGET_WAIT_TIMEOUT_S = 20.0
+    # Gaussian rendering plus YOLO can slow the simulator well below real time.
+    # The route still makes odometry progress, so a 60 s wall-clock deadline
+    # falsely aborts a healthy task-1 approach under load.
+    NAVIGATION_TIMEOUT_S = 180.0
 
     def __init__(self) -> None:
         speed_limits = SpeedLimits(
-            max_linear=0.34,
-            max_angular=0.80,
-            max_linear_accel=0.50,
-            max_angular_accel=1.50,
+            max_linear=0.20,
+            max_angular=0.65,
+            max_linear_accel=0.35,
+            max_angular_accel=1.20,
             emergency_clearance=0.20,
-            max_deceleration=0.70,
+            max_deceleration=0.50,
         )
-        self._nav_grid = build_layered_scene_grid()
+        self._navigation_grid = build_layered_scene_grid()
         self._navigation = NavigationController(
-            self._nav_grid,
+            self._navigation_grid,
             speed_limits,
             pos_tolerance=self.POSITION_TOLERANCE_M,
             yaw_tolerance=self.YAW_TOLERANCE_RAD,
-            lookahead_distance=0.50,
-            terminal_linear_max=0.16,
-            terminal_turn_max=0.70,
-            timeout=75.0,
+            lookahead_distance=0.45,
+            timeout=self.NAVIGATION_TIMEOUT_S,
             emergency_distance=0.20,
-            footprint_mode=FootprintMode.TRANSIT_STOWED,
         )
-        self._table_motion = TransferMotion()
         self.active_stage: TaskStage | None = None
         self._goal: NavigationGoal | None = None
-        self._navigation_goal: NavigationGoal | None = None
-        self._navigation_phase = "idle"
         self._stage_started_s = 0.0
         self._last_tick_s: float | None = None
         self._locked_target_world: tuple[float, float, float] | None = None
@@ -123,11 +105,8 @@ class Task1NavigationExecutor:
 
     def reset(self) -> None:
         self._navigation.reset()
-        self._table_motion.reset()
         self.active_stage = None
         self._goal = None
-        self._navigation_goal = None
-        self._navigation_phase = "idle"
         self._stage_started_s = 0.0
         self._last_tick_s = None
         self._locked_target_world = None
@@ -139,10 +118,7 @@ class Task1NavigationExecutor:
         self._last_tick_s = None
         if stage is TaskStage.NAVIGATE_TO_PICK:
             self._navigation.reset()
-            self._table_motion.reset()
             self._goal = None
-            self._navigation_goal = None
-            self._navigation_phase = "route_to_preturn"
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is not self.active_stage:
@@ -171,16 +147,10 @@ class Task1NavigationExecutor:
             return StageResult.running("task 1 waiting for valid odometry")
         robot_x, robot_y, robot_yaw = pose
 
-        target_color = (
-            str(context.instruction.get("target_color", "")).strip().lower()
-        )
-        if hasattr(self._navigation, "set_footprint_mode"):
-            self._navigation.set_footprint_mode(FootprintMode.TRANSIT_STOWED)
-        self._nav_grid.set_dynamic(navigation_overlay_from_context(
-            context, (robot_x, robot_y), exclude_target=True,
-        ))
-
         if self._goal is None:
+            target_color = (
+                str(context.instruction.get("target_color", "")).strip().lower()
+            )
             observation = context.target_observations.get(target_color)
             if observation is None:
                 return self._wait_for_target(context, target_color)
@@ -216,97 +186,31 @@ class Task1NavigationExecutor:
                 )
             target_x, target_y, _target_z = calibrated_target
 
-            final_y = float(target_y) - self.TABLE_STANDOFF_M
-            stand_x = float(target_x) - self.TABLE_WALL_CLEARANCE_OFFSET_M
             self._goal = NavigationGoal(
-                x=stand_x,
-                y=final_y,
+                x=float(target_x),
+                y=float(target_y) - self.TABLE_STANDOFF_M,
                 yaw=math.pi / 2.0,
                 position_tolerance=self.POSITION_TOLERANCE_M,
                 yaw_tolerance=self.YAW_TOLERANCE_RAD,
                 safety_radius=self.TABLE_STANDOFF_M,
                 segment=NavigationSegment.NAV_TABLE,
-                source_tag="calibrated_table_arm_handoff",
-            )
-            self._navigation_goal = NavigationGoal(
-                x=stand_x,
-                y=final_y - self.TABLE_FINAL_APPROACH_M,
-                yaw=math.pi / 2.0,
-                position_tolerance=self.TABLE_PRETURN_POSITION_TOLERANCE_M,
-                yaw_tolerance=self.TABLE_PRETURN_YAW_TOLERANCE_RAD,
-                safety_radius=self.TABLE_STANDOFF_M + self.TABLE_FINAL_APPROACH_M,
-                segment=NavigationSegment.NAV_TABLE,
-                source_tag="calibrated_table_safe_preturn",
+                source_tag="perception_slot_calibrated",
             )
             self._locked_target_world = calibrated_target
             self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
-            if not self._navigation.set_goal(
-                self._navigation_goal, robot_x, robot_y
-            ):
+            refresh_dynamic_overlay(
+                self._navigation_grid,
+                context.target_observations,
+                exclude_color=target_color,
+                robot_xy=(robot_x, robot_y),
+            )
+            if hasattr(self._navigation, "set_footprint_mode"):
+                self._navigation.set_footprint_mode(FootprintMode.TRANSIT_STOWED)
+            if not self._navigation.set_goal(self._goal, robot_x, robot_y):
                 return StageResult.blocked(
-                    "task 1 could not plan a collision-free path to the safe "
-                    f"table preturn ({self._navigation_goal.x:.2f}, "
-                    f"{self._navigation_goal.y:.2f})"
+                    "task 1 could not plan a collision-free path to "
+                    f"({self._goal.x:.2f}, {self._goal.y:.2f})"
                 )
-            self._navigation_phase = "route_to_preturn"
-
-        assert self._goal is not None
-        assert self._navigation_goal is not None
-        x_error = self._goal.x - robot_x
-        y_error = self._goal.y - robot_y
-        yaw_error = math.atan2(
-            math.sin(self._goal.yaw - robot_yaw),
-            math.cos(self._goal.yaw - robot_yaw),
-        )
-        if (
-            abs(x_error) <= self.TABLE_HANDOFF_X_TOLERANCE_M
-            and abs(y_error) <= self.TABLE_HANDOFF_Y_TOLERANCE_M
-            and abs(yaw_error) <= self.TABLE_HANDOFF_YAW_TOLERANCE_RAD
-        ):
-            return StageResult.succeeded(
-                "task 1 reached the strict table arm-handoff pose; "
-                f"x_err={x_error:+.3f}m, y_err={y_error:+.3f}m, "
-                f"yaw_err={yaw_error:+.3f}rad"
-            )
-
-        if (
-            self._navigation_phase == "route_to_preturn"
-            and robot_y >= self.TABLE_ROUTE_CAPTURE_Y_MIN_M
-            and robot_y < self._goal.y
-            and abs(x_error) <= self.TABLE_ROUTE_CAPTURE_X_TOLERANCE_M
-            and abs(yaw_error) <= self.TABLE_ROUTE_CAPTURE_YAW_TOLERANCE_RAD
-        ):
-            forward_m = self._goal.y - robot_y
-            if self._table_motion.begin_advance(
-                context.odometry,
-                forward_m,
-                heading_yaw=math.pi / 2.0,
-                completion_tolerance_m=self.TABLE_FINAL_ADVANCE_TOLERANCE_M,
-            ):
-                self._navigation.reset()
-                self._navigation_phase = "final_north_approach"
-                return StageResult.running(
-                    "task 1 captured the exact northbound table lane before "
-                    "the corner controller; starting straight arm-stand approach",
-                    base_command=(0.0, 0.0),
-                )
-
-        if self._navigation_phase == "final_north_approach":
-            done, command, detail = self._table_motion.tick_advance(
-                context.odometry
-            )
-            if done:
-                return StageResult.blocked(
-                    "task 1 fixed-heading table approach ended outside the "
-                    "strict arm-handoff gate: "
-                    f"x_err={x_error:+.3f}m, y_err={y_error:+.3f}m, "
-                    f"yaw_err={yaw_error:+.3f}rad"
-                )
-            return StageResult.running(
-                "task 1 advancing due north from the safe preturn to the exact "
-                f"arm stand; {detail}",
-                base_command=command,
-            )
 
         dt = self._control_dt(context.now_s)
         command = self._navigation.update(
@@ -318,42 +222,27 @@ class Task1NavigationExecutor:
         )
         status = self._navigation.status
         if status is NavigationStatus.GOAL_REACHED:
-            forward_m = self._goal.y - robot_y
-            if forward_m <= 0.0:
-                return StageResult.blocked(
-                    "task 1 safe preturn overshot the final table stand: "
-                    f"forward={forward_m:+.3f}m"
-                )
-            if not self._table_motion.begin_advance(
-                context.odometry,
-                forward_m,
-                heading_yaw=math.pi / 2.0,
-                completion_tolerance_m=self.TABLE_FINAL_ADVANCE_TOLERANCE_M,
-            ):
-                return StageResult.running(
-                    "task 1 waiting to start the fixed-heading final table approach"
-                )
-            self._navigation_phase = "final_north_approach"
-            return StageResult.running(
-                "task 1 reached the safe table preturn with arms retracted; "
-                "starting fixed-heading northbound approach",
-                base_command=(0.0, 0.0),
+            return StageResult.succeeded(
+                "task 1 reached the detected table-side pick stand; "
+                f"stopping before arm motion; {goal_reached_event(self._goal)}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
             return StageResult.blocked(
-                f"task 1 preturn navigation stopped safely with status={status.value}"
+                f"task 1 navigation stopped safely with status={status.value}"
             )
+        telemetry = (
+            format_nav_telemetry(self._navigation.telemetry, phase="task1_pick")
+            if hasattr(self._navigation, "telemetry")
+            else "NAV_TEL unavailable_for_test_double"
+        )
         return StageResult.running(
-            "task 1 navigating to safe table preturn "
-            f"({self._navigation_goal.x:.2f}, {self._navigation_goal.y:.2f}); "
-            f"final=({self._goal.x:.2f}, {self._goal.y:.2f}); "
-            f"nav_status={status.value}",
+            f"task 1 navigating to pick stand ({self._goal.x:.2f}, {self._goal.y:.2f}); "
+            f"nav_status={status.value}; {telemetry}",
             base_command=(command.linear_x, command.angular_z),
         )
 
     def cancel(self, reason: str) -> None:
         self._navigation.reset()
-        self._table_motion.reset()
         self.active_stage = None
         self._last_tick_s = None
 
@@ -440,7 +329,6 @@ class Task1PregraspExecutor(Task1NavigationExecutor):
         super().__init__()
         self._pregrasp = pregrasp_controller or OpenPregraspController()
         self._held_arm_command: ArmCommand | None = None
-        self._arm_reference_odometry = None
 
     @property
     def arm_command(self) -> ArmCommand | None:
@@ -450,13 +338,11 @@ class Task1PregraspExecutor(Task1NavigationExecutor):
         super().reset()
         self._pregrasp.reset()
         self._held_arm_command = None
-        self._arm_reference_odometry = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
         if stage is TaskStage.ALIGN_FOR_PICK:
             self._pregrasp.reset()
-            self._arm_reference_odometry = None
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is TaskStage.NAVIGATE_TO_PICK:
@@ -512,18 +398,15 @@ class Task1PregraspExecutor(Task1NavigationExecutor):
         # executor must not replace the open pregrasp with measured joints.
         super().cancel(reason)
         self._pregrasp.reset()
-        self._arm_reference_odometry = None
 
     def _tick_open_pregrasp(self, context: ExecutionContext) -> StageResult:
         if self._locked_target_world is None:
             return StageResult.blocked("task 1 open pregrasp has no locked target")
         if not self._pregrasp.planned:
             try:
-                if self._arm_reference_odometry is None:
-                    self._arm_reference_odometry = context.odometry
                 self._held_arm_command = self._pregrasp.plan(
                     self._locked_target_world,
-                    self._arm_reference_odometry,
+                    context.odometry,
                     context.joint_states,
                 )
             except PregraspInputError as exc:
@@ -686,18 +569,21 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             )
 
         now_s = float(context.now_s)
-        prepare_compliance = getattr(self._contact, "prepare_compliance", None)
+        prepare_compliance = getattr(
+            self._contact, "prepare_compliance", None
+        )
         if not self._contact.planned and callable(prepare_compliance):
             try:
                 ready, compliance_detail = prepare_compliance(
-                    now_s, context.joint_states
+                    now_s,
+                    context.joint_states,
                 )
             except PregraspInputError as exc:
                 return self._wait_for_contact_inputs(context, str(exc))
             if not ready:
                 return StageResult.running(
-                    "task 1 holding open pregrasp while calibrating master "
-                    f"wrist effort; {compliance_detail}",
+                    "task 1 holding the open pregrasp while calibrating wrist "
+                    f"effort; {compliance_detail}",
                     arm_command=self._held_arm_command,
                 )
 
@@ -709,10 +595,13 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         compliance_enabled = bool(
             getattr(self._contact, "compliance_enabled", False)
         )
+
         # Once bilateral contact appears, freeze the last command instead of
         # continuing toward the unconstrained IK solution.  A short stable
         # confirmation rejects single-frame contact noise.  If contact drops,
-        # resume the bounded inward ramp from the same command.
+        # resume the bounded inward ramp from the same command.  The compliant
+        # controller instead keeps ticking so joint 6 can follow the measured
+        # surface angle before it is locked.
         if (
             not compliance_enabled
             and self.REQUIRE_SERVER_CONTACT
@@ -736,12 +625,10 @@ class Task1ContactExecutor(Task1PregraspExecutor):
 
         if not self._contact.planned:
             try:
-                if self._arm_reference_odometry is None:
-                    self._arm_reference_odometry = context.odometry
                 self._held_arm_command = self._contact.plan(
                     self._locked_target_world,
                     self.SOURCE_ORIENTATION,
-                    self._arm_reference_odometry,
+                    context.odometry,
                     context.joint_states,
                 )
             except PregraspInputError as exc:
@@ -780,13 +667,17 @@ class Task1ContactExecutor(Task1PregraspExecutor):
 
         if bool(getattr(self._contact, "hard_effort_limit_exceeded", False)):
             return StageResult.blocked(
-                "task 1 master compliant grasp stopped at wrist effort safety limit",
+                "task 1 compliant grasp stopped because wrist effort reached "
+                "the 6.0 N.m safety limit",
                 arm_command=command,
             )
 
         if compliance_enabled:
             compliant_result = self._tick_compliant_contact_search(
-                context, command, pose_settled, detail
+                context,
+                command,
+                pose_settled,
+                detail,
             )
             if compliant_result is not None:
                 return compliant_result
@@ -805,7 +696,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 command = self._contact.tighten(
                     self._locked_target_world,
                     next_offset,
-                    self._arm_reference_odometry,
+                    context.odometry,
                     context.joint_states,
                 )
             except PregraspInputError as exc:
@@ -871,7 +762,12 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         pose_settled: bool,
         detail: str,
     ) -> StageResult | None:
-        """Master wrist-compliance contact, alignment and locked preload."""
+        """Run soft contact, bilateral wrist locking, and bounded preload.
+
+        ``None`` means the effort/angle signal was not useful after one safe
+        retry and the caller should continue through the validated legacy
+        four-millimetre completion path.
+        """
 
         now_s = float(context.now_s)
         diagnostic = str(
@@ -886,13 +782,13 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             if self.REQUIRE_SERVER_CONTACT:
                 if context.grasp_confirmed:
                     return StageResult.succeeded(
-                        "task 1 master bilateral compliant grasp confirmed; "
-                        f"{diagnostic}",
+                        "task 1 Server contact and bilateral compliant wrist "
+                        f"alignment are confirmed; {diagnostic}",
                         arm_command=command,
                     )
                 return StageResult.running(
-                    "task 1 master wrists aligned and locked; waiting for "
-                    f"Server bilateral contact; {diagnostic}",
+                    "task 1 both wrists are aligned and locked; waiting for "
+                    f"Server bilateral contact confirmation; {diagnostic}",
                     arm_command=command,
                 )
 
@@ -911,8 +807,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 getattr(self._contact, "preload_effort_limit_reached", False)
             ):
                 return StageResult.succeeded(
-                    "task 1 master wrists locked; preload stopped at soft "
-                    f"effort limit; {diagnostic}",
+                    "task 1 locked both aligned wrists and stopped preload at "
+                    f"the wrist-effort soft limit; {diagnostic}",
                     arm_command=command,
                 )
 
@@ -928,7 +824,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     + self.COMPLIANT_POST_ALIGN_STEP_M,
                 )
                 replanned = self._replan_contact_offset(
-                    context, next_offset, "master post-alignment preload"
+                    context,
+                    next_offset,
+                    "post-alignment preload",
                 )
                 if isinstance(replanned, StageResult):
                     return replanned
@@ -938,35 +836,42 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 )
                 self._held_arm_command = replanned
                 return StageResult.running(
-                    "task 1 master locked-wrist preload; "
+                    "task 1 applying locked-wrist post-alignment preload; "
                     f"offset={next_offset * 1000.0:.1f}/"
                     f"{target_offset * 1000.0:.1f} mm; {diagnostic}",
                     arm_command=replanned,
                 )
+
             if pose_settled and self._contact_search_used_m >= target_offset - 1e-9:
                 return StageResult.succeeded(
-                    "task 1 master bilateral compliant grasp settled; "
-                    f"preload={self._contact_search_used_m * 1000.0:.1f} mm; "
-                    f"{diagnostic}",
+                    "task 1 bilateral compliant grasp settled with locked "
+                    f"wrists and {self._contact_search_used_m * 1000.0:.1f} mm "
+                    f"bounded preload; {diagnostic}",
                     arm_command=command,
                 )
             return StageResult.running(
-                "task 1 holding master aligned wrists while preload settles; "
-                f"{diagnostic}; {detail}",
+                "task 1 holding aligned wrists while the bounded preload "
+                f"settles; {diagnostic}; {detail}",
                 arm_command=command,
             )
 
+        # Before bilateral alignment, approach in gentler half-millimetre
+        # steps so the first-contact wrist can rotate instead of levering the
+        # box away from the other hand.
         if (
             pose_settled
             and now_s >= self._contact_search_next_s
-            and self._contact_search_used_m < self.COMPLIANT_SOFT_MAX_M - 1e-9
+            and self._contact_search_used_m
+            < self.COMPLIANT_SOFT_MAX_M - 1e-9
         ):
             next_offset = min(
                 self.COMPLIANT_SOFT_MAX_M,
                 self._contact_search_used_m + self.COMPLIANT_SOFT_STEP_M,
             )
             replanned = self._replan_contact_offset(
-                context, next_offset, "master soft compliant contact"
+                context,
+                next_offset,
+                "soft compliant contact",
             )
             if isinstance(replanned, StageResult):
                 return replanned
@@ -974,26 +879,36 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             self._contact_search_next_s = now_s + self.COMPLIANT_SOFT_INTERVAL_S
             self._held_arm_command = replanned
             return StageResult.running(
-                "task 1 advancing master compliant contact; "
+                "task 1 advancing the compliant contact search; "
                 f"offset={next_offset * 1000.0:.1f}/"
                 f"{self.COMPLIANT_SOFT_MAX_M * 1000.0:.1f} mm; {diagnostic}",
                 arm_command=replanned,
             )
 
-        if pose_settled and self._contact_search_used_m >= self.COMPLIANT_SOFT_MAX_M - 1e-9:
+        if (
+            pose_settled
+            and self._contact_search_used_m
+            >= self.COMPLIANT_SOFT_MAX_M - 1e-9
+        ):
             if self._compliance_wait_since_s is None:
                 self._compliance_wait_since_s = now_s
             wait_s = max(0.0, now_s - self._compliance_wait_since_s)
             if wait_s >= self.COMPLIANT_SINGLE_SIDE_WAIT_S:
                 any_contact = bool(getattr(self._contact, "any_contact", False))
-                if any_contact and self._compliance_retry_count < self.COMPLIANT_MAX_RETRIES:
+                if (
+                    any_contact
+                    and self._compliance_retry_count
+                    < self.COMPLIANT_MAX_RETRIES
+                ):
                     next_offset = max(
                         0.0,
                         self._contact_search_used_m
                         - self.COMPLIANT_RETRY_BACKOFF_M,
                     )
                     replanned = self._replan_contact_offset(
-                        context, next_offset, "master one-side contact backoff"
+                        context,
+                        next_offset,
+                        "single-side contact backoff",
                     )
                     if isinstance(replanned, StageResult):
                         return replanned
@@ -1002,28 +917,33 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                         retry()
                     self._compliance_retry_count += 1
                     self._contact_search_used_m = next_offset
-                    self._contact_search_next_s = now_s + self.COMPLIANT_SOFT_INTERVAL_S
+                    self._contact_search_next_s = (
+                        now_s + self.COMPLIANT_SOFT_INTERVAL_S
+                    )
                     self._compliance_wait_since_s = None
                     self._held_arm_command = replanned
                     return StageResult.running(
-                        "task 1 master one-side contact: backed off 1 mm for retry; "
-                        f"{diagnostic}",
+                        "task 1 backed off 1.0 mm after one-sided compliant "
+                        f"contact; retry={self._compliance_retry_count}/"
+                        f"{self.COMPLIANT_MAX_RETRIES}; {diagnostic}",
                         arm_command=replanned,
                     )
+
                 abandon = getattr(self._contact, "abandon_compliance", None)
                 if callable(abandon):
                     abandon("no_stable_bilateral_signal")
                 self._compliance_wait_since_s = None
                 return None
+
             return StageResult.running(
-                "task 1 holding soft contact for master bilateral wrist alignment; "
-                f"wait={wait_s:.1f}/{self.COMPLIANT_SINGLE_SIDE_WAIT_S:.1f}s; "
-                f"{diagnostic}",
+                "task 1 holding maximum soft contact while waiting for "
+                f"bilateral wrist alignment ({wait_s:.1f}/"
+                f"{self.COMPLIANT_SINGLE_SIDE_WAIT_S:.1f}s); {diagnostic}",
                 arm_command=command,
             )
 
         return StageResult.running(
-            "task 1 moving inward with master wrist monitoring; "
+            "task 1 moving inward with compliant wrist monitoring; "
             f"offset={self._contact_search_used_m * 1000.0:.1f} mm; "
             f"{diagnostic}; {detail}",
             arm_command=command,
@@ -1036,11 +956,10 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         action: str,
     ) -> ArmCommand | StageResult:
         try:
-            odometry = self._arm_reference_odometry or context.odometry
             return self._contact.tighten(
                 self._locked_target_world,
                 offset_m,
-                odometry,
+                context.odometry,
                 context.joint_states,
             )
         except PregraspInputError as exc:

@@ -59,7 +59,6 @@ class CompetitionController:
         *,
         referee_driven: bool = True,
         max_attempts: int = 3,
-        local_task_id: int | None = None,
     ) -> None:
         missing = {1, 2, 3} - set(executors)
         if missing:
@@ -67,12 +66,6 @@ class CompetitionController:
         self.executors = dict(executors)
         self.referee_driven = bool(referee_driven)
         self.max_attempts = max(1, int(max_attempts))
-        self.local_task_id = int(local_task_id) if local_task_id is not None else None
-        if self.local_task_id is not None:
-            if self.referee_driven:
-                raise ValueError("local_task_id requires referee_driven=False")
-            if self.local_task_id not in executors:
-                raise ValueError(f"no executor for local task id {self.local_task_id}")
 
         self.instructions: list[dict] = []
         self.inputs_ready = False
@@ -126,16 +119,17 @@ class CompetitionController:
         if self.instructions and self.state is not ControllerState.WAITING_FOR_INPUTS:
             raise RuntimeError("instructions changed after task execution started")
 
+        # Some integrated executors need cross-task facts before task 1 starts
+        # (for example, task 2's instructed shelf colour constrains task 1's
+        # shelf recognition).  Keep that coupling at the orchestration
+        # boundary instead of letting executors reach into ROS/client state.
+        for executor in self.executors.values():
+            configure = getattr(executor, "configure_instructions", None)
+            if callable(configure):
+                configure(normalized)
+
         self.instructions = normalized
-        self.task_index = (
-            next(
-                index
-                for index, item in enumerate(normalized)
-                if int(item.get("task", 0)) == self.local_task_id
-            )
-            if self.local_task_id is not None
-            else 0
-        )
+        self.task_index = 0
         self.attempt = 1
         self.stage_index = 0
         self._stage_entered = False
@@ -158,7 +152,11 @@ class CompetitionController:
         ):
             return self.snapshot()
 
-        if self.referee_driven and self._referee_finished(context):
+        if (
+            self.referee_driven
+            and self._referee_finished(context)
+            and not self._finishing_task3_safe_return()
+        ):
             self._transition(ControllerState.FINISHED, "referee reported all tasks finished")
             return self.snapshot()
 
@@ -318,12 +316,6 @@ class CompetitionController:
             return
 
         if succeeded:
-            if self.local_task_id is not None:
-                self._transition(
-                    ControllerState.FINISHED,
-                    f"local task {self.local_task_id} sequence completed: {message}",
-                )
-                return
             self._advance_to_next_task("dry-run task sequence completed")
             return
         if self.attempt < self.max_attempts:
@@ -333,12 +325,6 @@ class CompetitionController:
                 f"dry-run retry task {self.task_id} attempt {self.attempt}: {message}",
             )
         else:
-            if self.local_task_id is not None:
-                self._transition(
-                    ControllerState.FINISHED,
-                    f"local task {self.local_task_id} exhausted {self.max_attempts} attempts",
-                )
-                return
             self._advance_to_next_task(
                 f"dry-run task {self.task_id} exhausted {self.max_attempts} attempts"
             )
@@ -424,6 +410,23 @@ class CompetitionController:
             "\u5168\u90e8\u4efb\u52a1\u7ed3\u675f" in task_text
             or "all tasks finished" in task_text
             or "all_tasks_done" in game_text
+        )
+
+    def _finishing_task3_safe_return(self) -> bool:
+        """Let the final task finish its local escape and end-zone alignment.
+
+        The referee awards task 3 as soon as placement is accepted and can
+        report the whole game finished while the robot is still beside the
+        shelf.  Stopping at that instant skips the post-release arm lift and
+        the final table-facing alignment.  Only defer the terminal referee
+        event while task 3's already-running local sequence is active; once it
+        succeeds and enters ``WAITING_FOR_REFEREE``, the next tick finishes the
+        controller normally.
+        """
+
+        return (
+            self.state is ControllerState.EXECUTING_STAGE
+            and self.task_id == 3
         )
 
     def _transition(self, state: ControllerState, message: str) -> None:

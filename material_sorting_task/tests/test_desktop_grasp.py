@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import math
 from pathlib import Path
 import unittest
@@ -16,6 +17,33 @@ class DesktopGraspIntegrationTests(unittest.TestCase):
         source = (TASK / "perception" / "box_detect.py").read_text(encoding="utf-8")
         self.assertIn('"perception", "checkpoints", "best.pt"', source)
         self.assertNotIn("backends_1", source)
+
+    def test_rgbd_mask_supports_pale_rendered_pink_with_depth_gating(self) -> None:
+        source = (TASK / "perception" / "box_detect.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "RGBD_RELAXED_COLOR_HSV"
+        }
+        ranges = assignments["RGBD_RELAXED_COLOR_HSV"]
+        pink_min_saturation = min(lower[1] for lower, _upper in ranges["pink"])
+        self.assertGreaterEqual(pink_min_saturation, 10)
+        self.assertLessEqual(pink_min_saturation, 20)
+        self.assertIn("depth_gate = positive_depth", source)
+        self.assertIn("mask_cloud_cuboid_relaxed", source)
+
+    def test_yellow_rgbd_center_compares_strict_and_relaxed_masks(self) -> None:
+        source = (TASK / "perception" / "box_detect.py").read_text(encoding="utf-8")
+
+        self.assertIn("strict_candidate = component_candidate(relaxed=False)", source)
+        self.assertIn("relaxed_candidate = component_candidate(relaxed=True)", source)
+        self.assertIn("RGBD_MASK_MIN_WIDTH_COVERAGE", source)
+        self.assertIn("RGBD_MASK_MAX_CENTER_OFFSET_RATIO", source)
+        self.assertIn("RGBD_MASK_MAX_LEFT_RIGHT_IMBALANCE", source)
 
     def test_orientation_from_box_dimensions(self) -> None:
         self.assertEqual(infer_box_orientation(0.24, 0.16, 0.0, 0.0), "yaw0")

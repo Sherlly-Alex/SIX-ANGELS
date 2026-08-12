@@ -478,7 +478,6 @@ class NavigationController:
             robot_x, robot_y, self._path,
             lookahead_distance=lookahead,
             closest_index=self._waypoint_idx if self._path else None,
-            project_from_pose=True,
         )
 
         dx = lg_x - robot_x
@@ -519,7 +518,7 @@ class NavigationController:
             if not was_rotating:
                 self._speed_limiter.reset()
         else:
-            raw_lin = min(0.36, 1.0 * dist_to_target) * max(0.0, math.cos(yaw_error)) ** 2
+            raw_lin = min(0.3, 0.8 * dist_to_target) * max(0.0, math.cos(yaw_error)) ** 2
             # Pure-pursuit curvature: kappa = 2 sin(e) / L ; omega = kappa * v.
             L = max(lookahead, 0.2)
             kappa = 2.0 * math.sin(yaw_error) / L

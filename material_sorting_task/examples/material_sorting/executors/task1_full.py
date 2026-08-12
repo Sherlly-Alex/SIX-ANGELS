@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Mapping, Sequence
 
 from desktop_grasp.pregrasp_core import PregraspInputError, PregraspPlanningError
 from executors.base import ArmCommand, ExecutionContext, StageResult, StageStatus, TaskStage
@@ -13,15 +14,22 @@ from executors.transfer_support import (
     stand_from_held_center,
     world_to_base,
 )
-from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
+from navigation.navigation_types import (
+    NavigationGoal,
+    NavigationSegment,
+    NavigationStatus,
+    SpeedLimits,
+)
 from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import (
     ArmRetractController,
     ReleaseSpreadController,
     SlideHoldController,
 )
-from shelf.state_tracker import ShelfState, ShelfStateTracker
+from shelf.placement_feedback import CompliantSlideLoweringController
+from shelf.state_tracker import COLORED_CLASSES, ShelfState, ShelfStateTracker
 from shelf.task_memory import CompetitionTaskMemory
+from task_orchestration import referee_place_confirmed
 
 
 class Task1IntegratedExecutor(Task1LiftExecutor):
@@ -29,51 +37,69 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
 
     name = "task1_integrated_table_to_empty_shelf"
 
-    TABLE_RETREAT_M = 0.80
-    # Task1 benefits from arriving at the direct shelf route already facing
-    # west.  Task3 overrides this because its lower target row is reached by a
-    # south-west diagonal: forcing west first makes the path follower command a
-    # second turn immediately afterwards and can sweep the shallow-held box
-    # into the terminal safety boundary.
-    FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION = True
-    SHELF_LEFT_TURN_YAW_TOLERANCE_RAD = 0.060
-    SHELF_LEFT_TURN_MAX_SPEED_RADPS = 0.70
+    # Leave enough room for the carried-box envelope to turn without sweeping
+    # the table edge.  Recognition remains active during this retreat, but it
+    # only gains votes after the shelf enters the camera view during the
+    # following direct A* route.
+    # Keep the inherited/default value unchanged because task 3 reuses it for
+    # its own verified table retreat.  Only task 1 uses the longer distance.
+    TABLE_RETREAT_M = 0.35
+    TASK1_TABLE_RETREAT_M = 0.70
     # The old fixed x=-1.88 was a shelf-pick stand.  With a task-1 box held
     # about 0.70 m ahead of the base it put the box center behind the shelf
-    # front before recognition had started.  Turn farther east, then derive a
-    # scan stand from the measured held-object transform.
+    # front before recognition had started.  Derive the safe pre-place stand
+    # from the measured held-object transform instead.
     SHELF_FRONT_X = -2.465
     # Keep the semantic camera well outside the shelf.  At 0.45 m the lower
     # packaging box was only visible for one frame; the farther pose gives the
     # head camera a wider view before the separate final placement approach.
     SHELF_SCAN_CENTER_CLEARANCE_M = 0.75
-    # Legacy camera-centred fallback.  Normal integrated runs derive the
-    # observation Y from the actual placement target so the base reaches the
-    # scan stand already aligned with the final straight shelf approach.
+    # Retained only by the previously validated fallback route.
+    SHELF_TURN_X = -0.55
     SHELF_OBSERVE_Y = 0.85
-    SHELF_TURN_POSITION_TOLERANCE_M = 0.015
-    SHELF_SCAN_YAW_TOLERANCE_RAD = 0.010
     SHELF_YAW = math.pi
+    DIRECT_SHELF_POSITION_TOLERANCE_M = 0.05
+    DIRECT_SHELF_YAW_TOLERANCE_RAD = 0.06
+    DIRECT_SHELF_MAX_LINEAR_MPS = 0.22
     SHELF_CLEARANCE_M = 0.055
-    # Move the carried box slightly farther inside the shelf before release.
-    SHELF_PLACE_DEPTH_BIAS_M = 0.02
     SHELF_RETREAT_M = 0.32
     SHELF_SCAN_TIMEOUT_S = 35.0
     SHELF_SCAN_PITCHES = (0.00, 0.08, 0.16)
     SHELF_SCAN_PITCH_DWELL_S = 3.0
     PLACE_TIMEOUT_S = 25.0
+    VERIFY_PLACE_TIMEOUT_S = 3.0
     ARM_RETRACT_TIMEOUT_S = 15.0
+    RELEASE_SUPPORT_SETTLE_S = 0.40
+    RELEASE_STAGE_SETTLE_S = 0.25
+    RELEASE_SPREAD_M = 0.040
+    RELEASE_COMMAND_RATE_PER_S = 0.30
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
         super().__init__()
         self._memory = memory
+        self._expected_shelf_color: str | None = None
         self._shelf_tracker = ShelfStateTracker()
         self._transfer = TransferMotion()
-        self._transfer.LATERAL_POSITION_TOLERANCE_M = 0.020
-        self._transfer.LATERAL_YAW_TOLERANCE_RAD = 0.010
+        # Only the new task-1 shelf route receives the modest cruise-speed
+        # increase.  The shared transfer helper and tasks 2/3 keep their
+        # existing limits.
+        self._direct_shelf_transfer = TransferMotion(
+            SpeedLimits(
+                max_linear=self.DIRECT_SHELF_MAX_LINEAR_MPS,
+                max_angular=0.55,
+                max_linear_accel=0.30,
+                max_angular_accel=1.0,
+                emergency_clearance=0.20,
+                max_deceleration=0.50,
+            )
+        )
         self._slide_hold = SlideHoldController()
-        self._soft_release = ReleaseSpreadController()
-        self._release = ReleaseSpreadController()
+        self._place_lowering = CompliantSlideLoweringController()
+        # Task 1 releases inside the shelf and therefore uses a dedicated slow
+        # rate.  Tasks 2/3 retain the existing release speed.
+        self._release = ReleaseSpreadController(
+            command_rate_per_s=self.RELEASE_COMMAND_RATE_PER_S
+        )
         self._arm_retract = ArmRetractController()
         self._shelf_state: ShelfState | None = None
         self._held_center_base: tuple[float, float, float] | None = None
@@ -88,14 +114,40 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         # Keep a phase-local deadline so a slow lowering motion cannot consume
         # the whole release timeout before the grippers even start to open.
         self._phase_started_s = 0.0
+        self._release_half_widths: tuple[float, ...] = ()
+        self._release_stage_index = 0
+        self._release_settle_started_s: float | None = None
+        self._legacy_shelf_route_used = False
+        self._place_started_s: float | None = None
+        self._place_time_reported = False
+
+    def configure_instructions(self, instructions: Sequence[Mapping]) -> None:
+        """Bind task 2's instructed colour as task 1 shelf-scan context."""
+
+        task2 = [item for item in instructions if int(item.get("task", 0)) == 2]
+        if len(task2) != 1:
+            raise ValueError("task 1 requires exactly one task-2 instruction")
+        color = str(task2[0].get("target_color", "")).strip().lower()
+        if color not in COLORED_CLASSES:
+            raise ValueError(f"task 2 has unsupported shelf colour {color!r}")
+        task1 = [item for item in instructions if int(item.get("task", 0)) == 1]
+        if len(task1) != 1:
+            raise ValueError("task 1 requires exactly one task-1 instruction")
+        carried_color = str(task1[0].get("target_color", "")).strip().lower()
+        if carried_color == color:
+            raise ValueError(
+                "task-1 carried colour and task-2 shelf colour must be distinct"
+            )
+        self._expected_shelf_color = color
 
     def reset(self) -> None:
         super().reset()
         self._shelf_tracker.reset()
         self._shelf_state = None
         self._transfer.reset()
+        self._direct_shelf_transfer.reset()
         self._slide_hold.reset()
-        self._soft_release.reset()
+        self._place_lowering.reset()
         self._release.reset()
         self._arm_retract.reset()
         self._held_center_base = None
@@ -107,6 +159,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._slide_start = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._release_half_widths = ()
+        self._release_stage_index = 0
+        self._release_settle_started_s = None
+        self._legacy_shelf_route_used = False
+        self._place_started_s = None
+        self._place_time_reported = False
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -115,21 +173,35 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._slide_applied = False
         if stage is TaskStage.TRANSPORT:
             self._transfer.reset()
-            # Begin fusing shelf detections as soon as the shelf enters the
-            # camera view during transport.
+            self._direct_shelf_transfer.reset()
+            # A new task-1 transport starts one fresh, continuous shelf
+            # observation epoch.  Later tasks inherit this executor but must
+            # retain task 1's shared shelf snapshot.
             self._shelf_tracker.reset()
             self._shelf_state = None
+            if self.task_id == 1:
+                self._memory.clear_shelf_state()
             self._phase = "retreat_table"
+            self._legacy_shelf_route_used = False
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
             self._transfer.reset()
+            # Do not reset here.  Frames collected from the moment the shelf
+            # enters view remain valid at the observation stand.  If transport
+            # already produced a complete stable state, the scan stage can use
+            # it immediately; otherwise it simply keeps adding new frames.
             self._phase = "scan_shelf"
         elif stage is TaskStage.PLACE:
             self._slide_hold.reset()
-            self._soft_release.reset()
+            self._place_lowering.reset()
             self._release.reset()
             self._phase = "lower"
             self._phase_started_s = float(context.now_s)
+            self._place_started_s = float(context.now_s)
+            self._place_time_reported = False
+            self._release_half_widths = ()
+            self._release_stage_index = 0
+            self._release_settle_started_s = None
         elif stage is TaskStage.VERIFY_PLACE:
             self._phase = "verify"
         elif stage is TaskStage.RETURN_TO_END:
@@ -173,13 +245,23 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             return self._tick_place(context)
         if stage is TaskStage.VERIFY_PLACE:
             elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
-            if elapsed >= 1.0:
+            if referee_place_confirmed(context.referee_gameinfo, context.task_index):
+                self._report_place_time(context, "confirmed")
                 return StageResult.succeeded(
-                    "task 1 shelf placement settled; handing result to referee",
+                    "task 1 shelf placement confirmed by official referee step=place",
+                    arm_command=self._held_arm_command,
+                )
+            if elapsed >= self.VERIFY_PLACE_TIMEOUT_S:
+                self._report_place_time(context, "not_confirmed")
+                return StageResult.blocked(
+                    "task 1 shelf placement was not confirmed by the official "
+                    f"referee within {self.VERIFY_PLACE_TIMEOUT_S:.1f}s; "
+                    f"referee_step={context.referee_gameinfo.get('step', '-')}",
                     arm_command=self._held_arm_command,
                 )
             return StageResult.running(
-                f"task 1 holding release pose for placement settle ({elapsed:.1f}/1.0s)",
+                "task 1 holding release pose until official referee reports "
+                f"step=place ({elapsed:.1f}/{self.VERIFY_PLACE_TIMEOUT_S:.1f}s)",
                 arm_command=self._held_arm_command,
             )
         if stage is TaskStage.RETURN_TO_END:
@@ -192,8 +274,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     def cancel(self, reason: str) -> None:
         super().cancel(reason)
         self._transfer.reset()
+        self._direct_shelf_transfer.reset()
         self._slide_hold.reset()
-        self._soft_release.reset()
         self._release.reset()
         self._arm_retract.reset()
 
@@ -210,14 +292,13 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             center[2] + self._lift.actual_lift_m,
         )
 
-    def _shelf_observation_target_y(self, context: ExecutionContext) -> float:
-        """Return the carried-object Y used for the shelf observation stand.
+    def _shelf_observation_target_y(self) -> float:
+        """Return the carried-box Y for the safe shelf pre-place stand.
 
-        The empty layer has no visible object, but its Y is the calibrated
-        shelf centre and is therefore known before semantic layer voting has
-        completed.  If a stable state is already available, prefer its exact
-        placement coordinate.  The former camera-centred Y remains a guarded
-        fallback for malformed geometry only.
+        Shelf layers differ in height, not in their front-view Y coordinate.
+        Prefer the stable task-1 shelf result when it is already available;
+        otherwise use this project's calibrated shelf geometry.  The legacy
+        camera-centred value is only a guarded fallback for malformed geometry.
         """
 
         if self._shelf_state is not None:
@@ -231,6 +312,15 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             target_y = float(self.SHELF_OBSERVE_Y)
         return target_y
 
+    def _start_legacy_shelf_route(self) -> None:
+        """Switch once to the previously validated turn-and-advance route."""
+
+        self._legacy_shelf_route_used = True
+        self._phase = "navigate_shelf_turn_fallback"
+        self._motion_started = False
+        self._direct_shelf_transfer.reset()
+        self._transfer.reset()
+
     def _tick_transport(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 1 transport has no stable held-object state")
@@ -239,7 +329,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._update_shelf_state(context)
         if self._phase == "retreat_table":
             if not self._motion_started:
-                if not self._transfer.begin_retreat(context.odometry, self.TABLE_RETREAT_M):
+                if not self._transfer.begin_retreat(
+                    context.odometry, self.TASK1_TABLE_RETREAT_M
+                ):
                     return StageResult.running(
                         "task 1 waiting for odometry before table retreat",
                         arm_command=self._held_arm_command,
@@ -252,52 +344,16 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
-            self._phase = (
-                "turn_left_to_shelf"
-                if self.FORCE_SHELF_FACING_TURN_BEFORE_NAVIGATION
-                else "navigate_shelf_scan"
-            )
+            self._phase = "navigate_shelf_direct"
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "turn_left_to_shelf":
-            pose = odometry_pose(context.odometry)
-            if pose is None:
-                return StageResult.running(
-                    "task 1 waiting for odometry before direct LEFT turn",
-                    arm_command=self._held_arm_command,
-                )
-            yaw_error = math.atan2(
-                math.sin(self.SHELF_YAW - pose[2]),
-                math.cos(self.SHELF_YAW - pose[2]),
-            )
-            if abs(yaw_error) <= self.SHELF_LEFT_TURN_YAW_TOLERANCE_RAD:
-                self._phase = "navigate_shelf_scan"
-                self._motion_started = False
-                self._transfer.reset()
-            else:
-                if yaw_error > 0.0:
-                    angular = min(
-                        self.SHELF_LEFT_TURN_MAX_SPEED_RADPS,
-                        max(0.16, 1.6 * yaw_error),
-                    )
-                else:
-                    # Only a small overshoot correction may turn clockwise;
-                    # the main north-to-west rotation is always LEFT.
-                    angular = max(-0.16, min(-0.06, 1.1 * yaw_error))
-                return StageResult.running(
-                    "task 1 turning LEFT directly toward the shelf after "
-                    f"the safe straight retreat; yaw_err={yaw_error:+.3f}rad",
-                    base_command=(0.0, angular),
-                    arm_command=self._held_arm_command,
-                )
-
-        if self._phase == "navigate_shelf_scan":
+        if self._phase == "navigate_shelf_direct":
             if self._shelf_scan_stand is None:
                 self._shelf_scan_stand = shelf_observation_stand(
                     self._held_center_base,
                     shelf_front_x=self.SHELF_FRONT_X,
-                    shelf_y=self._shelf_observation_target_y(context),
+                    shelf_y=self._shelf_observation_target_y(),
                     center_clearance_m=self.SHELF_SCAN_CENTER_CLEARANCE_M,
                     shelf_yaw=self.SHELF_YAW,
                 )
@@ -306,50 +362,118 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     x=self._shelf_scan_stand[0],
                     y=self._shelf_scan_stand[1],
                     yaw=self.SHELF_YAW,
-                    position_tolerance=self.SHELF_TURN_POSITION_TOLERANCE_M,
-                    yaw_tolerance=self.SHELF_SCAN_YAW_TOLERANCE_RAD,
+                    position_tolerance=self.DIRECT_SHELF_POSITION_TOLERANCE_M,
+                    yaw_tolerance=self.DIRECT_SHELF_YAW_TOLERANCE_RAD,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_SHELF,
-                    source_tag="integrated_task1_direct_shelf_scan",
+                    source_tag="integrated_task1_direct_shelf_preplace",
+                )
+                if not self._direct_shelf_transfer.begin_navigation(
+                    goal,
+                    context.odometry,
+                    footprint_mode=FootprintMode.TRANSIT_CARRY,
+                    observations=context.target_observations,
+                    exclude_color=str(context.instruction.get("target_color", "")),
+                ):
+                    self._start_legacy_shelf_route()
+                else:
+                    self._motion_started = True
+            if self._phase == "navigate_shelf_direct":
+                status, command, detail = self._direct_shelf_transfer.tick_navigation(
+                    context.odometry, context.now_s
+                )
+                if status is NavigationStatus.GOAL_REACHED:
+                    self._motion_started = False
+                    self._direct_shelf_transfer.reset()
+                    return StageResult.succeeded(
+                        "task 1 reached the target-aligned safe shelf pre-place "
+                        "stand by direct A* with the carried center still "
+                        f"{self.SHELF_SCAN_CENTER_CLEARANCE_M:.2f} m in front "
+                        "of the shelf",
+                        arm_command=self._held_arm_command,
+                    )
+                if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
+                    self._start_legacy_shelf_route()
+                else:
+                    return StageResult.running(
+                        f"task 1 moving directly to the safe shelf pre-place "
+                        f"stand; {detail}; {self._shelf_scan_detail()}",
+                        base_command=command,
+                        arm_command=self._held_arm_command,
+                    )
+
+        if self._phase == "navigate_shelf_turn_fallback":
+            assert self._shelf_scan_stand is not None
+            if not self._motion_started:
+                goal = NavigationGoal(
+                    x=self.SHELF_TURN_X,
+                    y=self._shelf_scan_stand[1],
+                    yaw=self.SHELF_YAW,
+                    position_tolerance=0.08,
+                    yaw_tolerance=0.06,
+                    safety_radius=0.0,
+                    segment=NavigationSegment.NAV_SHELF,
+                    source_tag="integrated_task1_legacy_shelf_turn_fallback",
                 )
                 if not self._transfer.begin_navigation(
-                    goal, context.odometry, context=context,
+                    goal,
+                    context.odometry,
                     footprint_mode=FootprintMode.TRANSIT_CARRY,
-                    exclude_target=True,
+                    observations=context.target_observations,
+                    exclude_color=str(context.instruction.get("target_color", "")),
                 ):
                     return StageResult.blocked(
-                        "task 1 could not plan a safe direct route to the shelf scan stand",
+                        "task 1 direct A* and legacy shelf-turn route both failed "
+                        "safe path planning",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True
             status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s, context=context,
-                footprint_mode=FootprintMode.TRANSIT_CARRY,
-                exclude_target=True,
+                context.odometry, context.now_s
             )
             if status is NavigationStatus.GOAL_REACHED:
+                self._phase = "approach_shelf_scan_fallback"
                 self._motion_started = False
                 self._transfer.reset()
-                return StageResult.succeeded(
-                    "task 1 reached the target-Y-aligned shelf observation "
-                    "stand directly with the carried center still "
-                    f"{self.SHELF_SCAN_CENTER_CLEARANCE_M:.2f} m in front "
-                    "of the shelf",
-                    arm_command=self._held_arm_command,
-                )
             elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
                 return StageResult.blocked(
-                    f"task 1 direct shelf-scan navigation stopped safely: {detail}",
+                    f"task 1 legacy shelf-turn fallback stopped safely: {detail}",
                     arm_command=self._held_arm_command,
                 )
             else:
                 return StageResult.running(
-                    f"task 1 moving directly to the shelf scan stand; {detail}; "
+                    f"task 1 using legacy shelf-turn fallback; {detail}; "
                     f"{self._shelf_scan_detail()}",
                     base_command=command,
                     arm_command=self._held_arm_command,
                 )
 
+        if self._phase in {
+            "approach_shelf_scan_fallback",
+            # Compatibility alias used by task 3 when it delegates its final
+            # safe shelf approach to this inherited helper.
+            "approach_shelf_scan",
+        }:
+            assert self._shelf_scan_stand is not None
+            legacy_fallback = self._phase == "approach_shelf_scan_fallback"
+            done, running = self._tick_straight_advance(
+                context,
+                self._shelf_scan_stand,
+                action=(
+                    "approaching the shelf pre-place stand by legacy fallback"
+                    if legacy_fallback
+                    else "approaching the shelf scan stand"
+                ),
+            )
+            if running is not None:
+                return running
+            if done:
+                return StageResult.succeeded(
+                    "task 1 reached the safe shelf pre-place stand with the "
+                    f"carried center still {self.SHELF_SCAN_CENTER_CLEARANCE_M:.2f} m "
+                    "in front of the shelf",
+                    arm_command=self._held_arm_command,
+                )
         return StageResult.blocked(
             f"task 1 invalid transport phase {self._phase!r}",
             arm_command=self._held_arm_command,
@@ -359,6 +483,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 1 shelf alignment has no held object")
         if self._phase == "scan_shelf":
+            if self._expected_shelf_color is None:
+                return StageResult.blocked(
+                    "task 1 shelf scan has no configured task-2 target colour",
+                    arm_command=self._held_arm_command,
+                )
             scan_elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
             pitch_index = min(
                 len(self.SHELF_SCAN_PITCHES) - 1,
@@ -366,16 +495,32 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             pitch = self.SHELF_SCAN_PITCHES[pitch_index]
             self._held_arm_command = _with_head_pitch(self._held_arm_command, pitch)
+            # Continue the same transport-time observation epoch.  The shelf
+            # tracker locks the coloured target and packaging box independently,
+            # so either target remains available if the carried box later hides it.
+            # A complete state collected while turning/driving is immediately
+            # reusable.  Only missing evidence triggers the stationary pitch
+            # sweep; the transport observation epoch is never cleared here.
             state = self._shelf_state or self._update_shelf_state(context)
             if state is None:
                 if scan_elapsed >= self.SHELF_SCAN_TIMEOUT_S:
                     return StageResult.blocked(
-                        "task 1 shelf recognition timed out without two stable occupied layers",
+                        "task 1 shelf recognition timed out without two stable "
+                        f"occupied layers; {self._shelf_tracker.diagnostic_summary}",
                         arm_command=self._held_arm_command,
                     )
                 return StageResult.running(
-                    "task 1 scanning shelf semantics; "
-                    f"head_pitch={pitch:.2f}, accepted_frames={self._shelf_tracker.frames_used}",
+                    "task 1 scanning shelf semantics for task-2 colour "
+                    f"{self._expected_shelf_color!r}; "
+                    f"head_pitch={pitch:.2f}, "
+                    f"{self._shelf_tracker.diagnostic_summary}",
+                    arm_command=self._held_arm_command,
+                )
+            if state.colored_class_id != self._expected_shelf_color:
+                return StageResult.blocked(
+                    "task 1 shelf scan produced a colour outside its task-2 "
+                    f"instruction constraint: expected={self._expected_shelf_color!r}, "
+                    f"observed={state.colored_class_id!r}",
                     arm_command=self._held_arm_command,
                 )
             self._memory.record_shelf_state(state)
@@ -404,11 +549,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             result = self._tick_slide(context, "moving held box to shelf clearance height")
             if result is not None:
                 return result
-            self._phase = "navigate_place_lateral"
+            self._phase = "check_place_alignment"
             self._motion_started = False
             self._transfer.reset()
 
-        if self._phase == "navigate_place_lateral":
+        if self._phase == "check_place_alignment":
             assert self._place_world is not None
             assert self._shelf_scan_stand is not None
             if self._final_place_stand is None:
@@ -418,9 +563,45 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     self.SHELF_YAW,
                 )
                 self._final_place_stand = (
-                    self._final_place_stand[0] - self.SHELF_PLACE_DEPTH_BIAS_M,
+                    self._final_place_stand[0],
                     max(0.58, min(0.98, self._final_place_stand[1])),
                 )
+            pose = odometry_pose(context.odometry)
+            if pose is None:
+                return StageResult.running(
+                    "task 1 waiting for odometry before final shelf alignment check",
+                    arm_command=self._held_arm_command,
+                )
+            _forward_error, lateral_error = target_delta_in_heading(
+                pose,
+                (self._shelf_scan_stand[0], self._final_place_stand[1]),
+                self.SHELF_YAW,
+            )
+            yaw_error = math.atan2(
+                math.sin(self.SHELF_YAW - pose[2]),
+                math.cos(self.SHELF_YAW - pose[2]),
+            )
+            if (
+                not self._legacy_shelf_route_used
+                and abs(lateral_error) <= self.DIRECT_SHELF_POSITION_TOLERANCE_M
+                and abs(yaw_error) <= self.DIRECT_SHELF_YAW_TOLERANCE_RAD
+            ):
+                self._phase = "approach_place_final"
+                self._motion_started = False
+                self._transfer.reset()
+            else:
+                # The direct route normally arrives already aligned.  Preserve
+                # the previous rotate-drive-restore controller only as a
+                # guarded correction/fallback when the final pose is outside
+                # the verified insertion corridor.
+                self._phase = "navigate_place_lateral"
+                self._motion_started = False
+                self._transfer.reset()
+
+        if self._phase == "navigate_place_lateral":
+            assert self._place_world is not None
+            assert self._shelf_scan_stand is not None
+            assert self._final_place_stand is not None
             if not self._motion_started:
                 if not self._transfer.begin_lateral_alignment(
                     # Only align y here; x remains at the safe shelf-front
@@ -483,9 +664,15 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             context.target_observations,
             now_s=context.now_s,
             carried_class_id=self._memory.task1_color,
+            expected_colored_class_id=self._expected_shelf_color,
         )
         if state is not None:
             self._shelf_state = state
+            # Save the three formal shelf coordinates as soon as both occupied
+            # layers have stable independent votes.  Later stages consume this
+            # same latched result; arriving at the pre-place stand never clears
+            # or restarts the observation epoch.
+            self._memory.record_shelf_state(state)
         return state
 
     def _shelf_scan_detail(self) -> str:
@@ -530,9 +717,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
             if forward_m <= 0.015:
                 return True, None
-            if not self._transfer.begin_advance(
-                context.odometry, forward_m, heading_yaw=self.SHELF_YAW
-            ):
+            if not self._transfer.begin_advance(context.odometry, forward_m):
                 return False, StageResult.running(
                     f"task 1 waiting to start {action}",
                     arm_command=self._held_arm_command,
@@ -554,7 +739,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         if self._place_world is None:
             return StageResult.blocked("task 1 placement has no empty-layer target")
         if self._phase == "lower":
-            if not self._slide_hold.planned:
+            if not self._place_lowering.planned:
                 target_slide = (
                     self._held_arm_command.spine_position
                     + self._held_center_base[2]
@@ -562,7 +747,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
                 try:
                     self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
+                    self._held_arm_command = self._place_lowering.plan(
                         self._held_arm_command,
                         target_slide,
                         context.joint_states,
@@ -572,61 +757,64 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                         f"task 1 could not plan shelf lowering: {exc}",
                         arm_command=self._held_arm_command,
                     )
-            result = self._tick_slide(context, "lowering box onto shelf board")
+            result = self._tick_slide(
+                context,
+                "lowering box onto shelf board",
+                controller=self._place_lowering,
+            )
             if result is not None:
                 return result
-            self._phase = "soft_release"
+            self._phase = "release_support_settle"
             # Start a fresh deadline for the release motion.  The lowering
             # controller has its own bounded timer and may legitimately take
             # most of the placement stage budget in simulation.
             self._phase_started_s = float(context.now_s)
 
-        if self._phase == "soft_release":
-            if not self._soft_release.planned:
-                try:
-                    self._held_arm_command = self._soft_release.plan_from_held(
-                        self._held_arm_command,
-                        self._held_center_base,
-                        context.joint_states,
-                        half_width=0.135,
-                    )
-                except (PregraspInputError, PregraspPlanningError) as exc:
-                    return StageResult.blocked(
-                        f"task 1 gentle shelf release planning failed: {exc}",
-                        arm_command=self._held_arm_command,
-                    )
-            try:
-                command, reached, detail = self._soft_release.update(
-                    context.now_s, context.joint_states
-                )
-            except (PregraspInputError, PregraspPlanningError) as exc:
-                return StageResult.blocked(
-                    f"task 1 gentle shelf release control failed: {exc}",
+        if self._phase == "release_support_settle":
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed < self.RELEASE_SUPPORT_SETTLE_S:
+                return StageResult.running(
+                    "task 1 holding the placed box on the shelf before "
+                    f"unloading bilateral preload ({elapsed:.2f}/"
+                    f"{self.RELEASE_SUPPORT_SETTLE_S:.2f}s)",
                     arm_command=self._held_arm_command,
                 )
-            self._held_arm_command = command
-            if reached:
-                self._phase = "release"
-                self._phase_started_s = float(context.now_s)
-            elif float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
+            try:
+                held_half_width = float(self._contact.half_width)
+            except (TypeError, ValueError):
                 return StageResult.blocked(
-                    f"task 1 gentle shelf release timed out: {detail}",
-                    arm_command=command,
+                    "task 1 lost the held half-width before shelf release",
+                    arm_command=self._held_arm_command,
                 )
-            else:
-                return StageResult.running(
-                    f"task 1 gently unloading the box symmetrically; {detail}",
-                    arm_command=command,
+            if not math.isfinite(held_half_width) or held_half_width <= 0.0:
+                return StageResult.blocked(
+                    "task 1 held half-width is invalid before shelf release",
+                    arm_command=self._held_arm_command,
                 )
+            self._release_half_widths = (
+                held_half_width + self.RELEASE_SPREAD_M,
+            )
+            self._release_stage_index = 0
+            self._release_settle_started_s = None
+            self._release.reset()
+            self._phase = "release"
+            self._phase_started_s = float(context.now_s)
 
         if self._phase == "release":
+            if self._release_stage_index >= len(self._release_half_widths):
+                return StageResult.succeeded(
+                    "task 1 gently unloaded preload and opened both arms on "
+                    "the empty shelf layer",
+                    arm_command=self._held_arm_command,
+                )
+            target_half_width = self._release_half_widths[self._release_stage_index]
             if not self._release.planned:
                 try:
                     self._held_arm_command = self._release.plan_from_held(
                         self._held_arm_command,
                         self._held_center_base,
                         context.joint_states,
-                        half_width=0.18,
+                        half_width=target_half_width,
                     )
                 except (PregraspInputError, PregraspPlanningError) as exc:
                     return StageResult.blocked(
@@ -644,17 +832,47 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
             self._held_arm_command = command
             if reached:
-                return StageResult.succeeded(
-                    "task 1 opened both arms and released the box on the empty shelf layer",
+                if self._release_settle_started_s is None:
+                    self._release_settle_started_s = float(context.now_s)
+                settle_elapsed = max(
+                    0.0,
+                    float(context.now_s) - self._release_settle_started_s,
+                )
+                if settle_elapsed < self.RELEASE_STAGE_SETTLE_S:
+                    return StageResult.running(
+                        "task 1 holding gentle shelf-release waypoint "
+                        f"{self._release_stage_index + 1}/"
+                        f"{len(self._release_half_widths)} at half_width="
+                        f"{target_half_width:.3f} m ({settle_elapsed:.2f}/"
+                        f"{self.RELEASE_STAGE_SETTLE_S:.2f}s)",
+                        arm_command=command,
+                    )
+                self._release_stage_index += 1
+                self._release_settle_started_s = None
+                self._release.reset()
+                if self._release_stage_index >= len(self._release_half_widths):
+                    return StageResult.succeeded(
+                        "task 1 gently unloaded preload and opened both arms "
+                        "on the empty shelf layer",
+                        arm_command=command,
+                    )
+                return StageResult.running(
+                    "task 1 advancing to the next gentle shelf-release "
+                    f"waypoint ({self._release_stage_index + 1}/"
+                    f"{len(self._release_half_widths)})",
                     arm_command=command,
                 )
             if float(context.now_s) - self._phase_started_s >= self.PLACE_TIMEOUT_S:
+                self._report_place_time(context, "release_timeout")
                 return StageResult.blocked(
                     f"task 1 shelf release timed out: {detail}",
                     arm_command=command,
                 )
             return StageResult.running(
-                f"task 1 slowly spreading both arms around the held centre; {detail}",
+                "task 1 gently spreading both arms to release on shelf; "
+                f"stage={self._release_stage_index + 1}/"
+                f"{len(self._release_half_widths)}, half_width="
+                f"{target_half_width:.3f} m; {detail}",
                 arm_command=command,
             )
         return StageResult.blocked(
@@ -681,7 +899,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             # The release IK pose is still extended into the shelf.  Retreat
             # first, then retract the arms, and only then allow base navigation.
             self._phase = "retract_arms"
-            self._stage_started_s = float(context.now_s)
+            self._phase_started_s = float(context.now_s)
             self._motion_started = False
             self._transfer.reset()
 
@@ -712,7 +930,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
             self._held_arm_command = command
-            elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+            # Retreat and arm retraction are separate motions.  Starting the
+            # retraction deadline at RETURN_TO_END entry made the completed
+            # retreat consume the whole arm timeout before retraction began.
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
             if reached:
                 self._phase = "navigate_end"
                 self._motion_started = False
@@ -741,9 +962,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     source_tag="layout_end_zone_center",
                 )
                 if not self._transfer.begin_navigation(
-                    goal, context.odometry, context=context,
-                    footprint_mode=FootprintMode.TRANSIT_STOWED,
-                    exclude_target=False,
+                    goal,
+                    context.odometry,
+                    observations=context.target_observations,
                 ):
                     return StageResult.blocked(
                         "task 1 could not plan a route to the end zone",
@@ -751,9 +972,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     )
                 self._motion_started = True
             status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s, context=context,
-                footprint_mode=FootprintMode.TRANSIT_STOWED,
-                exclude_target=False,
+                context.odometry, context.now_s
             )
             if status is NavigationStatus.GOAL_REACHED:
                 return StageResult.succeeded(
@@ -779,9 +998,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self,
         context: ExecutionContext,
         action: str,
+        *,
+        controller=None,
     ) -> StageResult | None:
+        active_controller = self._slide_hold if controller is None else controller
         try:
-            command, reached, detail = self._slide_hold.update(
+            command, reached, detail = active_controller.update(
                 context.now_s, context.joint_states
             )
         except (PregraspInputError, PregraspPlanningError) as exc:
@@ -802,6 +1024,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             elapsed = max(0.0, float(context.now_s) - started_s)
             timeout = 60.0 if self.active_stage is TaskStage.ALIGN_FOR_PLACE else self.PLACE_TIMEOUT_S
             if elapsed >= timeout:
+                if self.active_stage is TaskStage.PLACE:
+                    self._report_place_time(context, "place_timeout")
                 return StageResult.blocked(
                     f"task 1 {action} timed out after {elapsed:.1f}s: {detail}",
                     arm_command=command,
@@ -824,6 +1048,17 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             self._slide_applied = True
         return None
+
+    def _report_place_time(self, context: ExecutionContext, result: str) -> None:
+        if self._place_time_reported or self._place_started_s is None:
+            return
+        elapsed = max(0.0, float(context.now_s) - self._place_started_s)
+        print(
+            f"[PLACE_TIME] task={self.task_id} attempt={context.attempt} "
+            f"duration_s={elapsed:.3f} result={result}",
+            flush=True,
+        )
+        self._place_time_reported = True
 
 
 def shelf_observation_stand(
