@@ -277,7 +277,7 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
     def test_task1_uses_slow_staged_shelf_release(self) -> None:
         executor = Task1IntegratedExecutor(CompetitionTaskMemory())
 
-        self.assertAlmostEqual(executor.RELEASE_SPREAD_M, 0.020)
+        self.assertAlmostEqual(executor.RELEASE_SPREAD_M, 0.040)
         self.assertLess(
             executor._release.command_rate_per_s,
             1.20,

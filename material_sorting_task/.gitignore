@@ -19,6 +19,7 @@ venv/
 MUJOCO_LOG.TXT
 referee_results_*.json
 test-results/
+artifacts/
 
 # Local training output
 examples/material_sorting/perception/training/

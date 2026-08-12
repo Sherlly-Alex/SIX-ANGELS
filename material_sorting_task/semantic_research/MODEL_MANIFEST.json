@@ -1,0 +1,19 @@
+{
+  "slm": {
+    "name": "Qwen2.5-3B-Instruct-GGUF Q4_K_M",
+    "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
+    "revision": "cc1e68eea5f05f88f41a6de1fc73110178f23715",
+    "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/cc1e68eea5f05f88f41a6de1fc73110178f23715/qwen2.5-3b-instruct-q4_k_m.gguf?download=true",
+    "sha256": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+    "bytes": 2104932768,
+    "license": "Qwen Research License",
+    "optional": true
+  },
+  "ml": {
+    "artifact": "semantic_research/artifacts/ml_slots_v2.joblib",
+    "metadata": "semantic_research/artifacts/ml_slots_v2.meta.json",
+    "source_split": "train",
+    "optional": true,
+    "reproducible_command": "python -m semantic_research.train_ml --splits train --out semantic_research/artifacts/ml_slots_v2.joblib"
+  }
+}

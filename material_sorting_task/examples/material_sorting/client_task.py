@@ -37,6 +37,7 @@ from instruction_parser import (
     parse_instruction_message,
     validate_instruction,
 )
+from semantic_audit import SemanticAudit
 from task_orchestration import parse_gameinfo, sorted_instructions
 
 
@@ -108,6 +109,7 @@ class CompetitionClient(Node):
             executors,
             referee_driven=self.execution_mode != "dry_run",
         )
+        self.semantic_audit = SemanticAudit(self.get_logger().info)
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
         self.spine_pub = self.create_publisher(
@@ -168,6 +170,7 @@ class CompetitionClient(Node):
             "client started; waiting for instruction, odometry and joint states; "
             f"execution_mode={self.execution_mode}"
         )
+        self.get_logger().info(self.semantic_audit.describe())
         if self.execution_mode == "dry_run":
             self.get_logger().warning(
                 "dry_run is scheduling-only: all three tasks advance without robot motion "
@@ -249,6 +252,9 @@ class CompetitionClient(Node):
                     for task in instructions
                 )
             )
+            # Research-only sidecar.  It consumes a snapshot after formal JSON
+            # acceptance and cannot change instructions/controller state.
+            self.semantic_audit.submit(instructions)
 
     def _taskinfo_cb(self, msg: String) -> None:
         self.referee_taskinfo = msg.data

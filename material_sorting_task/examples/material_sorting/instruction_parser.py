@@ -3,10 +3,10 @@
 统一处理三种输入形式：
   1. ROS2 /material/instruction JSON 数组（正式主路径）
   2. 单条 JSON 对象（测试/演示/外部接口）
-  3. 纯中文文本（答辩演示/兜底）
+  3. 纯中文文本（答辩演示/兜底；不具备 execution-ready JSON 字段）
 
-职责：数据规范化、文本兜底补全、冲突检测、合法性校验。
-不负责：视觉检测、坐标推算、导航、IK、抓取、裁判。
+正式结构化路径：只信任 JSON 中真实出现的执行字段；中文文本仅用于冲突检测，
+不得补全缺失槽位。纯文本路径可抽取语义槽位，但不能通过 require_execution_ready。
 
 用法::
 
@@ -175,6 +175,10 @@ class TaskInstruction:
 
     source: str
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # Keys that were actually present (and non-null) in the Server JSON object.
+    # Formal execution readiness must be judged against this set, never against
+    # values recovered from Chinese instruction text.
+    json_fields: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def semantic_valid(self) -> bool:
@@ -421,14 +425,40 @@ def validate_instruction(
         errors.append(f"task={task.task!r} must be a positive integer")
 
     if require_execution_ready:
-        if task.target_color is None:
+        # The formal Server publishes a complete three-task JSON contract.
+        # Readiness is based on JSON-present fields only — Chinese text must
+        # never recover a missing formal slot.
+        present = set(task.json_fields)
+        for name in (
+            "task",
+            "target_body",
+            "target_color",
+            "place_type",
+            "place_world",
+            "place_radius",
+        ):
+            if name not in present:
+                errors.append(
+                    f"execution-ready instruction requires JSON field {name}"
+                )
+        if "target_body" in present and (
+            not isinstance(task.target_body, str) or not task.target_body.strip()
+        ):
+            errors.append("execution-ready instruction requires target_body")
+        if "task" in present and task.task is None:
+            errors.append("execution-ready instruction requires task")
+        if "target_color" in present and task.target_color is None:
             errors.append("execution-ready instruction requires target_color")
-        if task.place_type is None:
+        if "place_type" in present and task.place_type is None:
             errors.append("execution-ready instruction requires place_type")
-        if task.place_world is None:
+        if "place_world" in present and task.place_world is None:
             errors.append("execution-ready instruction requires place_world")
+        if "place_radius" in present and task.place_radius is None:
+            errors.append("execution-ready instruction requires place_radius")
 
-    if task.place_type is not None:
+    if task.place_type is not None or (
+        require_execution_ready and "place_type" in task.json_fields
+    ):
         _validate_place_type_constraints(task, require_execution_ready, errors)
 
     if errors:
@@ -442,11 +472,21 @@ def _validate_place_type_constraints(
 ) -> None:
     """根据 place_type 进行额外字段校验。"""
     pt = task.place_type
+    present = set(task.json_fields)
 
     if pt in ("shelf_point", "table_point"):
         pass
 
     elif pt == "shelf_prop_side":
+        if require_execution_ready:
+            if "direction" not in present:
+                errors.append(
+                    "shelf_prop_side requires JSON field direction"
+                )
+            if "ref_prop" not in present and "ref_prop_body" not in present:
+                errors.append(
+                    "shelf_prop_side requires JSON field ref_prop or ref_prop_body"
+                )
         if task.direction is None:
             errors.append("shelf_prop_side requires direction")
         if task.ref_prop is None and task.ref_prop_body is None:
@@ -566,14 +606,17 @@ def parse_instruction_text(text: str) -> TaskInstruction:
         place_radius=None,
         source="text_fallback",
         warnings=warnings,
+        json_fields=frozenset(),
     )
 
 
 def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
     """从单条 JSON 对象生成 TaskInstruction。
 
-    优先级: 结构字段 > 文本解析 > 默认值。
-    结构字段与文本结果冲突时保留结构字段并记录 warning。
+    正式结构化路径：只采用 JSON 中真实存在的执行字段；中文文本仅用于冲突检测，
+    不得补全缺失的 target_color / place_type / direction / ref_prop 等槽位。
+    纯文本演示路径（无任何结构化字段）仍可用文本抽取语义槽位，但不具备
+    execution-ready 所需的 JSON 字段集合。
 
     Args:
         data: 单条指令 dict，至少包含 "instruction" 键。
@@ -592,6 +635,7 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
         raise InstructionParseError("instruction text is empty or missing")
 
     struct_fields, has_structure = _parse_struct_fields(data)
+    json_fields = frozenset(struct_fields.keys())
     warnings: list[str] = []
 
     # 1. 结构字段取值
@@ -606,23 +650,30 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
     place_world = struct_fields.get("place_world")
     place_radius = struct_fields.get("place_radius")
 
-    # 2. 文本兜底。颜色只从抓取分句读取，方向只从放置分句读取。
+    # 2. 文本抽取：结构化路径只做冲突检测；纯文本路径才用于补全。
     normalized = _normalize_text(instruction)
     pickup_clause, _ = _split_clauses(normalized)
     pickup_colors = _extract_all_colors(pickup_clause)
     if len(pickup_colors) > 1:
-        if structured_color is None:
+        if structured_color is None and not has_structure:
             raise InstructionParseError(
                 f"ambiguous: multiple colors {pickup_colors} in pickup clause: {instruction!r}")
-        warnings.append(
-            f"text target_color is ambiguous and ignored: {pickup_colors!r}")
-        text_color = None
+        if structured_color is None and has_structure:
+            warnings.append(
+                f"text target_color is ambiguous and ignored: {pickup_colors!r}")
+            text_color = None
+        elif structured_color is not None:
+            warnings.append(
+                f"text target_color is ambiguous and ignored: {pickup_colors!r}")
+            text_color = None
+        else:
+            text_color = None
     else:
         text_color = pickup_colors[0] if pickup_colors else None
 
     text_directions = _extract_all_directions(normalized)
     if len(text_directions) > 1:
-        if structured_direction is None:
+        if structured_direction is None and not has_structure:
             raise InstructionParseError(
                 f"ambiguous: multiple directions {text_directions} in placement clause: "
                 f"{instruction!r}")
@@ -636,13 +687,13 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
     text_target_kind = _extract_target_kind(pickup_clause)
     text_place_type = _classify_place_type(normalized, text_direction, text_reference)
 
-    # 3. 冲突检测
+    # 3. 冲突检测。颜色/方向与中文明显冲突时拒绝整条指令。
     if structured_color is not None and text_color is not None and structured_color != text_color:
-        warnings.append(
+        raise InstructionParseError(
             f"target_color conflict: structured={structured_color!r}, text={text_color!r}")
     if (structured_direction is not None and text_direction is not None
             and structured_direction != text_direction):
-        warnings.append(
+        raise InstructionParseError(
             f"direction conflict: structured={structured_direction!r}, text={text_direction!r}")
     for field_name, structured_value, text_value in (
             ("target_kind", target_kind, text_target_kind),
@@ -654,17 +705,31 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
                 f"{field_name} conflict: structured={structured_value!r}, "
                 f"text={text_value!r}")
 
-    # 4. 最终取值（结构优先）
-    final_color = structured_color if structured_color is not None else text_color
-    final_direction = structured_direction if structured_direction is not None else text_direction
-    final_ref_prop = ref_prop if ref_prop is not None else text_reference
-    final_target_kind = target_kind if target_kind is not None else text_target_kind
+    # 4. 最终取值。结构化 JSON 路径禁止用文本补全正式执行槽位。
+    if has_structure:
+        final_color = structured_color
+        final_direction = structured_direction
+        final_ref_prop = ref_prop
+        final_place_type = place_type
+        final_target_kind = target_kind
+        if structured_color is None and text_color is not None:
+            warnings.append("text target_color ignored; JSON field missing")
+        if place_type is None and text_place_type is not None:
+            warnings.append("text place_type ignored; JSON field missing")
+        if structured_direction is None and text_direction is not None:
+            warnings.append("text direction ignored; JSON field missing")
+        if ref_prop is None and text_reference is not None:
+            warnings.append("text ref_prop ignored; JSON field missing")
+        source = "structured"
+    else:
+        final_color = text_color
+        final_direction = text_direction
+        final_ref_prop = text_reference
+        final_place_type = text_place_type
+        final_target_kind = text_target_kind
+        source = "text_fallback"
+
     final_ref_prop_body = ref_prop_body
-
-    # 放置类型：结构字段优先，否则走文本推断
-    final_place_type = place_type if place_type is not None else text_place_type
-
-    # 纯文本兜底时 place_world 不还原
     final_place_world = place_world
     final_place_radius = place_radius
 
@@ -676,21 +741,6 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
         warnings.append(
             f"legacy reference prop {final_ref_prop!r} is not executable"
         )
-
-    # source 判定
-    used_text_fallback = any((
-        structured_color is None and text_color is not None,
-        structured_direction is None and text_direction is not None,
-        ref_prop is None and text_reference is not None,
-        target_kind is None and text_target_kind is not None,
-        place_type is None and text_place_type is not None,
-    ))
-    if not has_structure:
-        source = "text_fallback"
-    elif used_text_fallback:
-        source = "hybrid"
-    else:
-        source = "structured"
 
     return TaskInstruction(
         task=task,
@@ -706,6 +756,7 @@ def parse_instruction_dict(data: dict[str, Any]) -> TaskInstruction:
         place_radius=final_place_radius,
         source=source,
         warnings=tuple(warnings),
+        json_fields=json_fields,
     )
 
 

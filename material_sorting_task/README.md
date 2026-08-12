@@ -34,6 +34,7 @@ scripts/
   setup_env_gpu.sh               ROS 2 / GPU 环境初始化
 tests/                            不依赖 ROS 2 的单元测试
 docs/                             架构和开发说明
+semantic_research/                离线语义旁路（Regex/ML/SLM），不进入正式控制链
 ```
 
 ## 运行
@@ -173,10 +174,23 @@ bash scripts/run_client.sh
 
 ## 测试
 
+正式（不发现 `tests/semantic_research`，无需 sklearn）：
+
 ```bash
-python3 -m unittest discover -s tests -t .
-python3 scripts/check_workspace.py
+bash scripts/run_formal_tests.sh
+python scripts/check_workspace.py
 ```
+
+研究旁路单测与离线评估（与 `run_client.sh` 互不依赖）：
+
+```bash
+bash scripts/run_semantic_research_tests.sh
+bash scripts/run_semantic_research_eval.sh
+```
+
+语义真值与旁路边界见 [docs/SEMANTIC_PARSING.md](docs/SEMANTIC_PARSING.md)、
+[docs/DEPENDENCIES_LICENSES.md](docs/DEPENDENCIES_LICENSES.md)、
+[semantic_research/README.md](semantic_research/README.md)。
 
 开发约束和后续实现顺序见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 导航 v3 的兼容边界、接入结构和本地/SSH 验证步骤见

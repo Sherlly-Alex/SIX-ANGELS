@@ -1,0 +1,16 @@
+# Research-only dependencies. Do NOT install into the formal competition image
+# unless explicitly reviewing an offline experiment.
+#
+# License notes (verify upstream before redistribution):
+# - scikit-learn: BSD-3-Clause
+# - joblib: BSD-3-Clause
+# - scipy/numpy: BSD-style
+# - llama-cpp-python (optional P4): MIT; model weights have separate licenses
+
+scikit-learn>=1.3
+joblib>=1.3
+numpy>=1.24
+scipy>=1.10
+
+# Optional local SLM runtime (P4). Default offline path does not download weights.
+# llama-cpp-python>=0.2.0
