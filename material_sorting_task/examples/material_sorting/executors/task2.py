@@ -39,6 +39,7 @@ from shelf.manipulation import (
     ShelfOpenPregraspController,
     SlideHoldController,
 )
+from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf.task_memory import CompetitionTaskMemory
 from shelf.target_center import StableTargetCenterTracker
 
@@ -110,6 +111,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     TABLE_RETREAT_M = 0.35
     PLACE_CLEARANCE_M = 0.055
     PLACE_TIMEOUT_S = 25.0
+    RELEASE_SUPPORT_SETTLE_S = 0.40
     ARM_RETRACT_TIMEOUT_S = 15.0
     TRANSPORT_SEGMENT_TIMEOUT_S = 30.0
     # Keep the successful shelf grasp completely unchanged during transport.
@@ -133,6 +135,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._memory = memory
         self._transfer = TransferMotion()
         self._slide_hold = SlideHoldController()
+        self._place_lowering = CompliantSlideLoweringController()
         self._carried_envelope = CarriedEnvelopeChecker()
         self._release = ReleaseSpreadController()
         self._arm_retract = ArmRetractController()
@@ -156,6 +159,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().reset()
         self._transfer.reset()
         self._slide_hold.reset()
+        self._place_lowering.reset()
         self._release.reset()
         self._arm_retract.reset()
         self._target_center_tracker.reset()
@@ -212,8 +216,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._phase = "clearance"
         elif stage is TaskStage.PLACE:
             self._slide_hold.reset()
+            self._place_lowering.reset()
             self._release.reset()
             self._phase = "lower"
+            self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.VERIFY_PLACE:
             self._phase = "verify"
         elif stage is TaskStage.TRANSPORT:
@@ -277,6 +283,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         super().cancel(reason)
         self._transfer.reset()
         self._slide_hold.reset()
+        self._place_lowering.reset()
         self._release.reset()
         self._arm_retract.reset()
         self._pregrasp.reset()
@@ -1398,7 +1405,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         if self._place_world is None:
             return StageResult.blocked("task 2 placement has no saved table target")
         if self._phase == "lower":
-            if not self._slide_hold.planned:
+            if not self._place_lowering.planned:
                 target_slide = (
                     self._held_arm_command.spine_position
                     + self._held_center_base[2]
@@ -1406,7 +1413,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
                 try:
                     self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
+                    self._held_arm_command = self._place_lowering.plan(
                         self._held_arm_command, target_slide, context.joint_states
                     )
                 except (PregraspInputError, PregraspPlanningError) as exc:
@@ -1414,10 +1421,26 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                         f"task 2 could not plan table lowering: {exc}",
                         arm_command=self._held_arm_command,
                     )
-            result = self._tick_slide(context, "lowering box onto original table point")
+            result = self._tick_slide(
+                context,
+                "lowering box compliantly onto original table point",
+                controller=self._place_lowering,
+            )
             if result is not None:
                 return result
+            self._phase = "support_settle"
+            self._phase_started_s = float(context.now_s)
+
+        if self._phase == "support_settle":
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed < self.RELEASE_SUPPORT_SETTLE_S:
+                return StageResult.running(
+                    "task 2 holding the placed box on the table before "
+                    f"release ({elapsed:.2f}/{self.RELEASE_SUPPORT_SETTLE_S:.2f}s)",
+                    arm_command=self._held_arm_command,
+                )
             self._phase = "release"
+            self._phase_started_s = float(context.now_s)
 
         if self._phase == "release":
             if not self._release.planned:
@@ -1580,9 +1603,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self,
         context: ExecutionContext,
         action: str,
+        *,
+        controller: SlideHoldController | CompliantSlideLoweringController | None = None,
     ) -> StageResult | None:
+        active_controller = controller or self._slide_hold
         try:
-            command, reached, detail = self._slide_hold.update(
+            command, reached, detail = active_controller.update(
                 context.now_s, context.joint_states
             )
         except (PregraspInputError, PregraspPlanningError) as exc:
@@ -1602,6 +1628,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             if self.active_stage is TaskStage.TRANSPORT:
                 started_s = self._phase_started_s
                 timeout_s = self.TRANSPORT_SEGMENT_TIMEOUT_S
+            elif self.active_stage is TaskStage.PLACE:
+                started_s = self._phase_started_s
+                timeout_s = self.PLACE_TIMEOUT_S
             else:
                 started_s = self._stage_started_s
                 timeout_s = self.PLACE_TIMEOUT_S

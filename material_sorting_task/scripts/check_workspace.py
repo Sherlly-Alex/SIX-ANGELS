@@ -36,6 +36,7 @@ REQUIRED = (
     TASK / "desktop_grasp" / "semantic_target_locator.py",
     TASK / "desktop_grasp" / "target_metadata.py",
     TASK / "desktop_grasp" / "pregrasp_core.py",
+    TASK / "shelf" / "placement_feedback.py",
     ROOT / "scripts" / "run_client.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
 )

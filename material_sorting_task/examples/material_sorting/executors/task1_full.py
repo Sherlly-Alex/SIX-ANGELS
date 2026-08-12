@@ -26,6 +26,7 @@ from shelf.manipulation import (
     ReleaseSpreadController,
     SlideHoldController,
 )
+from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf.state_tracker import COLORED_CLASSES, ShelfState, ShelfStateTracker
 from shelf.task_memory import CompetitionTaskMemory
 
@@ -91,6 +92,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
         )
         self._slide_hold = SlideHoldController()
+        self._place_lowering = CompliantSlideLoweringController()
         # Task 1 releases inside the shelf and therefore uses a dedicated slow
         # rate.  Tasks 2/3 retain the existing release speed.
         self._release = ReleaseSpreadController(
@@ -141,6 +143,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._direct_shelf_transfer.reset()
         self._slide_hold.reset()
+        self._place_lowering.reset()
         self._release.reset()
         self._arm_retract.reset()
         self._held_center_base = None
@@ -184,6 +187,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             self._phase = "scan_shelf"
         elif stage is TaskStage.PLACE:
             self._slide_hold.reset()
+            self._place_lowering.reset()
             self._release.reset()
             self._phase = "lower"
             self._phase_started_s = float(context.now_s)
@@ -254,6 +258,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._transfer.reset()
         self._direct_shelf_transfer.reset()
         self._slide_hold.reset()
+        self._place_lowering.reset()
         self._release.reset()
         self._arm_retract.reset()
 
@@ -717,7 +722,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         if self._place_world is None:
             return StageResult.blocked("task 1 placement has no empty-layer target")
         if self._phase == "lower":
-            if not self._slide_hold.planned:
+            if not self._place_lowering.planned:
                 target_slide = (
                     self._held_arm_command.spine_position
                     + self._held_center_base[2]
@@ -725,7 +730,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
                 try:
                     self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
+                    self._held_arm_command = self._place_lowering.plan(
                         self._held_arm_command,
                         target_slide,
                         context.joint_states,
@@ -735,7 +740,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                         f"task 1 could not plan shelf lowering: {exc}",
                         arm_command=self._held_arm_command,
                     )
-            result = self._tick_slide(context, "lowering box onto shelf board")
+            result = self._tick_slide(
+                context,
+                "lowering box compliantly onto shelf board",
+                controller=self._place_lowering,
+            )
             if result is not None:
                 return result
             self._phase = "release_support_settle"
@@ -967,9 +976,12 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self,
         context: ExecutionContext,
         action: str,
+        *,
+        controller: SlideHoldController | CompliantSlideLoweringController | None = None,
     ) -> StageResult | None:
+        active_controller = controller or self._slide_hold
         try:
-            command, reached, detail = self._slide_hold.update(
+            command, reached, detail = active_controller.update(
                 context.now_s, context.joint_states
             )
         except (PregraspInputError, PregraspPlanningError) as exc:

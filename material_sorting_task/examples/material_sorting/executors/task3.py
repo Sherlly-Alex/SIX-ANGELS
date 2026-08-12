@@ -17,6 +17,7 @@ from navigation.navigation_types import NavigationGoal, NavigationSegment, Navig
 from navigation.competition_adapter import goal_reached_event
 from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import HeldTransportController
+from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf.task3_geometry import (
     TASK3_SAFE_RELEASE_CENTER_INSET_M,
     task3_safe_release_target,
@@ -98,6 +99,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_RELEASE_SPREAD_M = 0.040
     TASK3_RELEASE_MIN_HALF_WIDTH_M = 0.110
     TASK3_RELEASE_MAX_HALF_WIDTH_M = 0.140
+    TASK3_RELEASE_SUPPORT_SETTLE_S = 0.40
     # Keep the arms/box in the verified grasp pose.  After the reverse retreat,
     # drive directly to a shelf-front pre-place stand that is this far east of
     # the measured observation stand.  The 0.15 m offset keeps the carried
@@ -140,6 +142,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_insert_target_base: tuple[float, float, float] | None = None
         self._task3_safe_front_stand: tuple[float, float] | None = None
         self._task3_lift_fallback_since_s: float | None = None
+        self._task3_place_lowering = CompliantSlideLoweringController()
 
     def reset(self) -> None:
         super().reset()
@@ -157,6 +160,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._task3_insert_target_base = None
         self._task3_safe_front_stand = None
         self._task3_lift_fallback_since_s = None
+        self._task3_place_lowering.reset()
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -195,6 +199,13 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._held_insert.reset()
             self._task3_shallow_place_stand = None
             self._task3_insert_target_base = None
+        elif stage is TaskStage.PLACE:
+            # Task 3 owns a separate placement-feedback epoch.  Only its
+            # vertical lowering is replaced; release and the post-release
+            # retreat/compact/push route remain unchanged.
+            self._task3_place_lowering.reset()
+            self._phase = "lower"
+            self._phase_started_s = float(context.now_s)
         elif stage is TaskStage.RETURN_TO_END:
             # Task 3 has a different post-release safety sequence from task 1:
             # retreat, compact the open arms, make a short second push, retreat
@@ -983,7 +994,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         if self._place_world is None:
             return StageResult.blocked("task 3 placement has no formal target")
         if self._phase == "lower":
-            if not self._slide_hold.planned:
+            if not self._task3_place_lowering.planned:
                 target_slide = (
                     self._held_arm_command.spine_position
                     + self._held_center_base[2]
@@ -991,7 +1002,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 )
                 try:
                     self._slide_start = self._held_arm_command.spine_position
-                    self._held_arm_command = self._slide_hold.plan(
+                    self._held_arm_command = self._task3_place_lowering.plan(
                         self._held_arm_command,
                         target_slide,
                         context.joint_states,
@@ -1003,10 +1014,23 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     )
             result = self._tick_slide(
                 context,
-                "lowering task-3 box vertically onto the shelf board",
+                "lowering task-3 box compliantly onto the shelf board",
+                controller=self._task3_place_lowering,
             )
             if result is not None:
                 return result
+            self._phase = "support_settle"
+            self._phase_started_s = float(context.now_s)
+
+        if self._phase == "support_settle":
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed < self.TASK3_RELEASE_SUPPORT_SETTLE_S:
+                return StageResult.running(
+                    "task 3 holding the placed box on shelf support before "
+                    f"release ({elapsed:.2f}/"
+                    f"{self.TASK3_RELEASE_SUPPORT_SETTLE_S:.2f}s)",
+                    arm_command=self._held_arm_command,
+                )
             self._phase = "release"
             self._phase_started_s = float(context.now_s)
 

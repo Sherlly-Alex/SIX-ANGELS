@@ -26,6 +26,7 @@ from shelf.manipulation import (
     ShelfOpenPregraspController,
     SlideHoldController,
 )
+from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf.state_tracker import ShelfStateTracker
 from shelf.target_center import StableTargetCenterTracker
 from shelf.task_memory import CompetitionTaskMemory
@@ -274,6 +275,17 @@ class SlideHoldControllerTests(unittest.TestCase):
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):
+    def test_all_integrated_tasks_use_independent_compliant_place_lowering(self) -> None:
+        memory = CompetitionTaskMemory()
+        task1 = Task1IntegratedExecutor(memory)
+        task2 = Task2IntegratedExecutor(memory)
+
+        self.assertIsInstance(task1._place_lowering, CompliantSlideLoweringController)
+        self.assertIsInstance(task2._place_lowering, CompliantSlideLoweringController)
+        self.assertIsNot(task1._place_lowering, task2._place_lowering)
+        self.assertEqual(task1.RELEASE_SUPPORT_SETTLE_S, 0.40)
+        self.assertEqual(task2.RELEASE_SUPPORT_SETTLE_S, 0.40)
+
     def test_task1_uses_slow_staged_shelf_release(self) -> None:
         executor = Task1IntegratedExecutor(CompetitionTaskMemory())
 

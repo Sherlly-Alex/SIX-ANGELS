@@ -14,6 +14,7 @@ from shelf.task3_geometry import (
     task3_scoring_target,
 )
 from shelf.task_memory import CompetitionTaskMemory
+from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf_geometry import load_shelf_geometry
 
 
@@ -79,6 +80,19 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         memory.record_shelf_state(state)
         return memory
 
+    def test_task3_uses_independent_compliant_place_lowering_and_keeps_tail(self) -> None:
+        executor = Task3IntegratedExecutor(self._memory())
+        self.assertIsInstance(
+            executor._task3_place_lowering,
+            CompliantSlideLoweringController,
+        )
+        self.assertIsNot(executor._task3_place_lowering, executor._place_lowering)
+        self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
+        self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
+        self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
+        self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
+
     def test_executor_uses_task1_grasp_and_task3_orientation(self) -> None:
         executor = Task3IntegratedExecutor(self._memory())
         self.assertEqual(executor.task_id, 3)
@@ -97,6 +111,16 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor.TASK3_RELEASE_SPREAD_M, 0.035)
         self.assertEqual(executor.TASK3_RELEASE_MIN_HALF_WIDTH_M, 0.110)
         self.assertEqual(executor.TASK3_RELEASE_MAX_HALF_WIDTH_M, 0.140)
+        self.assertIsInstance(
+            executor._task3_place_lowering,
+            CompliantSlideLoweringController,
+        )
+        self.assertIsNot(executor._task3_place_lowering, executor._place_lowering)
+        self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
+        self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
+        self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
+        self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
         self.assertTrue(executor._held_insert.allow_extension)
         self.assertEqual(executor._held_insert.max_translation_m, 0.30)
 
