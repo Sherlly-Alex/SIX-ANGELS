@@ -68,9 +68,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     ARM_RETRACT_TIMEOUT_S = 15.0
     RELEASE_SUPPORT_SETTLE_S = 0.40
     RELEASE_STAGE_SETTLE_S = 0.25
-    RELEASE_UNLOAD_M = 0.006
-    RELEASE_MIDDLE_HALF_WIDTH_M = 0.14
-    RELEASE_FINAL_HALF_WIDTH_M = 0.18
+    RELEASE_SPREAD_M = 0.040
     RELEASE_COMMAND_RATE_PER_S = 0.30
 
     def __init__(self, memory: CompetitionTaskMemory) -> None:
@@ -767,27 +765,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     "task 1 held half-width is invalid before shelf release",
                     arm_command=self._held_arm_command,
                 )
-            candidates = (
-                min(
-                    held_half_width + self.RELEASE_UNLOAD_M,
-                    self.RELEASE_FINAL_HALF_WIDTH_M,
-                ),
-                self.RELEASE_MIDDLE_HALF_WIDTH_M,
-                self.RELEASE_FINAL_HALF_WIDTH_M,
+            self._release_half_widths = (
+                held_half_width + self.RELEASE_SPREAD_M,
             )
-            widths: list[float] = []
-            previous = held_half_width
-            for width in candidates:
-                width = float(width)
-                if width > previous + 1e-6:
-                    widths.append(width)
-                    previous = width
-            if not widths:
-                return StageResult.blocked(
-                    "task 1 shelf release has no outward half-width waypoint",
-                    arm_command=self._held_arm_command,
-                )
-            self._release_half_widths = tuple(widths)
             self._release_stage_index = 0
             self._release_settle_started_s = None
             self._release.reset()

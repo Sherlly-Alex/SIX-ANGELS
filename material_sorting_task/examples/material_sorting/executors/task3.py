@@ -82,12 +82,12 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # stand and wiring tests.  No arm-insertion controller is executed now.
     TASK3_ARM_INSERTION_M = 0.240
     TASK3_ARM_INSERT_TIMEOUT_S = 20.0
-    TASK3_EXTRA_BASE_ADVANCE_M = 0.20
+    TASK3_EXTRA_BASE_ADVANCE_M = 0.15
     TASK3_POST_RELEASE_RETREAT_M = 0.40
     # ``ReleaseSpreadController`` interprets this as the per-arm half-width,
     # matching the competition client's gripper-width convention.
     TASK3_POST_RELEASE_HALF_WIDTH_M = 0.065
-    TASK3_POST_RELEASE_PUSH_M = 0.45
+    TASK3_POST_RELEASE_PUSH_M = 0.38
     TASK3_POST_PUSH_RETREAT_M = 0.45
     TASK3_RETURN_SEQUENCE_TIMEOUT_S = 90.0
     TASK3_RAISE_SPINE_TIMEOUT_S = 30.0
