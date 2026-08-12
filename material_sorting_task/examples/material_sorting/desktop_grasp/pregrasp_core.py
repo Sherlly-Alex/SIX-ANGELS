@@ -28,6 +28,12 @@ HAND_Z_OFFSET = 0.02
 GRIPPER_OPEN = 1.0
 GRASP_BACKOFF_X = -0.02
 GRASP_INITIAL_PRELOAD = 0.002
+# With effort feedback available, the ordinary position-controlled approach
+# stops this far outside the measured box surface.  The remaining motion is
+# generated continuously by ``track_inward_offset`` so contact is observable
+# and the wrist can follow the surface before it is locked.
+COMPLIANT_ENTRY_CLEARANCE_M = 0.010
+COMPLIANT_ENTRY_TRAVEL_M = GRASP_INITIAL_PRELOAD + COMPLIANT_ENTRY_CLEARANCE_M
 BOX_HALF_EXTENTS_BY_ORIENTATION = {
     "yaw0": np.array([0.12, 0.08], dtype=float),
     "yaw90": np.array([0.08, 0.12], dtype=float),
@@ -603,6 +609,14 @@ class ContactGraspController(OpenPregraspController):
         )
 
     @property
+    def bilateral_contact_seen(self) -> bool:
+        """Whether both wrists have independently latched first contact."""
+
+        return self.compliance_enabled and all(
+            wrist.contact_seen for wrist in (self._left_wrist, self._right_wrist)
+        )
+
+    @property
     def preload_effort_limit_reached(self) -> bool:
         return self.compliance_enabled and any(
             wrist.latest_effort_delta >= WRIST_PRELOAD_SOFT_LIMIT_DELTA
@@ -718,12 +732,19 @@ class ContactGraspController(OpenPregraspController):
                     self._action_vector[wrist.vector_index] = wrist.locked_position
 
     def retry_compliance(self) -> None:
-        """Clear contact latches after a bounded one-millimetre backoff."""
+        """Retry only wrists that have not completed surface alignment.
+
+        A wrist that is already aligned has a valid measured surface angle.
+        Keeping its lock prevents a one-sided retry from throwing away the
+        successful side and making the grasp oscillate between two contacts.
+        """
 
         if not self.compliance_enabled:
             return
         self._server_contact = False
         for wrist in (self._left_wrist, self._right_wrist):
+            if wrist.aligned and wrist.locked_position is not None:
+                continue
             wrist.contact_candidate_since_s = None
             wrist.contact_seen = False
             wrist.aligned_since_s = None
@@ -742,10 +763,18 @@ class ContactGraspController(OpenPregraspController):
     ) -> ArmCommand:
         robot_pose = _odometry_pose(odometry)
         self._orientation = str(orientation)
-        self._half_width = _oriented_grasp_half_width(
+        nominal_half_width = _oriented_grasp_half_width(
             self._orientation,
             robot_pose[2],
         )
+        # The old implementation sent the arms directly to the nominal
+        # contact/preload pose and only made the final 4 mm compliant.  When
+        # effort feedback is usable, stop the fast segment 10 mm outside the
+        # physical box face instead.  The executor then traverses the full
+        # remaining gap continuously at the bounded compliant speed.
+        self._half_width = nominal_half_width
+        if self.compliance_enabled:
+            self._half_width += COMPLIANT_ENTRY_TRAVEL_M
         command = self._plan_pose(
             target_world,
             odometry,
@@ -865,8 +894,11 @@ class ContactGraspController(OpenPregraspController):
             self._orientation,
             robot_pose[2],
         )
+        entry_half_width = nominal_half_width
+        if self.compliance_enabled:
+            entry_half_width += COMPLIANT_ENTRY_TRAVEL_M
         self.ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
-        self._half_width = max(nominal_half_width - offset, 0.01)
+        self._half_width = max(entry_half_width - offset, 0.01)
         self._plan_pose(
             target_world,
             odometry,
@@ -956,13 +988,15 @@ class ContactGraspController(OpenPregraspController):
                 wrist.latest_angle_delta >= WRIST_CONTACT_MIN_ROTATION_RAD
                 or self._server_contact
             )
-            effort_present = (
-                wrist.latest_effort_delta >= wrist.effort_threshold
-                or self._server_contact
-            )
+            # Effort is required to latch first contact above.  It is not
+            # required to remain high while the free wrist rotates into full
+            # surface contact: that rotation can unload joint 6 even though
+            # the pad is still touching the box.  After contact_seen, use the
+            # measured angle and low velocity to identify a settled face, while
+            # the separate soft/absolute effort limits continue to protect the
+            # subsequent preload.
             stable = (
                 angle_aligned
-                and effort_present
                 and wrist.latest_velocity <= WRIST_ALIGN_VELOCITY_RAD_S
             )
             if stable:

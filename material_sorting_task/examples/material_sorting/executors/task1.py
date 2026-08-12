@@ -18,6 +18,8 @@ from executors.base import (
     TaskStage,
 )
 from desktop_grasp.pregrasp_core import (
+    COMPLIANT_ENTRY_CLEARANCE_M as DEFAULT_COMPLIANT_ENTRY_CLEARANCE_M,
+    COMPLIANT_ENTRY_TRAVEL_M as DEFAULT_COMPLIANT_ENTRY_TRAVEL_M,
     ContactGraspController,
     OpenPregraspController,
     PregraspInputError,
@@ -478,9 +480,15 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     COMPLIANT_CONTACT_SPEED_M_S = 0.0005
     COMPLIANT_PRELOAD_SPEED_M_S = 0.0010
     COMPLIANT_DT_MAX_S = 0.10
-    COMPLIANT_SOFT_MAX_M = 0.004
+    # The fast pose ends 10 mm outside the physical box surface.  Because the
+    # old nominal grasp already contains 2 mm initial preload, reaching that
+    # nominal pose takes 12 mm from the new compliant entry.  Preserve the old
+    # additional 4 mm bounded search margin and 2 mm hard safety margin.
+    COMPLIANT_ENTRY_CLEARANCE_M = DEFAULT_COMPLIANT_ENTRY_CLEARANCE_M
+    COMPLIANT_ENTRY_TRAVEL_M = DEFAULT_COMPLIANT_ENTRY_TRAVEL_M
+    COMPLIANT_SOFT_MAX_M = COMPLIANT_ENTRY_TRAVEL_M + 0.004
     COMPLIANT_POST_ALIGN_PRELOAD_M = 0.002
-    COMPLIANT_ABSOLUTE_MAX_M = 0.006
+    COMPLIANT_ABSOLUTE_MAX_M = COMPLIANT_ENTRY_TRAVEL_M + 0.006
     COMPLIANT_SINGLE_SIDE_WAIT_S = 2.0
     COMPLIANT_RETRY_BACKOFF_M = 0.001
     COMPLIANT_MAX_RETRIES = 1
@@ -799,11 +807,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             if self._compliance_post_align_target_m is None:
                 self._compliance_post_align_target_m = min(
                     self.COMPLIANT_ABSOLUTE_MAX_M,
-                    max(
-                        self.CONTACT_SEARCH_MAX_M,
-                        self._contact_search_used_m
-                        + self.COMPLIANT_POST_ALIGN_PRELOAD_M,
-                    ),
+                    self._contact_search_used_m
+                    + self.COMPLIANT_POST_ALIGN_PRELOAD_M,
                 )
                 self._compliant_motion_last_s = now_s
 
@@ -905,7 +910,10 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 "task 1 continuously advancing the compliant contact search; "
                 f"speed={speed_m_s * 1000.0:.1f} mm/s, "
                 f"offset={next_offset * 1000.0:.1f}/"
-                f"{self.COMPLIANT_SOFT_MAX_M * 1000.0:.1f} mm; {diagnostic}",
+                f"{self.COMPLIANT_SOFT_MAX_M * 1000.0:.1f} mm, "
+                "surface_clearance="
+                f"{max(0.0, self.COMPLIANT_ENTRY_CLEARANCE_M - next_offset) * 1000.0:.1f} mm; "
+                f"{diagnostic}",
                 arm_command=replanned,
             )
 
@@ -919,8 +927,12 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             wait_s = max(0.0, now_s - self._compliance_wait_since_s)
             if wait_s >= self.COMPLIANT_SINGLE_SIDE_WAIT_S:
                 any_contact = bool(getattr(self._contact, "any_contact", False))
+                bilateral_contact_seen = bool(
+                    getattr(self._contact, "bilateral_contact_seen", False)
+                )
                 if (
                     any_contact
+                    and not bilateral_contact_seen
                     and self._compliance_retry_count
                     < self.COMPLIANT_MAX_RETRIES
                 ):
@@ -929,7 +941,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                         self._contact_search_used_m
                         - self.COMPLIANT_RETRY_BACKOFF_M,
                     )
-                    replanned = self._replan_contact_offset(
+                    replanned = self._track_contact_offset(
                         context,
                         next_offset,
                         "single-side contact backoff",
@@ -1054,7 +1066,10 @@ class Task1LiftExecutor(Task1ContactExecutor):
     name = "task1_lift_only"
     REQUIRE_SERVER_CONTACT = False
     ALLOW_SETTLED_MAX_SEARCH = True
-    CONTACT_TIMEOUT_S = 25.0
+    # The compliant phase now includes the visible 10 mm approach outside the
+    # box surface.  Keep it bounded but leave enough time for a one-sided
+    # 0.5 mm/s contact correction and the single safe retry.
+    CONTACT_TIMEOUT_S = 35.0
     LIFT_TIMEOUT_S = 15.0
 
     def __init__(

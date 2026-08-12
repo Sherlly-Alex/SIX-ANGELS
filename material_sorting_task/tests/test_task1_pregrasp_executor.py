@@ -7,6 +7,8 @@ import unittest
 import numpy as np
 
 from desktop_grasp.pregrasp_core import (
+    COMPLIANT_ENTRY_CLEARANCE_M,
+    COMPLIANT_ENTRY_TRAVEL_M,
     ContactGraspController,
     OpenPregraspController,
     SlideLiftController,
@@ -132,7 +134,7 @@ class FakeCompliantContactController(FakeContactController):
         super().__init__()
         self.compliance_enabled = True
         self.bilateral_aligned = False
-        self.any_contact = True
+        self.any_contact = False
         self.preload_effort_limit_reached = False
         self.hard_effort_limit_exceeded = False
         self.diagnostic_summary = "compliance=fake"
@@ -141,6 +143,7 @@ class FakeCompliantContactController(FakeContactController):
         super().reset()
         self.compliance_enabled = True
         self.bilateral_aligned = False
+        self.any_contact = False
 
     def prepare_compliance(self, now_s, joint_states):
         return True, self.diagnostic_summary
@@ -161,7 +164,8 @@ class FakeCompliantContactController(FakeContactController):
             odometry,
             joint_states,
         )
-        if inward_offset >= 0.001 - 1e-9:
+        if inward_offset >= COMPLIANT_ENTRY_CLEARANCE_M - 1e-9:
+            self.any_contact = True
             self.bilateral_aligned = True
         return command
 
@@ -174,7 +178,8 @@ class FakeCompliantContactController(FakeContactController):
             odometry,
             joint_states,
         )
-        if inward_offset >= 0.001 - 1e-9:
+        if inward_offset >= COMPLIANT_ENTRY_CLEARANCE_M - 1e-9:
+            self.any_contact = True
             self.bilateral_aligned = True
         return command
 
@@ -353,6 +358,45 @@ class OpenPregraspControllerTests(unittest.TestCase):
         )
         self.assertAlmostEqual(controller.ARM_POSITION_TOL, 0.24, places=6)
 
+    def test_compliant_contact_starts_ten_mm_outside_box_surface(self) -> None:
+        kdl = FakeKdl()
+        controller = ContactGraspController(kdl=kdl)
+        feedback = joint_states()
+        ready = False
+        for tick in range(9):
+            ready, _ = controller.prepare_compliance(tick * 0.05, feedback)
+        self.assertTrue(ready)
+
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+
+        # yaw0 at this robot yaw has a 0.120 m physical lateral half extent.
+        # The fast pose must therefore stop at 0.130 m, not at the old
+        # 0.118 m preload pose.
+        self.assertAlmostEqual(controller.half_width, 0.130, places=6)
+        self.assertAlmostEqual(kdl.left[1, 3], 0.130, places=6)
+        self.assertAlmostEqual(kdl.right[1, 3], -0.130, places=6)
+
+        controller.track_inward_offset(
+            (-0.18, 2.20, 0.834),
+            COMPLIANT_ENTRY_CLEARANCE_M,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+        self.assertAlmostEqual(controller.half_width, 0.120, places=6)
+
+        controller.track_inward_offset(
+            (-0.18, 2.20, 0.834),
+            COMPLIANT_ENTRY_TRAVEL_M,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+        self.assertAlmostEqual(controller.half_width, 0.118, places=6)
+
     def test_contact_pose_adds_symmetric_five_degree_toe_in(self) -> None:
         kdl = FakeKdl()
         controller = ContactGraspController(kdl=kdl)
@@ -443,6 +487,77 @@ class OpenPregraspControllerTests(unittest.TestCase):
         )
         self.assertAlmostEqual(tightened.left_arm_positions[5], 0.04, places=6)
         self.assertAlmostEqual(tightened.right_arm_positions[5], -0.04, places=6)
+
+    def test_wrist_alignment_survives_effort_release_after_contact(self) -> None:
+        controller = ContactGraspController(kdl=FakeKdl())
+        expected_slide = 1.32163718 - 0.854
+        baseline = joint_states(slide=expected_slide)
+        for tick in range(9):
+            controller.prepare_compliance(tick * 0.05, baseline)
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            baseline,
+        )
+
+        contact = joint_states(
+            slide=expected_slide,
+            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.04],
+            left_effort=[0.0, 0.0, 0.0, 0.0, 0.0, 0.8],
+            right_effort=[0.0, 0.0, 0.0, 0.0, 0.0, -0.8],
+        )
+        now_s = 0.50
+        for _ in range(20):
+            controller.update(now_s, contact)
+            now_s += 0.05
+            if controller._left_wrist.contact_seen and controller._right_wrist.contact_seen:
+                break
+        self.assertTrue(controller.bilateral_contact_seen)
+
+        # Surface alignment unloads joint 6 back near its baseline.  Contact
+        # remains latched and both wrists must still lock from angle + velocity.
+        relaxed = joint_states(
+            slide=expected_slide,
+            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.04],
+        )
+        for _ in range(20):
+            controller.update(now_s, relaxed)
+            now_s += 0.05
+            if controller.bilateral_aligned:
+                break
+
+        self.assertTrue(controller.bilateral_aligned)
+        self.assertLess(
+            controller._left_wrist.latest_effort_delta,
+            controller._left_wrist.effort_threshold,
+        )
+
+    def test_retry_preserves_an_already_locked_wrist(self) -> None:
+        controller = ContactGraspController(kdl=FakeKdl())
+        expected_slide = 1.32163718 - 0.854
+        feedback = joint_states(slide=expected_slide)
+        for tick in range(9):
+            controller.prepare_compliance(tick * 0.05, feedback)
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+        controller._left_wrist.contact_seen = True
+        controller._left_wrist.aligned = True
+        controller._left_wrist.locked_position = 0.04
+        controller._right_wrist.contact_seen = False
+
+        controller.retry_compliance()
+
+        self.assertTrue(controller._left_wrist.contact_seen)
+        self.assertTrue(controller._left_wrist.aligned)
+        self.assertEqual(controller._left_wrist.locked_position, 0.04)
+        self.assertFalse(controller._right_wrist.contact_seen)
 
     def test_missing_effort_keeps_legacy_contact_available(self) -> None:
         controller = ContactGraspController(kdl=FakeKdl())
@@ -843,7 +958,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.SUCCEEDED)
         offsets = contact_controller.tighten_offsets
         self.assertGreater(len(offsets), 8)
-        self.assertAlmostEqual(offsets[-1], 0.004, places=6)
+        self.assertAlmostEqual(offsets[-1], COMPLIANT_ENTRY_TRAVEL_M, places=6)
         self.assertTrue(
             all(later > earlier for earlier, later in zip(offsets, offsets[1:]))
         )
