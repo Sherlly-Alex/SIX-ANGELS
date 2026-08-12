@@ -832,6 +832,61 @@ class ContactGraspController(OpenPregraspController):
         self._preserve_locked_wrists()
         return self.command() if self._action_vector is not None else command
 
+    def track_inward_offset(
+        self,
+        target_world: tuple[float, float, float],
+        inward_offset: float,
+        odometry: Any,
+        joint_states: Any,
+    ) -> ArmCommand:
+        """Retarget a moving inward pose without restarting arm interpolation.
+
+        ``tighten()`` deliberately starts a fresh bounded pose transition and
+        is retained for the legacy stepped search and one-shot retry backoff.
+        The compliant search calls this method every control tick instead: IK
+        is refreshed for the continuously changing half-width, while the
+        current action, interpolation clock and wrist contact latches survive.
+        """
+
+        if self._orientation is None:
+            raise PregraspPlanningError(
+                "continuous contact tracking requested before initial plan"
+            )
+        offset = float(inward_offset)
+        if not math.isfinite(offset) or offset < 0.0:
+            raise PregraspInputError("inward_offset must be finite and non-negative")
+
+        previous_action = (
+            None if self._action_vector is None else self._action_vector.copy()
+        )
+        previous_update_s = self._last_update_s
+        robot_pose = _odometry_pose(odometry)
+        nominal_half_width = _oriented_grasp_half_width(
+            self._orientation,
+            robot_pose[2],
+        )
+        self.ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
+        self._half_width = max(nominal_half_width - offset, 0.01)
+        self._plan_pose(
+            target_world,
+            odometry,
+            joint_states,
+            center_backoff_x=GRASP_BACKOFF_X,
+            half_width=self._half_width,
+            left_rotation=LEFT_CONTACT_ROT,
+            right_rotation=RIGHT_CONTACT_ROT,
+        )
+
+        # _plan_pose initializes interpolation from measured joints.  Restore
+        # the already-issued action so a high-rate moving target remains smooth
+        # rather than repeatedly snapping back to feedback on every tick.
+        if previous_action is not None:
+            self._action_vector = previous_action
+        self._last_update_s = previous_update_s
+        self._stable_since_s = None
+        self._preserve_locked_wrists()
+        return self.command()
+
     def _update_wrist_compliance(
         self,
         wrist: _WristContactState,

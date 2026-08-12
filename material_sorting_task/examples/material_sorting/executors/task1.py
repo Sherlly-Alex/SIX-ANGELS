@@ -470,11 +470,15 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     CONTACT_SEARCH_STEP_M = 0.001
     CONTACT_SEARCH_MAX_M = 0.004
     CONTACT_SEARCH_INTERVAL_S = 0.30
-    COMPLIANT_SOFT_STEP_M = 0.0005
-    COMPLIANT_SOFT_INTERVAL_S = 0.25
+    # Continuously retarget the symmetric half-width from elapsed time.  The
+    # former 0.5 mm / 0.25 s staircase had the same nominal 2 mm/s speed but
+    # visibly stopped between IK targets.  Slow down after first contact so the
+    # free wrist has time to follow the box face before bilateral locking.
+    COMPLIANT_APPROACH_SPEED_M_S = 0.0020
+    COMPLIANT_CONTACT_SPEED_M_S = 0.0005
+    COMPLIANT_PRELOAD_SPEED_M_S = 0.0010
+    COMPLIANT_DT_MAX_S = 0.10
     COMPLIANT_SOFT_MAX_M = 0.004
-    COMPLIANT_POST_ALIGN_STEP_M = 0.0005
-    COMPLIANT_POST_ALIGN_INTERVAL_S = 0.20
     COMPLIANT_POST_ALIGN_PRELOAD_M = 0.002
     COMPLIANT_ABSOLUTE_MAX_M = 0.006
     COMPLIANT_SINGLE_SIDE_WAIT_S = 2.0
@@ -496,6 +500,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_wait_since_s: float | None = None
         self._compliance_post_align_target_m: float | None = None
         self._compliance_retry_count = 0
+        self._compliant_motion_last_s: float | None = None
 
     def reset(self) -> None:
         super().reset()
@@ -506,6 +511,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_wait_since_s = None
         self._compliance_post_align_target_m = None
         self._compliance_retry_count = 0
+        self._compliant_motion_last_s = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -517,6 +523,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             self._compliance_wait_since_s = None
             self._compliance_post_align_target_m = None
             self._compliance_retry_count = 0
+            self._compliant_motion_last_s = None
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is TaskStage.GRASP:
@@ -556,6 +563,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_wait_since_s = None
         self._compliance_post_align_target_m = None
         self._compliance_retry_count = 0
+        self._compliant_motion_last_s = None
 
     def _tick_contact(self, context: ExecutionContext) -> StageResult:
         if self._locked_target_world is None:
@@ -797,7 +805,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                         + self.COMPLIANT_POST_ALIGN_PRELOAD_M,
                     ),
                 )
-                self._contact_search_next_s = now_s
+                self._compliant_motion_last_s = now_s
 
             if bool(
                 getattr(self._contact, "preload_effort_limit_reached", False)
@@ -810,29 +818,31 @@ class Task1ContactExecutor(Task1PregraspExecutor):
 
             target_offset = self._compliance_post_align_target_m
             if (
-                pose_settled
-                and now_s >= self._contact_search_next_s
-                and self._contact_search_used_m < target_offset - 1e-9
+                self._contact_search_used_m < target_offset - 1e-9
             ):
+                dt = self._continuous_contact_dt(now_s)
+                if dt <= 0.0:
+                    return StageResult.running(
+                        "task 1 starting continuous locked-wrist preload; "
+                        f"{diagnostic}",
+                        arm_command=command,
+                    )
                 next_offset = min(
                     target_offset,
                     self._contact_search_used_m
-                    + self.COMPLIANT_POST_ALIGN_STEP_M,
+                    + self.COMPLIANT_PRELOAD_SPEED_M_S * dt,
                 )
-                replanned = self._replan_contact_offset(
+                replanned = self._track_contact_offset(
                     context,
                     next_offset,
-                    "post-alignment preload",
+                    "continuous post-alignment preload",
                 )
                 if isinstance(replanned, StageResult):
                     return replanned
                 self._contact_search_used_m = next_offset
-                self._contact_search_next_s = (
-                    now_s + self.COMPLIANT_POST_ALIGN_INTERVAL_S
-                )
                 self._held_arm_command = replanned
                 return StageResult.running(
-                    "task 1 applying locked-wrist post-alignment preload; "
+                    "task 1 continuously applying locked-wrist preload; "
                     f"offset={next_offset * 1000.0:.1f}/"
                     f"{target_offset * 1000.0:.1f} mm; {diagnostic}",
                     arm_command=replanned,
@@ -851,31 +861,49 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                 arm_command=command,
             )
 
-        # Before bilateral alignment, approach in gentler half-millimetre
-        # steps so the first-contact wrist can rotate instead of levering the
-        # box away from the other hand.
+        # Once the initial contact pose has settled, continuously move the IK
+        # target inward.  First contact reduces the speed so that wrist can
+        # follow the box face while the opposite side closes the remaining gap.
         if (
-            pose_settled
-            and now_s >= self._contact_search_next_s
-            and self._contact_search_used_m
-            < self.COMPLIANT_SOFT_MAX_M - 1e-9
+            self._contact_search_used_m < self.COMPLIANT_SOFT_MAX_M - 1e-9
         ):
+            if self._compliant_motion_last_s is None:
+                if not pose_settled:
+                    return StageResult.running(
+                        "task 1 settling at the compliant contact start pose; "
+                        f"{diagnostic}; {detail}",
+                        arm_command=command,
+                    )
+                self._compliant_motion_last_s = now_s
+                return StageResult.running(
+                    "task 1 starting continuous compliant inward motion; "
+                    f"{diagnostic}",
+                    arm_command=command,
+                )
+
+            dt = self._continuous_contact_dt(now_s)
+            any_contact = bool(getattr(self._contact, "any_contact", False))
+            speed_m_s = (
+                self.COMPLIANT_CONTACT_SPEED_M_S
+                if any_contact
+                else self.COMPLIANT_APPROACH_SPEED_M_S
+            )
             next_offset = min(
                 self.COMPLIANT_SOFT_MAX_M,
-                self._contact_search_used_m + self.COMPLIANT_SOFT_STEP_M,
+                self._contact_search_used_m + speed_m_s * dt,
             )
-            replanned = self._replan_contact_offset(
+            replanned = self._track_contact_offset(
                 context,
                 next_offset,
-                "soft compliant contact",
+                "continuous soft compliant contact",
             )
             if isinstance(replanned, StageResult):
                 return replanned
             self._contact_search_used_m = next_offset
-            self._contact_search_next_s = now_s + self.COMPLIANT_SOFT_INTERVAL_S
             self._held_arm_command = replanned
             return StageResult.running(
-                "task 1 advancing the compliant contact search; "
+                "task 1 continuously advancing the compliant contact search; "
+                f"speed={speed_m_s * 1000.0:.1f} mm/s, "
                 f"offset={next_offset * 1000.0:.1f}/"
                 f"{self.COMPLIANT_SOFT_MAX_M * 1000.0:.1f} mm; {diagnostic}",
                 arm_command=replanned,
@@ -913,9 +941,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                         retry()
                     self._compliance_retry_count += 1
                     self._contact_search_used_m = next_offset
-                    self._contact_search_next_s = (
-                        now_s + self.COMPLIANT_SOFT_INTERVAL_S
-                    )
+                    self._compliant_motion_last_s = now_s
                     self._compliance_wait_since_s = None
                     self._held_arm_command = replanned
                     return StageResult.running(
@@ -944,6 +970,45 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             f"{diagnostic}; {detail}",
             arm_command=command,
         )
+
+    def _continuous_contact_dt(self, now_s: float) -> float:
+        """Return a bounded elapsed time for continuous inward retargeting."""
+
+        if self._compliant_motion_last_s is None:
+            self._compliant_motion_last_s = float(now_s)
+            return 0.0
+        dt = min(
+            self.COMPLIANT_DT_MAX_S,
+            max(0.0, float(now_s) - self._compliant_motion_last_s),
+        )
+        self._compliant_motion_last_s = float(now_s)
+        return dt
+
+    def _track_contact_offset(
+        self,
+        context: ExecutionContext,
+        offset_m: float,
+        action: str,
+    ) -> ArmCommand | StageResult:
+        tracker = getattr(self._contact, "track_inward_offset", None)
+        if not callable(tracker):
+            # Compatibility for injected legacy controllers and older Client
+            # images; the production ContactGraspController provides tracker.
+            return self._replan_contact_offset(context, offset_m, action)
+        try:
+            return tracker(
+                self._locked_target_world,
+                offset_m,
+                context.odometry,
+                context.joint_states,
+            )
+        except PregraspInputError as exc:
+            return self._wait_for_contact_inputs(context, str(exc))
+        except PregraspPlanningError as exc:
+            return StageResult.blocked(
+                f"task 1 {action} planning failed: {exc}",
+                arm_command=self._held_arm_command,
+            )
 
     def _replan_contact_offset(
         self,

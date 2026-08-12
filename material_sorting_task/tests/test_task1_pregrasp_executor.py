@@ -119,6 +119,13 @@ class FakeContactController:
         self.updates_since_plan = 0
         return ARM_COMMAND
 
+    def track_inward_offset(
+        self, target_world, inward_offset, odometry, joint_states
+    ):
+        self.tighten_offsets.append(inward_offset)
+        self.half_width = 0.118 - inward_offset
+        return ARM_COMMAND
+
 
 class FakeCompliantContactController(FakeContactController):
     def __init__(self) -> None:
@@ -149,6 +156,19 @@ class FakeCompliantContactController(FakeContactController):
 
     def tighten(self, target_world, inward_offset, odometry, joint_states):
         command = super().tighten(
+            target_world,
+            inward_offset,
+            odometry,
+            joint_states,
+        )
+        if inward_offset >= 0.001 - 1e-9:
+            self.bilateral_aligned = True
+        return command
+
+    def track_inward_offset(
+        self, target_world, inward_offset, odometry, joint_states
+    ):
+        command = super().track_inward_offset(
             target_world,
             inward_offset,
             odometry,
@@ -347,6 +367,32 @@ class OpenPregraspControllerTests(unittest.TestCase):
         # Left and right tool-forward axes must turn toward the centre line.
         self.assertLess(kdl.left[1, 0], -0.08)
         self.assertGreater(kdl.right[1, 0], 0.08)
+
+    def test_continuous_retarget_preserves_action_and_locked_wrists(self) -> None:
+        kdl = FakeKdl()
+        controller = ContactGraspController(kdl=kdl)
+        feedback = joint_states()
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+        controller._action_vector[3] = 0.27
+        controller._left_wrist.locked_position = 0.04
+        controller._right_wrist.locked_position = -0.05
+
+        command = controller.track_inward_offset(
+            (-0.18, 2.20, 0.834),
+            0.0002,
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            feedback,
+        )
+
+        self.assertAlmostEqual(controller.half_width, 0.1178, places=6)
+        self.assertAlmostEqual(command.left_arm_positions[0], 0.27, places=6)
+        self.assertAlmostEqual(command.left_arm_positions[5], 0.04, places=6)
+        self.assertAlmostEqual(command.right_arm_positions[5], -0.05, places=6)
 
     def test_effort_contact_follows_then_locks_both_wrists(self) -> None:
         kdl = FakeKdl()
@@ -782,7 +828,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         executor.enter_stage(TaskStage.GRASP, grasp_context)
 
         result = None
-        for tick in range(40):
+        for tick in range(100):
             result = executor.tick(
                 TaskStage.GRASP,
                 context(
@@ -795,18 +841,15 @@ class Task1LiftExecutorTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.status, StageStatus.SUCCEEDED)
-        self.assertEqual(
-            contact_controller.tighten_offsets,
-            [
-                0.0005,
-                0.001,
-                0.0015,
-                0.002,
-                0.0025,
-                0.003,
-                0.0035,
-                0.004,
-            ],
+        offsets = contact_controller.tighten_offsets
+        self.assertGreater(len(offsets), 8)
+        self.assertAlmostEqual(offsets[-1], 0.004, places=6)
+        self.assertTrue(
+            all(later > earlier for earlier, later in zip(offsets, offsets[1:]))
+        )
+        self.assertLessEqual(
+            max(later - earlier for earlier, later in zip(offsets, offsets[1:])),
+            0.0002 + 1e-9,
         )
         self.assertIn("locked wrists", result.message)
 
