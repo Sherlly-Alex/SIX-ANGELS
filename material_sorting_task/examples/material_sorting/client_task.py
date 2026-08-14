@@ -110,6 +110,9 @@ class CompetitionClient(Node):
         )
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
+        self.shelf_empty_check_pub = self.create_publisher(
+            Bool, "/material/shelf_recognition_enable", 10
+        )
         self.spine_pub = self.create_publisher(
             Float64MultiArray,
             "/spine_forward_position_controller/commands",
@@ -319,6 +322,7 @@ class CompetitionClient(Node):
                 "material_box",
                 "packaging_box",
                 "shelf_obstacle",
+                "shelf_empty",
             }:
                 continue
             if not all(math.isfinite(value) for value in point):
@@ -482,6 +486,15 @@ class CompetitionClient(Node):
     def _publish_stop(self) -> None:
         self._publish_base_command(0.0, 0.0)
 
+    def _publish_shelf_empty_check(self, enabled: bool) -> None:
+        if not rclpy.ok():
+            return
+        try:
+            self.shelf_empty_check_pub.publish(Bool(data=bool(enabled)))
+        except Exception:
+            if rclpy.ok():
+                raise
+
     def _publish_arm_command(self, command: ArmCommand) -> None:
         if not rclpy.ok():
             return
@@ -555,6 +568,7 @@ class CompetitionClient(Node):
         """Feed ROS observations into the non-blocking competition controller."""
         if self.phase in (ClientPhase.SAFE_HOLD, ClientPhase.FINISHED):
             self._publish_stop()
+            self._publish_shelf_empty_check(False)
             snapshot = self.controller.snapshot()
             if snapshot.controls_arm and snapshot.arm_command is not None:
                 self._publish_arm_command(snapshot.arm_command)
@@ -566,6 +580,7 @@ class CompetitionClient(Node):
         self.controller.set_inputs_ready(not missing)
         if missing:
             self._publish_stop()
+            self._publish_shelf_empty_check(False)
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_wait_log_ns >= 5_000_000_000:
                 self.get_logger().info("waiting for: " + ", ".join(missing))
@@ -599,6 +614,10 @@ class CompetitionClient(Node):
                 grasp_confirmed=self.grasp_confirmed,
                 unsafe_collision=self.unsafe_collision,
             )
+        )
+
+        self._publish_shelf_empty_check(
+            snapshot.requests_shelf_recognition
         )
 
         if snapshot.controls_base:
@@ -646,6 +665,7 @@ class CompetitionClient(Node):
         self.controller.stop("client shutdown")
         self.phase = ClientPhase.SAFE_HOLD
         self._publish_stop()
+        self._publish_shelf_empty_check(False)
         snapshot = self.controller.snapshot()
         if snapshot.controls_arm and snapshot.arm_command is not None:
             self._publish_arm_command(snapshot.arm_command)

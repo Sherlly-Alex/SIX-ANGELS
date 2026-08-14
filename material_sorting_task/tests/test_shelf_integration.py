@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import unittest
 from types import SimpleNamespace
@@ -165,6 +166,54 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+    def test_strict_l1_candidate_requires_fresh_empty_confirmation(self) -> None:
+        tracker = ShelfStateTracker(
+            required_votes=3,
+            require_empty_confirmation=True,
+        )
+
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "brown": observation(
+                        "brown", (-2.63, 0.778, 1.166), stamp
+                    ),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.63, 0.778, 0.837), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(tracker.semantic_empty_candidate, 1)
+
+        for stamp in (4.0, 5.0, 6.0):
+            result = tracker.update(
+                {
+                    "brown": observation(
+                        "brown", (-2.63, 0.778, 1.166), stamp
+                    ),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.63, 0.778, 0.837), stamp
+                    ),
+                    "shelf_empty": observation(
+                        "shelf_empty", (-2.63, 0.778, 0.530), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+            )
+
+        self.assertIsNotNone(result)
+        tracker.reset_empty_confirmation()
+        self.assertIsNone(tracker.result())
+        self.assertEqual(tracker.semantic_empty_candidate, 1)
+        self.assertIn("empty=none", tracker.diagnostic_summary)
+
+
 class StableTargetCenterTrackerTests(unittest.TestCase):
     def test_task2_tracker_rejects_visible_surface_fallbacks(self) -> None:
         tracker = StableTargetCenterTracker(require_quality="mask_cloud_cuboid")
@@ -326,6 +375,9 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
                         "packaging_box": observation(
                             "packaging_box", (-2.54, 0.78, 0.530), stamp
                         ),
+                        "shelf_empty": observation(
+                            "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                        ),
                     },
                 )
             )
@@ -340,6 +392,109 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
             memory.require_task3_packaging_box_center(),
             (-2.54, 0.78, 0.530),
         )
+
+    def test_task1_lowers_carried_box_only_for_unconfirmed_l1(self) -> None:
+        class RecordingSlideHold:
+            def __init__(self) -> None:
+                self.target_slide = None
+
+            def plan(self, hold_command, target_slide, _joint_states):
+                self.target_slide = float(target_slide)
+                return hold_command
+
+        memory = CompetitionTaskMemory()
+        memory.record_task1_origin((-0.22, 2.20, 0.84), "yellow")
+        executor = Task1IntegratedExecutor(memory)
+        executor.configure_instructions(
+            (
+                {"task": 1, "target_color": "yellow"},
+                {"task": 2, "target_color": "brown"},
+            )
+        )
+        executor._held_center_base = (0.70, 0.0, 0.96)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._phase = "scan_shelf"
+        executor._stage_started_s = 0.0
+        recording_slide = RecordingSlideHold()
+        executor._slide_hold = recording_slide
+
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = executor._tick_align_for_place(
+                ExecutionContext(
+                    now_s=stamp,
+                    instruction={"task": 1, "target_color": "yellow"},
+                    task_index=1,
+                    attempt=1,
+                    target_observations={
+                        "brown": observation(
+                            "brown", (-2.63, 0.778, 1.166), stamp
+                        ),
+                        "packaging_box": observation(
+                            "packaging_box", (-2.63, 0.778, 0.837), stamp
+                        ),
+                    },
+                )
+            )
+
+        assert result is not None
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "l1_visibility_clearance")
+        self.assertAlmostEqual(recording_slide.target_slide, 0.58, places=6)
+        self.assertIsNone(executor._shelf_state)
+        self.assertIsNone(memory.shelf_state)
+        self.assertIn("explicit empty-layer confirmation", result.message)
+
+    def test_l1_visibility_posture_does_not_run_for_task3(self) -> None:
+        class RejectingSlideHold:
+            def plan(self, _hold_command, _target_slide, _joint_states):
+                raise AssertionError("task 3 must not use task-1 L1 visibility")
+
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor.task_id = 3
+        executor._expected_shelf_color = "brown"
+        executor._held_center_base = (0.70, 0.0, 0.96)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._phase = "scan_shelf"
+        executor._stage_started_s = 0.0
+        executor._slide_hold = RejectingSlideHold()
+
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = executor._tick_align_for_place(
+                ExecutionContext(
+                    now_s=stamp,
+                    instruction={"task": 3, "target_color": "yellow"},
+                    task_index=3,
+                    attempt=1,
+                    target_observations={
+                        "brown": observation(
+                            "brown", (-2.63, 0.778, 1.166), stamp
+                        ),
+                        "packaging_box": observation(
+                            "packaging_box", (-2.63, 0.778, 0.837), stamp
+                        ),
+                    },
+                )
+            )
+
+        assert result is not None
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "scan_shelf")
 
     def test_task1_direct_route_uses_project_geometry_not_legacy_turn_point(self) -> None:
         memory = CompetitionTaskMemory()
@@ -454,6 +609,50 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertEqual(executor._phase, "approach_place_final")
         self.assertIn("entering the recognized empty shelf layer", result.message)
+
+    def test_task1_corrects_three_centimeter_lateral_place_offset(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._place_world = (-2.63, 0.778, 0.84)
+        executor._shelf_scan_stand = shelf_observation_stand(
+            executor._held_center_base,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=0.778,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        executor._phase = "check_place_alignment"
+
+        result = executor._tick_align_for_place(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=_odom(
+                    executor._shelf_scan_stand[0],
+                    executor._shelf_scan_stand[1] - 0.03,
+                    executor.SHELF_YAW,
+                ),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "navigate_place_lateral")
+        self.assertAlmostEqual(
+            executor._transfer._lateral_position_tolerance_m,
+            executor.FINAL_PLACE_LATERAL_TOLERANCE_M,
+            places=6,
+        )
+        self.assertIn("aligning laterally", result.message)
 
     def test_task1_transport_keeps_task3_approach_phase_compatibility(self) -> None:
         executor = Task1IntegratedExecutor(CompetitionTaskMemory())
@@ -638,6 +837,7 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())
         self.assertIsInstance(executor._pregrasp, ShelfOpenPregraspController)
         self.assertAlmostEqual(executor._pregrasp.half_width, 0.20, places=6)
+        self.assertEqual(executor.SHELF_LATERAL_ALIGNMENT_TIMEOUT_S, 40.0)
 
     def test_task2_corrects_yaw0_shelf_fit_along_shelf_normal(self) -> None:
         executor = Task2IntegratedExecutor(CompetitionTaskMemory())
@@ -935,6 +1135,107 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertFalse(result.controls_base)
         self.assertIn("maximum transport height", result.message)
+
+    def test_task2_scales_long_table_column_reverse_timeout(self) -> None:
+        class NeverFinishedTransfer:
+            def begin_retreat(self, _odometry, _distance, *, heading_yaw=None):
+                self.heading_yaw = heading_yaw
+                return True
+
+            def tick_retreat(self, _odometry):
+                return False, (-0.04, 0.0), "retreating straight; remaining=0.156 m"
+
+        class AlwaysSafeEnvelope:
+            def check_rotation(self, *_args):
+                return SimpleNamespace(safe=True, detail="safe")
+
+            def check_fixed_heading_translation(self, *_args):
+                return SimpleNamespace(safe=True, detail="safe")
+
+        memory = CompetitionTaskMemory(
+            task1_origin_world=(-0.174, 2.20, 0.84),
+            task1_color="brown",
+        )
+        executor = Task2IntegratedExecutor(memory)
+        hold = ArmCommand(
+            spine_position=-0.04,
+            head_positions=(0.0, 0.16),
+            left_arm_positions=(0.4,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(-0.4,) * 6,
+            right_gripper_position=0.20,
+        )
+        context = ExecutionContext(
+            now_s=0.0,
+            instruction={},
+            task_index=2,
+            attempt=1,
+            odometry=_odom(-2.05, 0.77, math.pi),
+        )
+        executor.enter_stage(TaskStage.TRANSPORT, context)
+        executor._phase = "reverse_to_table_column"
+        executor._held_arm_command = hold
+        executor._held_center_base = (0.82, 0.0, 1.30)
+        executor._held_half_width = lambda: 0.10
+        executor._carried_envelope = AlwaysSafeEnvelope()
+        executor._transfer = NeverFinishedTransfer()
+        executor._guard_carried_command = lambda _context, _command: (True, "safe")
+
+        result = executor.tick(TaskStage.TRANSPORT, context)
+
+        self.assertEqual(result.status, StageStatus.RUNNING, result.message)
+        self.assertGreater(executor._table_column_reverse_timeout_s, 30.0)
+        context = replace(context, now_s=31.0)
+        result = executor.tick(TaskStage.TRANSPORT, context)
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        context = replace(
+            context,
+            now_s=executor._table_column_reverse_timeout_s + 0.1,
+        )
+        result = executor.tick(TaskStage.TRANSPORT, context)
+        self.assertEqual(result.status, StageStatus.BLOCKED)
+        self.assertIn("limit=60.0s", result.message)
+
+    def test_task1_arm_retract_timeout_starts_after_shelf_retreat(self) -> None:
+        class NeverReachedArmRetract:
+            def __init__(self) -> None:
+                self.planned = False
+                self.command = None
+
+            def plan(self, hold_command, _joint_states):
+                self.planned = True
+                self.command = hold_command
+                return hold_command
+
+            def update(self, _now_s, _joint_states):
+                return self.command, False, "still retracting"
+
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        hold = ArmCommand(
+            spine_position=0.70,
+            head_positions=(0.0, 0.16),
+            left_arm_positions=(0.4,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(-0.4,) * 6,
+            right_gripper_position=0.20,
+        )
+        context = ExecutionContext(
+            now_s=100.0,
+            instruction={"task": 1, "target_color": "brown"},
+            task_index=1,
+            attempt=1,
+        )
+        executor.enter_stage(TaskStage.RETURN_TO_END, context)
+        executor._stage_started_s = 0.0
+        executor._phase = "retract_arms"
+        executor._held_arm_command = hold
+        executor._arm_retract = NeverReachedArmRetract()
+
+        result = executor.tick(TaskStage.RETURN_TO_END, context)
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertIn("retracting arms", result.message)
+        self.assertAlmostEqual(executor._phase_started_s, 100.0, places=6)
 
     def test_task2_retracts_arms_after_table_retreat_before_end_navigation(self) -> None:
         memory = CompetitionTaskMemory(

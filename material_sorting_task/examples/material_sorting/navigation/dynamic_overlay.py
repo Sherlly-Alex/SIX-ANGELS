@@ -92,6 +92,8 @@ def volumes_from_detections(
     out: List[ObstacleVolume] = []
     hx, hy = _BOX_HALF_XY
     for color, xyz, _score in detections:
+        if color == "shelf_empty":
+            continue
         if exclude_color is not None and color == exclude_color:
             continue
         if not isinstance(xyz, (list, tuple)) or len(xyz) < 3:
