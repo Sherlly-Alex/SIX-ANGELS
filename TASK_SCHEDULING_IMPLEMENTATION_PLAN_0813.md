@@ -1,0 +1,1293 @@
+# SIX-ANGELS 任务调度实施方案（0813 最新工作区）
+
+## 0. 文档定位
+
+本文面向 `0813` 工作区的后续实施人员，给出从当前固定三任务状态机演进到“裁判约束、
+安全优先、代价地图辅助、可选强化学习排序”的完整改造方案。
+
+本文基线：
+
+- GitHub 仓库：`https://github.com/Sherlly-Alex/SIX-ANGELS.git`
+- 分支：`master`
+- 拉取时 HEAD：`4828d5d3990350913998981381196a9492fb77b9`
+- 语义优化来源：`8a224228208672d23ae32d171014d01a181d487d`
+- 正式执行入口：`material_sorting_task/examples/material_sorting/client_task.py`
+- 正式三任务模式：`MATERIAL_EXECUTION_MODE=task123_full`
+
+### 2026-08-13 实施状态
+
+本工作区已完成计划中的可离线验证内核。2026-08-13 最终审查结果为
+`371 passed, 5 skipped, 1 warning`；正式 `unittest` 为 `220 tests OK`，
+`scripts/check_workspace.py` 也通过。这里的“完成”只指纯 Python 内核与兼容接入，
+不代表 ROS/Server 联调、仿真性能和实机安全验收已经完成。已落地：
+
+- `legacy / shadow / v2` 三模式 facade；默认仍为 `legacy`，非法值自动回退。
+- 三个独立 TaskPlan 实例（当前仍复用同一十阶段拓扑）；Task 3 终局清理由
+  `TerminalPolicy` 表达，不再由 V2 写死任务号。
+- `SchedulerEngine` 非阻塞执行、裁判同步、结构化事件、资源原子租约、命令校验、底盘
+  150 ms lease、安全主管和重复裁判失配闭锁。
+- `WorldCostmap` 版本快照、动态障碍 TTL/置信度、现有 A*/footprint/携物包络复用。
+- 中心/左右偏站位候选、硬过滤、确定性 Multi-Critic、动作保持与切换滞回；有限恢复
+  候选与 `RecoverableStep` 已有独立内核和测试，但尚未接入当前 Executor 主执行路径。
+- 后台单线程、最高 4 Hz 的导航候选重评估，不阻塞 20 Hz 控制 tick。
+- 固定离散宏动作、action mask、观测 schema、奖励去重、Gymnasium 兼容环境、域随机化、
+  MaskablePPO 延迟加载接口。
+- `rl_shadow / rl_guarded`、模型 SHA256/schema 校验、超时/NaN/越界/masked/低安全下界回退。
+- 正式语义 JSON 严格准入和 Regex/ML/SLM 只读审计旁路已经合并进同一工作区。
+- 完整 ArmCommand 被视为持续位置保持；所有可能继续发布该命令的阶段（包括
+  `NAVIGATE_TO_PICK`）均持有完整机械臂资源，阶段间由持久 hold lease 接管，关闭时释放。
+- Task 1 导航执行器已实现 `apply_scheduler_candidate(...)` opt-in hook：候选必须通过
+  站位走廊（横向 ≤0.15 m、纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
+  `NavigationController` 实际重规划四道校验，任一失败 fail-closed；未接 hook 的执行器
+  继续使用已验证固定站位，`legacy/shadow` 行为不变。
+
+当前明确保留的上线闸门：
+
+- 代价地图/RL 已实时计算和记录“哪个有限宏动作效用最高”，Task 1 `nav_only` 导航执行器
+  已声明 `apply_scheduler_candidate(...)` opt-in hook（仅中心/左右站位切换，不改写
+  抓取/放置轨迹）；Task 2 货架观察/抓取站位、Task 1/2/3 transport、Return-to-End 的
+  hook 仍未开放。
+- 正式实动继续使用 `legacy`；先运行 `shadow`，再运行 `v2 + dry_run`，最后按 Task/Step
+  为具体 Executor 接入 hook 并完成官方 4090 镜像逐段标定。
+- `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；无批准模型时始终回退
+  `HeuristicPolicy`，且项目不下载任何权重。
+- transport 当前使用保守的 `TRANSIT_CARRY` 机器人包络，但实测物体中心/半宽尚未送入
+  costmap 的可选 held-object 包络；正式携物导航前必须补齐并标定。
+- 当前在线候选 Provider 只覆盖导航阶段，且默认不生成恢复候选；`FailureCode` /
+  `RecoverableStep` 还没有桥接现有 `StageResult`，不能宣称自动恢复已经上线。
+
+### 必须坚持的架构结论
+
+1. Server 结构化 JSON 是正式任务语义的唯一真值。
+2. Server 裁判决定正式任务序号、尝试结算和任务推进。
+3. Safety Supervisor 的优先级高于任何调度策略、代价函数和 RL 策略。
+4. 代价地图用于选择路径、站位和恢复动作，不得改变裁判指定的 Task 顺序。
+5. RL 只允许从已经通过硬约束过滤的有限宏动作中选择，不直接输出底盘或双臂控制量。
+6. 当前非阻塞 Executor 继续作为真实运动后端，第一阶段不重写抓取和放置控制器。
+7. 每次迁移必须支持 Legacy/Shadow/V2 三种模式，并可一键退回 Legacy。
+
+---
+
+## 1. 0813 最新代码变化及其调度影响
+
+`aa819cb` 之后的最新主线包含四组关键变化。
+
+### 1.1 连续柔顺抓取
+
+相关提交：
+
+- `424a954 Use continuous compliant grasp approach`
+- `4828d5d Extend continuous compliant grasp approach`
+
+主要变化：
+
+- 抓取目标不再只按离散毫米步进更新，而是根据控制周期持续向内重规划。
+- 首次接触后降低另一侧搜索速度。
+- 支持左右腕部分别锁定、单侧接触等待、有限回退和一次重试。
+- 通过腕部第 6 关节角度、速度及相对 effort 变化判断接触。
+- 加入软 effort 上限、绝对 effort 上限和最大位移边界。
+
+调度影响：
+
+- `GRASP` 不应被视作一个不可观察的黑盒阶段，而应暴露 `approach / single_contact /
+  bilateral_lock / preload / settled` 子相位。
+- 单侧接触不是立即失败，应映射为有限的局部恢复。
+- effort 达到硬上限必须映射为 `FATAL_SAFETY`，不能由 RL 继续尝试。
+- 已产生接触后切换站位或重做导航属于高风险动作，必须先执行明确的退臂动作。
+
+### 1.2 三任务柔顺放置
+
+相关提交：`94baea5 Add compliant placement to all three tasks`
+
+主要变化：
+
+- 新增 `shelf/placement_feedback.py`。
+- Task 1、Task 2、Task 3 分别持有独立的 `CompliantSlideLoweringController`。
+- 放置过程中使用 slide 与双臂 effort 相对基线判断物体是否获得支撑。
+- effort 不可用时仍保留几何目标作为硬回退。
+
+调度影响：
+
+- `PLACE` 应拆成 `baseline / descend / contact_candidate / contact_confirm /
+  release / post_release_cleanup`。
+- effort 证据只能提前结束下降，不能取消几何安全边界。
+- 物体释放是不可逆边界；越过边界后失败必须进入裁判结算或安全收尾，不能重新执行抓取。
+- Task 3 裁判可能在本地撤离完成前宣布全部结束，必须用通用 `cleanup=True` 标记处理，
+  不能继续保留 Task 3 编号特判。
+
+### 1.3 抓取指标与绘图
+
+相关提交：`2798813 Add compliant grasp metrics and plots`
+
+新增：
+
+- `scripts/record_grasp_metrics.py`
+- `scripts/plot_grasp_metrics.py`
+- `docs/COMPLIANT_GRASP_METRICS.md`
+
+调度影响：
+
+- 这些只读测量工具应扩展为调度 EventLog 的数据来源。
+- 调度决策必须记录候选集合、各 Critic 分数、最终动作和结果，才能训练或审计 RL。
+- 原始 joint effort 是执行器广义力，不得在代价函数中伪装成真实指尖牛顿力。
+
+### 1.4 语义严格准入与旁路审计
+
+已从 `8a22422` 接入：
+
+- 正式 JSON 字段存在性追踪与严格校验。
+- 中文文本不能补全缺失的正式执行字段。
+- Regex、ML、本地 SLM 的离线评估模块。
+- 默认关闭、异步、只写日志的 `SemanticAudit`。
+- 研究模型缺失和推理失败不会影响正式控制。
+
+调度影响：
+
+- 调度器只接收已经通过 `validate_instruction(require_execution_ready=True)` 的结构化任务。
+- 语义旁路结果不进入 `WorldState` 的控制真值字段，也不参与 Candidate Mask。
+- 可将 `SEM_AUDIT DIFF` 作为离线数据质量事件记录，但不能阻塞、改写或重排任务。
+
+---
+
+## 2. 当前调度实现
+
+当前链路为：
+
+```text
+/material/instruction + /referee/* + odom + joint_states + detections
+                              |
+                              v
+                       client_task.py
+                     20 Hz create_timer
+                              |
+                              v
+                  CompetitionController.tick()
+                              |
+                 固定 TASK_STAGE_SEQUENCE
+                              |
+                              v
+                    Task1/2/3 Executor
+                              |
+                              v
+                    底盘与机械臂命令发布
+```
+
+### 当前优点
+
+- 单 ROS 进程贯穿整场比赛。
+- Controller 不依赖 ROS，可进行纯 Python 测试。
+- Executor 使用 `enter_stage / tick / cancel`，天然适合非阻塞调度。
+- 每个控制周期最多推进一次明显状态转换。
+- 正式模式等待裁判确认重试与任务推进。
+- 缺少底盘命令时默认发布零速度。
+
+### 当前限制
+
+- Task 1/2/3 强制共享全局 `TASK_STAGE_SEQUENCE`。
+- `BLOCKED` 同时表达感知失败、规划失败、IK 失败和安全异常，调度器无法选择正确恢复。
+- 超时、重试和恢复分散在大型 Executor 内部。
+- 当前任务索引、裁判同步、执行阶段和安全状态集中在一个 Controller。
+- Task 2/3 detection epoch 在 `client_task.py` 中存在任务编号特判。
+- 缺少统一的资源所有权、命令租约、候选动作评分和决策事件。
+- `_finishing_task3_safe_return()` 是不可扩展的任务编号特判。
+
+---
+
+## 3. 目标架构
+
+```mermaid
+flowchart TD
+    ROS["ROS 输入适配层<br/>client_task.py"] --> BUILD["WorldStateBuilder"]
+    BUILD --> WORLD["只读 WorldState"]
+    WORLD --> SAFE["SafetySupervisor"]
+    WORLD --> REF["RefereeGateway"]
+    WORLD --> MAP["WorldCostmap"]
+    REF --> ENGINE["SchedulerEngine"]
+    SAFE --> ENGINE
+    ENGINE --> PLAN["TaskPlan / StepGraph"]
+    PLAN --> GEN["CandidateGenerator"]
+    MAP --> SCORE["Multi-Critic Evaluator"]
+    GEN --> MASK["SafetyShield / Action Mask"]
+    MASK --> SCORE
+    SCORE --> HEUR["HeuristicPolicy"]
+    SCORE --> RL["可选 Maskable RL Policy"]
+    HEUR --> GUARD["PolicyGuard"]
+    RL --> GUARD
+    GUARD --> ACTION["ScheduledAction / Legacy Adapter"]
+    ACTION --> EXEC["现有 Executor"]
+    EXEC --> MUX["CommandMux + Lease"]
+    SAFE --> MUX
+    MUX --> OUT["ROS 命令发布"]
+    ENGINE --> EVENT["EventLog / Metrics / Replay"]
+```
+
+### 优先级
+
+```text
+Safety hard constraints
+    > Referee authority
+    > Task graph invariants
+    > Resource ownership
+    > Deterministic recovery policy
+    > Heuristic utility
+    > RL preference
+```
+
+---
+
+## 4. 核心数据模型
+
+建议新增目录：
+
+```text
+material_sorting_task/examples/material_sorting/scheduler/
+  __init__.py
+  models.py
+  engine.py
+  plans.py
+  referee.py
+  recovery.py
+  resources.py
+  safety.py
+  events.py
+  candidate_generator.py
+  utility.py
+  legacy_adapter.py
+  policies/
+    heuristic.py
+    shadow.py
+    rl.py
+    guard.py
+```
+
+### 4.1 运行时状态
+
+```python
+@dataclass(frozen=True)
+class WorldState:
+    now_s: float
+    instruction: Mapping[str, Any]
+    odometry: Any
+    joint_states: Any
+    target_observations: Mapping[str, TargetObservation]
+    referee: RefereeSnapshot
+    score: int
+    grasp_confirmed: bool
+    unsafe_collision: bool
+    input_ages_s: Mapping[str, float]
+    payload_mode: PayloadMode
+```
+
+`WorldState` 每个 tick 新建、只读，不允许 Action 修改。
+
+### 4.2 记忆分层
+
+```text
+AttemptMemory
+  只在当前裁判 attempt 内有效
+  target lock / candidate stand / retry count / temporary shelf scan
+
+CompetitionMemory
+  跨 Task 保存
+  task1 origin / committed shelf state / task2 region / task3 reference region
+```
+
+当前 `CompetitionTaskMemory` 演进为 `CompetitionMemory`。新增候选—提交语义：
+
+```text
+Task 1 扫描完成 -> AttemptMemory.candidate_shelf_state
+裁判正式推进 Task 2 -> commit 到 CompetitionMemory
+Task 1 重试或失败 -> 丢弃 candidate
+```
+
+### 4.3 结构化动作结果
+
+```python
+class ActionStatus(Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    RETRYABLE_FAILURE = "retryable_failure"
+    ATTEMPT_FAILED = "attempt_failed"
+    BLOCKED = "blocked"
+    CANCELED = "canceled"
+    FATAL = "fatal"
+
+class FailureCode(Enum):
+    INPUT_STALE = "input_stale"
+    TARGET_LOST = "target_lost"
+    NAV_NO_PATH = "nav_no_path"
+    NAV_STUCK = "nav_stuck"
+    ALIGNMENT_FAILED = "alignment_failed"
+    IK_FAILED = "ik_failed"
+    SINGLE_SIDE_CONTACT = "single_side_contact"
+    GRASP_NOT_CONFIRMED = "grasp_not_confirmed"
+    EFFORT_SOFT_LIMIT = "effort_soft_limit"
+    EFFORT_HARD_LIMIT = "effort_hard_limit"
+    OBJECT_DROPPED = "object_dropped"
+    OBJECT_RELEASED = "object_released"
+    PLACEMENT_UNCERTAIN = "placement_uncertain"
+    UNSAFE_COLLISION = "unsafe_collision"
+    REFEREE_DESYNC = "referee_desync"
+    RESOURCE_CONFLICT = "resource_conflict"
+    INTERNAL_ERROR = "internal_error"
+```
+
+禁止继续通过错误消息字符串决定恢复策略。
+
+### 4.4 Step 与 TaskPlan
+
+```python
+@dataclass(frozen=True)
+class StepSpec:
+    id: str
+    action_factory: Callable[[], ScheduledAction]
+    resources: frozenset[Resource]
+    timeout_s: float
+    next_on_success: str | None
+    recovery_policy: str | None
+    irreversible: bool = False
+    cleanup: bool = False
+
+@dataclass(frozen=True)
+class TaskPlan:
+    task_id: int
+    entry_step: str
+    steps: Mapping[str, StepSpec]
+```
+
+第一版使用 Python 声明 TaskPlan，暂不使用 XML/YAML 表达拓扑。数值参数可以放 YAML，
+但任务拓扑必须经过单元测试和代码审查。
+
+---
+
+## 5. 调度循环
+
+`client_task.py` 保持 20 Hz。高层动作选择不需要每个 tick 都重算，只在事件触发时更新。
+
+```python
+def tick(world: WorldState) -> SchedulerSnapshot:
+    # 1. 安全检查拥有最高优先级
+    violation = safety_supervisor.check(world)
+    if violation.must_stop:
+        return enter_safe_hold(violation)
+
+    # 2. 同步裁判，不由本地分数推进正式 Task
+    referee_event = referee_gateway.observe(world.referee)
+    apply_referee_event(referee_event)
+
+    # 3. 裁判已结束时，只允许 cleanup=True 的已启动安全收尾
+    if referee_event.all_tasks_done and not active_step.cleanup:
+        return finish_and_stop()
+
+    # 4. 等待裁判结算时禁止启动新的得分动作
+    if state == WAITING_FOR_REFEREE:
+        return stopped_snapshot()
+
+    # 5. 取得当前 TaskPlan 和 Step
+    step = plan_registry[current_task_id].steps[current_step_id]
+
+    # 6. 首次进入时申请资源
+    if not step_entered:
+        resource_manager.acquire(step.resources, owner=step.id)
+        action.enter(build_action_context(world))
+        emit(STEP_ENTERED)
+        return snapshot()
+
+    # 7. 非阻塞运行一次
+    result = action.tick(build_action_context(world))
+
+    # 8. 校验 Action 是否越权发命令
+    validated_command = command_validator.validate(
+        result.command,
+        owned_resources=step.resources,
+    )
+
+    # 9. RUNNING / 成功 / 恢复 / attempt 失败 / fatal
+    apply_action_result(step, result)
+    return snapshot(validated_command)
+```
+
+### 重新决策触发条件
+
+- 进入新 Step。
+- 当前路径失效。
+- 目标观测越过变化阈值。
+- 动态障碍层更新。
+- Action 返回结构化失败。
+- 裁判状态改变。
+- 恢复动作完成。
+- 当前候选效用下降超过阈值。
+
+### 防止动作抖动
+
+```text
+minimum_action_hold_s
+switch_utility_margin
+candidate_stability_frames
+replan_min_period_s
+```
+
+除非当前动作失效或触发安全条件，新动作必须明显优于当前动作才能切换。
+
+---
+
+## 6. 三个 Task 的执行图
+
+### 6.1 Task 1
+
+```text
+validate_instruction
+ -> navigate_table
+ -> acquire_table_target
+ -> align_open_pregrasp
+ -> compliant_bilateral_grasp
+ -> lift
+ -> retreat_table
+ -> transport_shelf_observation
+ -> scan_shelf
+ -> select_empty_layer
+ -> align_shelf_place
+ -> compliant_lowering
+ -> release
+ -> verify_release
+ -> arm_retract
+ -> retreat_shelf
+ -> return_end
+ -> wait_referee
+```
+
+恢复策略：
+
+```text
+navigate_table:
+  replan same goal -> alternate legal stand -> ATTEMPT_FAILED
+
+acquire_table_target:
+  clear detection epoch -> head scan -> small base reposition -> BLOCKED
+
+compliant_bilateral_grasp:
+  single-side wait -> 1 mm backoff -> one retry -> ATTEMPT_FAILED
+  hard effort / unsafe collision -> SAFE_HOLD
+
+scan_shelf:
+  stationary rescan -> head adjustment -> observation-stand adjustment -> BLOCKED
+
+compliant_lowering:
+  effort unavailable -> geometry fallback
+  effort contact candidate -> settle confirmation
+  geometry target reached -> success
+```
+
+### 6.2 Task 2
+
+```text
+require_committed_task1_memory
+ -> navigate_shelf_far_stand
+ -> reacquire_shelf_target
+ -> choose_shelf_pick_stand
+ -> align_shelf_pick
+ -> compliant_bilateral_grasp
+ -> extract_from_shelf
+ -> lift_clearance
+ -> navigate_saved_table_origin
+ -> align_table_place
+ -> compliant_lowering
+ -> release
+ -> verify_release
+ -> arm_retract
+ -> return_end
+ -> wait_referee
+```
+
+约束：
+
+- Task 1 的货架记忆只用于粗定位和缩小候选范围。
+- Task 2 到达货架后必须重新感知，不得把旧中心直接作为最终抓取点。
+- 取出物体后 Payload Layer 必须切换为携物包络。
+- 释放后禁止重新执行抓取；失败进入安全收尾和裁判结算。
+
+### 6.3 Task 3
+
+```text
+navigate_table
+ -> acquire_task3_target
+ -> compliant_bilateral_grasp
+ -> lift
+ -> retreat_table
+ -> navigate_shelf_observation
+ -> reacquire_packaging_box
+ -> compute_left_place_pose
+ -> choose_safe_place_stand
+ -> align_place
+ -> compliant_lowering
+ -> release                 [irreversible=True]
+ -> arm_safe_lift           [cleanup=True]
+ -> post_release_retreat    [cleanup=True]
+ -> final_alignment         [cleanup=True]
+ -> finish
+```
+
+这会替代当前 `_finishing_task3_safe_return()` 特判。裁判宣布结束后，仅允许已定义的
+`cleanup=True` 动作继续，不允许开启任何新的得分动作。
+
+---
+
+## 7. 恢复策略
+
+参考 Nav2 `RecoveryNode + WouldARecoveryHelp + RoundRobin`，实现确定性恢复阶梯。
+
+### 7.1 恢复层级
+
+```text
+L0 当前动作内部微调
+   连续接触、短时等待、重新规划 IK、清空短窗口
+
+L1 同一 Step 局部恢复
+   重新感知、重新规划、头部扫描、小范围站位调整
+
+L2 安全撤退后重进 Step
+   cancel -> resource release -> retreat -> reacquire -> retry
+
+L3 本次裁判 attempt 结束
+   安全保持/撤退 -> WAITING_FOR_REFEREE
+
+L4 SAFE_HOLD
+   碰撞、硬 effort 上限、非法命令、资源冲突、内部异常
+```
+
+### 7.2 `RecoverableStep`
+
+```python
+class RecoverableStep:
+    def tick(self, context):
+        result = self.action.tick(context)
+        if result.status is not RETRYABLE_FAILURE:
+            return result
+
+        decision = self.classifier.classify(result.failure_code, context)
+        if not decision.recovery_would_help:
+            return ActionResult.attempt_failed(result.failure_code)
+
+        if self.recovery_count >= decision.max_recoveries:
+            return ActionResult.attempt_failed(RECOVERY_EXHAUSTED)
+
+        self.action.cancel("entering recovery")
+        self.release_resources()
+        self.active_recovery = decision.next_recovery
+        self.recovery_count += 1
+        return ActionResult.running("starting recovery")
+```
+
+### 7.3 不可逆边界
+
+以下事件发生后不能进行软件 `reset()` 假装场景恢复：
+
+- 物体已经掉落。
+- 物体已经释放。
+- 夹持状态未知且机器人已搬运。
+- 裁判已开始结算当前 attempt。
+- 机器人退出合法操作区。
+
+---
+
+## 8. 资源所有权和命令租约
+
+```python
+class Resource(Enum):
+    BASE = "base"
+    SPINE = "spine"
+    HEAD = "head"
+    LEFT_ARM = "left_arm"
+    RIGHT_ARM = "right_arm"
+    GRIPPERS = "grippers"
+    PERCEPTION = "perception"
+```
+
+规则：
+
+- 一个控制周期只能有一个 Action 持有 `BASE`。
+- 双臂协同抓取必须原子申请双臂和夹爪。
+- 未持有对应资源却输出命令，立即记录 `RESOURCE_CONFLICT` 并 SAFE_HOLD。
+- 底盘命令使用短租约；本周期未续租自动发布零速度。
+- 机械臂“继续运动”和“保持最后安全姿态”必须在 CommandFrame 中区分。
+
+```python
+@dataclass(frozen=True)
+class CommandFrame:
+    owner_step_id: str
+    base_command: BaseCommand | None
+    arm_command: ArmCommand | None
+    arm_mode: ArmCommandMode
+    valid_until_s: float
+```
+
+---
+
+## 9. 全局代价地图和实时效用选择
+
+当前代码已有：
+
+- `navigation/occupancy_grid.py`：栅格、分高度层、距离变换和膨胀代价。
+- `navigation/global_planner.py`：带软代价的确定性 A*。
+- `navigation/dynamic_overlay.py`：视觉检测动态障碍。
+- `navigation/footprint_checker.py`：底盘和机械臂包络。
+- `navigation/carried_envelope.py`：携物扫掠空间。
+
+因此第一步不是接入整套 Nav2，而是把现有组件封装为 `WorldCostmap`。
+
+### 9.1 建议目录
+
+```text
+navigation/costmap/
+  snapshot.py
+  world_costmap.py
+  static_layer.py
+  dynamic_layer.py
+  inflation_layer.py
+  payload_layer.py
+  semantic_layer.py
+  visibility_layer.py
+```
+
+### 9.2 Layer
+
+| Layer | 内容 | 更新方式 |
+|---|---|---|
+| Static | 墙、桌子、货架、边界 | 启动时构建 |
+| Dynamic | 感知到的物体 | 带时间戳、置信度和 TTL |
+| Inflation | 连续障碍势场 | 障碍层变更后重算 |
+| Payload | 空载、双臂张开、不同携物姿态 | Action 状态变化时切换 |
+| Semantic | 合法抓取区、禁止旋转区、优选通道 | 场景配置 |
+| Visibility | 相机视场、遮挡、预计目标质量 | 选择观察站位时计算 |
+
+动态障碍必须包含 TTL，避免一次错误检测永久污染地图：
+
+```python
+@dataclass(frozen=True)
+class DynamicObstacle:
+    bounds: AABB
+    confidence: float
+    observed_at_s: float
+    expires_at_s: float
+    source: str
+```
+
+### 9.3 候选宏动作
+
+示例：Task 2 货架抓取前生成：
+
+```text
+A0 默认远端站位
+A1 货架中间观察站位
+A2 左偏 8 cm 观察
+A3 右偏 8 cm 观察
+A4 原地头部扫描
+A5 重新规划当前目标
+A6 安全后退再观察
+```
+
+候选先经过硬过滤：
+
+- 裁判是否允许。
+- Step 拓扑是否允许。
+- 碰撞与最小净空。
+- 携物包络。
+- IK 可达性。
+- 资源是否可用。
+- 不可逆边界是否已越过。
+
+非法候选直接 `utility=-inf`，不交给 RL。
+
+### 9.4 Multi-Critic 评分
+
+参考 Nav2 MPPI Critic 思想：
+
+```text
+Utility(a) =
+  + w_reward       * expected_score
+  + w_success      * success_probability
+  - w_time         * expected_time
+  - w_path         * path_length
+  - w_obstacle     * inflation_integral
+  - w_turn         * heading_change
+  - w_uncertainty  * perception_uncertainty
+  - w_manipulation * manipulation_difficulty
+  - w_failure      * irreversible_failure_risk
+  - w_recovery     * recovery_cost
+```
+
+第一版 `success_probability` 使用离线统计或保守常数，不使用神经网络。
+
+### 9.5 高层更新频率
+
+- 20 Hz：安全检查、Action tick、命令租约。
+- 2～5 Hz：局部候选重新评分。
+- 1 Hz 或事件触发：全局路径重规划。
+- Step 进入、路径失效或障碍突变：立即重算。
+
+---
+
+## 10. 强化学习接入方案
+
+### 10.1 推荐范围
+
+RL 只学习：
+
+- 多个安全候选站位的排序。
+- 感知失败后的有限恢复动作选择。
+- 评分接近时的候选决胜。
+
+RL 不学习：
+
+- Task 1/2/3 正式顺序。
+- 裁判 attempt 推进。
+- 原始 `vx/wz`。
+- 双臂 12 个关节和夹爪连续命令。
+- 碰撞阈值、effort 硬上限和不可逆边界。
+
+### 10.2 状态特征
+
+```text
+task_id / step_id / attempt
+robot pose / heading
+payload_mode
+candidate path length
+candidate minimum clearance
+candidate turn count
+inflation cost integral
+target confidence / age / quality
+visibility score
+IK margin
+grasp subphase
+placement subphase
+recovery counters
+remaining time
+referee state
+```
+
+### 10.3 动作掩码
+
+使用 MaskablePPO 类似接口：
+
+```python
+safe_candidates, action_mask = safety_shield.filter(candidates, world, costmap)
+action = rl_policy.predict(features, action_masks=action_mask)
+selected = policy_guard.accept_or_fallback(action, heuristic_best)
+```
+
+### 10.4 奖励
+
+```text
++100 裁判确认任务成功
++20  稳定抓取确认
++10  安全完成放置
++3   完成关键 Step
+-0.02 * elapsed_time
+-0.1  * path_length
+-inflation_cost_integral
+-2   重新规划
+-5   局部恢复
+-20  抓取失败
+-40  物体掉落
+-100 attempt 失败
+-500 安全违规（理论上应先被 mask 阻止）
+```
+
+中间奖励必须按 `step_run_id` 去重，裁判得分不能由本地事件伪造。
+
+### 10.5 部署阶段
+
+```text
+Phase RL-0: 数据记录，不训练
+Phase RL-1: 离线训练和回放评估
+Phase RL-2: Shadow，只记录 RL 建议
+Phase RL-3: 只在启发式分数接近时决胜
+Phase RL-4: 受约束接管宏动作选择
+```
+
+正式比赛中只推理，不在线更新模型。
+
+### 10.6 推理回退
+
+以下任何情况立即使用 HeuristicPolicy：
+
+- 模型文件缺失或 SHA256 不匹配。
+- 推理超时。
+- 输出动作被 mask。
+- 特征包含 NaN/Inf。
+- 模型版本与 observation schema 不兼容。
+- RL 选项低于确定性安全下界。
+
+---
+
+## 11. 语义解析在新调度器中的位置
+
+### 正式链
+
+```text
+/material/instruction
+ -> parse_instruction_message
+ -> TaskInstruction
+ -> validate_instruction(require_execution_ready=True)
+ -> task ids == [1,2,3]
+ -> SchedulerEngine.configure
+```
+
+### 旁路链
+
+```text
+已通过正式校验的 instruction snapshot
+ -> SemanticAudit.submit
+ -> Regex / optional ML / optional SLM
+ -> SEM_AUDIT MATCH/DIFF/ERROR
+ -> 不返回 SchedulerEngine
+```
+
+约束：
+
+- 不得把 Regex/ML/SLM 结果写入 Candidate 特征中的正式目标字段。
+- 不得用自然语言补全 `target_body/place_world/place_radius`。
+- 审计超时和错误不能阻塞 ROS 控制线程。
+- 正式部署默认 `MATERIAL_SEMANTIC_AUDIT=0`。
+
+建议配置：
+
+```bash
+# 正式比赛默认
+export MATERIAL_SEMANTIC_AUDIT=0
+
+# 调试：只开 Regex，避免模型依赖
+export MATERIAL_SEMANTIC_AUDIT=1
+export MATERIAL_SEMANTIC_AUDIT_ML=0
+export MATERIAL_SEMANTIC_AUDIT_SLM=0
+
+# 研究：Regex + 已安装的 ML
+export MATERIAL_SEMANTIC_AUDIT=1
+export MATERIAL_SEMANTIC_AUDIT_ML=1
+export MATERIAL_SEMANTIC_AUDIT_ML_MODEL=/workspace/baseline/semantic_research/artifacts/ml_slots_v2.joblib
+```
+
+---
+
+## 12. 分阶段实施任务
+
+每一阶段建议单独 PR，不允许跨阶段顺手重构运动控制。
+
+### PR 0：冻结 0813 基线
+
+任务：
+
+1. 记录 HEAD、环境、测试命令和 176 项回归结果。
+2. 固定 `task123_full` dry-run trace。
+3. 记录 Task 1/2/3 当前阶段序列和裁判事件样例。
+4. 固定连续抓取和柔顺放置参数文档。
+
+退出标准：
+
+- 工作区来源可追溯。
+- 全量纯 Python 测试通过。
+- 不修改控制行为。
+
+### PR 1：调度数据模型和事件日志
+
+新增：
+
+```text
+scheduler/models.py
+scheduler/events.py
+tests/test_scheduler_models.py
+tests/test_scheduler_events.py
+```
+
+任务：
+
+- 定义 `ActionStatus/FailureCode/StepSpec/TaskPlan/SchedulerSnapshot`。
+- 定义 session/task/attempt/step/step_run 唯一 ID。
+- 事件先写内存 sink 和 JSONL sink，不改 ROS 日志。
+
+退出标准：
+
+- 纯数据层，无 Executor 改动。
+- JSONL 可回放、字段版本化。
+
+### PR 2：RefereeGateway
+
+新增：
+
+```text
+scheduler/referee.py
+tests/test_referee_gateway.py
+```
+
+迁移：
+
+- 当前 ordinal、attempt、all-tasks-done 解释。
+- 重复消息幂等。
+- 状态倒退、缺失和冲突检测。
+
+退出标准：
+
+- 新旧 Controller 对同一裁判 trace 产生相同 task/attempt。
+- 不发布任何运动命令。
+
+### PR 3：LegacyStageAction 和 SchedulerEngine 骨架
+
+新增：
+
+```text
+scheduler/legacy_adapter.py
+scheduler/engine.py
+scheduler/plans.py
+tests/test_scheduler_engine.py
+tests/test_scheduler_trace_equivalence.py
+```
+
+任务：
+
+- 把现有 Executor Stage 包成 ScheduledAction。
+- 用新 Engine 复现固定 Task 1→2→3 和现有 Stage 顺序。
+- `CompetitionController` 暂时保留为兼容外观。
+
+退出标准：
+
+- dry-run 状态 trace 与旧 Controller 相同。
+- 正式裁判推进语义不变。
+
+### PR 4：Shadow 模式
+
+配置：
+
+```text
+MATERIAL_SCHEDULER_ENGINE=legacy
+MATERIAL_SCHEDULER_ENGINE=shadow
+MATERIAL_SCHEDULER_ENGINE=v2
+```
+
+Shadow 规则：
+
+- Legacy 真实发命令。
+- V2 只计算状态和记录差异。
+- 不一致绝不影响真实命令。
+
+退出标准：
+
+- 多组 dry-run/referee trace 无状态差异。
+- Shadow 不改变 ROS topic、频率和命令值。
+
+### PR 5：资源所有权和 Command Lease
+
+新增：
+
+```text
+scheduler/resources.py
+scheduler/safety.py
+tests/test_resource_manager.py
+tests/test_command_lease.py
+```
+
+任务：
+
+- 声明 BASE/SPINE/HEAD/ARMS/GRIPPERS/PERCEPTION。
+- 校验旧 Executor 返回的控制权标志。
+- 底盘命令租约超时自动归零。
+
+退出标准：
+
+- 缺命令、异常、超时和冲突全部停车。
+- 机械臂保持最后安全命令行为不退化。
+
+### PR 6：结构化失败和恢复
+
+优先改造：
+
+1. 导航失败。
+2. 感知失败。
+3. 安全撤退。
+4. 最后才改抓取/放置。
+
+任务：
+
+- 为关键错误增加 FailureCode。
+- 实现 `RecoverableStep` 和有限恢复表。
+- 保留原错误文本用于人读日志，但不用于决策。
+
+退出标准：
+
+- 每种 FailureCode 有故障注入测试。
+- 恢复次数有硬上限。
+- 不可逆失败不会被错误重试。
+
+### PR 7：独立 TaskPlan 与通用 Cleanup
+
+任务：
+
+- 删除所有任务强制共享全局 Stage 序列的要求。
+- 为 Task 1/2/3 注册独立 TaskPlan。
+- 用 `cleanup=True` 替换 Task 3 收尾特判。
+- 把 Task 2/3 detection epoch 迁入 AttemptMemory/Action lifecycle。
+
+退出标准：
+
+- 三任务原有物理顺序不变。
+- 裁判提前结束时只执行安全 cleanup。
+
+### PR 8：WorldCostmap 与候选站位评分
+
+任务：
+
+- 封装现有静态、动态、分层、footprint 和 carried envelope。
+- 为动态障碍加入 TTL/置信度。
+- `GlobalPlanner` 返回路径及完整成本指标。
+- Task 1/2/3 各提供多个合法候选站位。
+- 使用确定性 Multi-Critic 选择。
+
+退出标准：
+
+- 相同输入产生确定性结果。
+- 所有候选都通过硬安全过滤。
+- 比固定站位策略不降低成功率和最小净空。
+
+### PR 9：调度数据集和 Gymnasium 环境
+
+新增：
+
+```text
+learning/env.py
+learning/observation.py
+learning/action_space.py
+learning/reward.py
+learning/action_mask.py
+learning/domain_randomization.py
+```
+
+任务：
+
+- 把候选动作调度封装为离散 Action Space。
+- 记录 heuristic 策略数据作为基线。
+- 做场景、检测、延迟和规划失败随机化。
+
+退出标准：
+
+- 固定 seed 可复现。
+- action mask 测试覆盖非法动作。
+- 数据不包含 Server 私有真值泄露。
+
+### PR 10：RL Shadow
+
+新增：
+
+```text
+scheduler/policies/rl.py
+scheduler/policies/guard.py
+learning/train_maskable_ppo.py
+learning/evaluate_policy.py
+```
+
+任务：
+
+- 离线训练 MaskablePPO。
+- 固定模型哈希、特征 schema 和训练配置。
+- 正式 Client 先只记录 RL 建议。
+
+退出标准：
+
+- 100% 输出位于 action mask 内。
+- 推理 P95 满足预算。
+- Shadow 不改变控制命令。
+
+### PR 11：受约束启用与封板
+
+启用条件：
+
+- RL 在盲测 seed 上不低于启发式成功率下界。
+- 碰撞和硬约束违规为 0。
+- 平均时间、恢复次数或路径成本至少一项显著改善。
+- 推理异常回退测试全部通过。
+
+正式默认仍建议先保持 HeuristicPolicy；RL 通过完整实机审查后再显式开启。
+
+---
+
+## 13. 测试矩阵
+
+### 单元测试
+
+- TaskPlan 拓扑完整、无悬空 Step。
+- 每个 Step 的成功和失败转移存在。
+- FailureCode 到 RecoveryPolicy 映射完整。
+- 资源冲突和命令越权。
+- 动态障碍 TTL。
+- Candidate action mask。
+- utility 的 NaN/Inf 和边界值。
+- 无模型、坏模型、推理超时回退。
+
+### 状态机测试
+
+- 三任务 dry-run。
+- 裁判重试和跨任务推进。
+- 重复裁判消息幂等。
+- 裁判提前宣布全部结束。
+- Task 3 cleanup。
+- 正式指令重复发布和执行中变更拒绝。
+
+### 故障注入
+
+- odom/joint/detection 过期。
+- 无路径。
+- 动态障碍突然出现。
+- 只发生单侧接触。
+- effort 软上限/硬上限。
+- 物体掉落。
+- 放置 effort 不可用。
+- Executor 抛异常。
+- 控制循环超时。
+- RL 输出非法动作。
+
+### 仿真指标
+
+```text
+task success rate
+attempt success rate
+total score
+task elapsed time
+path length
+minimum clearance
+replan count
+recovery count
+grasp single-side duration
+peak wrist effort delta
+placement completion reason
+action switch count
+policy inference latency
+```
+
+---
+
+## 14. 推荐配置项
+
+```text
+MATERIAL_SCHEDULER_ENGINE=legacy|shadow|v2
+MATERIAL_SCHEDULER_POLICY=heuristic|rl_shadow|rl_guarded
+MATERIAL_SCHEDULER_EVENT_LOG=/tmp/material_scheduler.jsonl
+
+MATERIAL_COSTMAP_DYNAMIC_TTL_S=1.0
+MATERIAL_POLICY_REEVALUATE_PERIOD_S=0.25
+MATERIAL_POLICY_SWITCH_MARGIN=0.25
+MATERIAL_POLICY_MIN_HOLD_S=0.75
+
+MATERIAL_SCHEDULER_MODEL=
+MATERIAL_SCHEDULER_MODEL_SHA256=
+MATERIAL_RL_TIMEOUT_MS=25
+
+MATERIAL_SEMANTIC_AUDIT=0
+MATERIAL_SEMANTIC_AUDIT_ML=0
+MATERIAL_SEMANTIC_AUDIT_SLM=0
+```
+
+以上除独立全局重规划周期外均已接入 `client_task.py`；全局路径仍按阶段进入、地图变化和现有
+导航控制器触发，不暴露 `MATERIAL_COSTMAP_REPLAN_PERIOD_S`。非法数值配置会关闭候选策略
+旁路并回退既有确定性 Executor，不影响正式 JSON 和 Legacy 控制链。
+
+所有新增配置必须：
+
+- 有安全默认值。
+- 非法值不能导致正式 Client 崩溃。
+- 启动日志输出最终生效值。
+- 模型和日志缺失时回退到确定性策略。
+
+---
+
+## 15. GitHub 参考项目到本项目的映射
+
+| 项目 | 借鉴内容 | 本项目落点 |
+|---|---|---|
+| [Nav2](https://github.com/ros-navigation/navigation2) | RecoveryNode、分层 Costmap、生命周期 | recovery.py、WorldCostmap、RefereeGateway |
+| [BehaviorTree.CPP](https://github.com/BehaviorTree/BehaviorTree.CPP) | 异步 Action、Sequence/Fallback/Retry、Blackboard | ScheduledAction、TaskPlan、分层 Memory |
+| [py_trees_ros](https://github.com/splintered-reality/py_trees_ros) | Python ROS 行为树和可视化 | V2 分支复杂后再评估接入 |
+| [Nav2 MPPI](https://github.com/ros-navigation/navigation2/tree/main/nav2_mppi_controller) | 多 Critic 轨迹评分 | utility.py 的确定性 Multi-Critic |
+| [Stable-Baselines3 Contrib](https://github.com/Stable-Baselines-Team/stable-baselines3-contrib) | MaskablePPO | 有限安全宏动作排序 |
+| [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) | 标准 RL 环境接口 | learning/env.py |
+| [IsaacLab](https://github.com/isaac-sim/IsaacLab) | 并行训练和域随机化思想 | 仅参考；当前不迁移仿真平台 |
+| [PlanSys2](https://github.com/PlanSys2/ros2_planning_system) | Plan/Executor 分离 | 借鉴边界；当前不引入 PDDL |
+
+当前不直接引入 BehaviorTree.CPP 或 PlanSys2。先完成轻量 Python V2 内核；只有当恢复分支和
+并行行为复杂到 TaskPlan 难以维护时，再评估把 TaskPlan 映射到 `py_trees_ros`。
+
+---
+
+## 16. 回退策略
+
+### 代码回退
+
+- 保留 `MATERIAL_SCHEDULER_ENGINE=legacy` 直到 V2 实机封板。
+- 新 Engine 不直接删除 `CompetitionController`。
+- 旧 Executor 接口至少保留一个完整发布周期。
+
+### 运行时回退
+
+- RL 异常 -> HeuristicPolicy。
+- Costmap 候选为空 -> 当前已验证固定站位策略或安全 BLOCKED。
+- 动态层异常 -> 清空动态候选，但保留静态安全层。
+- 语义研究异常 -> 关闭审计，不影响正式 JSON。
+- Scheduler 内部异常 -> SAFE_HOLD，不自动重启 Client。
+
+### 数据回退
+
+- 每个模型记录 SHA256 和 observation schema version。
+- EventLog 只追加，不覆盖比赛输入或控制配置。
+- 不提交大模型、临时指标和仿真缓存。
+
+---
+
+## 17. 最终验收清单
+
+- [x] Server JSON 仍是唯一执行语义真值。
+- [x] 裁判仍是 Task 和 attempt 推进权威。
+- [ ] 20 Hz 安全与命令循环未降低。
+- [x] 底盘命令租约失效后自动归零。
+- [x] 三任务有独立 TaskPlan 实例（当前共享兼容阶段拓扑）。
+- [ ] 抓取和放置柔顺子相位可观察。
+- [x] 物体释放后的不可逆边界被正确建模。
+- [x] Task 3 收尾不再依赖任务编号特判。
+- [x] 动态障碍具有 TTL 和置信度。
+- [x] 候选动作先硬过滤再评分。
+- [x] RL 只能选择 action mask 内的宏动作。
+- [x] RL/模型/推理故障可自动回退。
+- [x] 语义旁路不能修改任务或阻塞控制。
+- [x] Legacy/Shadow/V2 三模式可切换。
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（371 passed，5 skipped）。
+- [ ] ROS/Server 联调、仿真时序和实机故障注入回归通过。
+- [ ] 官方 4090 Server/Client 环境完成逐段实机标定。
+
+---
+
+## 18. 下一实施批次：实机放行，不再扩张内核
+
+原计划第一个批次（models/events/referee、Legacy trace、SchedulerEngine 骨架）已经完成，并已
+继续完成代价地图、Multi-Critic 和受约束 RL 接口。下一批工作不得直接训练或正式启用 RL，
+而应按以下顺序完成实机放行：
+
+1. 官方镜像运行 `legacy + task123_full`，记录三任务基准轨迹和周期延迟。
+2. 同一随机种子运行 `shadow + task123_full`，要求零重复 executor tick、零计划分歧。
+3. 运行 `v2 + dry_run + heuristic`，核对裁判推进、资源释放、命令 lease 和 JSONL 回放。
+4. 运行 `v2 + nav_only + heuristic`，只为 Task 1 导航执行器实现
+   `apply_scheduler_candidate(...)`，验证中心/左右候选切换和最小净空。
+   **[代码已完成，待实机验证]**：hook 已在 `executors/task1.py` 落地并带单元/集成
+   测试（`tests/test_task1_scheduler_candidate.py`，15 项）；四道执行器侧校验（走廊、
+   碰撞、净空 ≥0.22 m、重规划）任一失败 fail-closed 进入 SAFE_HOLD；候选侧
+   `heuristic` 已通过 action mask 与硬过滤。剩余：官方镜像上录制中心/左右切换的
+   周期延迟与净空遥测。
+5. 依次为 Task 2 货架观察/抓取站位、Task 1/2/3 transport、Return-to-End 开放 hook；每一步
+   都必须能用环境变量立即退回 `legacy`。
+6. 完成故障注入：动态障碍过期、无路径、输入陈旧、裁判主题短暂乱序、模型缺失、推理超时、
+   masked action、NaN 输出、底盘 lease 失效。
+7. 只在足量 Heuristic EventLog 经过离线回放后训练 MaskablePPO；先 `rl_shadow`，通过回放和
+   仿真统计门槛后再讨论 `rl_guarded` 实机许可。
+
+另外两项代码闭环应排在扩大 Executor hook 之前：把实际 held-object 几何传给 transport
+costmap；将现有 Executor 的失败结果结构化映射到 `FailureCode`，再由 `RecoverableStep`
+执行有预算的恢复。当前这两部分只有基础设施和单测，不属于已上线能力。
+
+这个顺序的核心是：内核已经能计算候选回报，剩余风险集中在“选择结果如何改变真实运动”。
+因此每个 Executor 必须显式 opt-in，不能通过调度器反射修改私有 `_goal` 或绕过现有导航、
+IK、柔顺抓取和柔顺放置控制器。

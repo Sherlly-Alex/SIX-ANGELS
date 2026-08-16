@@ -50,7 +50,7 @@ class ControllerSnapshot:
     transition_serial: int
 
 
-class CompetitionController:
+class _LegacyCompetitionController:
     """Schedule task 1, task 2, and task 3 in one long-lived process."""
 
     def __init__(
@@ -440,6 +440,110 @@ class CompetitionController:
     def _bump_message(self, message: str) -> None:
         self._message = message
         self._transition_serial += 1
+
+
+class CompetitionController:
+    """Stable public facade for legacy, shadow, and scheduler-v2 modes.
+
+    ``legacy`` remains the default for formal runs.  ``shadow`` executes the
+    same controller and validates its trace against v2 plans without issuing a
+    second command.  ``v2`` activates the plan-driven scheduler while keeping
+    this class's existing public API and snapshot types.
+    """
+
+    VALID_SCHEDULER_MODES = frozenset({"legacy", "shadow", "v2"})
+
+    def __init__(
+        self,
+        executors: Mapping[int, TaskExecutor],
+        *,
+        referee_driven: bool = True,
+        max_attempts: int = 3,
+        scheduler_mode: str = "legacy",
+        event_sink=None,
+        decision_service=None,
+        candidate_provider=None,
+        decision_period_s: float = 0.25,
+    ) -> None:
+        mode = str(scheduler_mode).strip().casefold()
+        if mode not in self.VALID_SCHEDULER_MODES:
+            raise ValueError(
+                f"unsupported scheduler_mode={scheduler_mode!r}; expected one of "
+                f"{sorted(self.VALID_SCHEDULER_MODES)}"
+            )
+        self.scheduler_mode = mode
+        self._shadow_validator = None
+        if mode == "v2":
+            from scheduler.engine import SchedulerEngine
+
+            self._backend = SchedulerEngine(
+                executors,
+                referee_driven=referee_driven,
+                max_attempts=max_attempts,
+                state_enum=ControllerState,
+                snapshot_factory=ControllerSnapshot,
+                event_sink=event_sink,
+                decision_service=decision_service,
+                candidate_provider=candidate_provider,
+                decision_period_s=decision_period_s,
+            )
+        else:
+            self._backend = _LegacyCompetitionController(
+                executors,
+                referee_driven=referee_driven,
+                max_attempts=max_attempts,
+            )
+            if mode == "shadow":
+                from scheduler.plans import build_executor_task_plans
+                from scheduler.shadow import ShadowTraceValidator
+
+                self._shadow_validator = ShadowTraceValidator(
+                    build_executor_task_plans()
+                )
+
+    def __getattr__(self, name):
+        # ``_backend`` is assigned before external attribute access.  Guarding
+        # the lookup avoids infinite recursion during partially-built objects.
+        backend = self.__dict__.get("_backend")
+        if backend is None:
+            raise AttributeError(name)
+        return getattr(backend, name)
+
+    @property
+    def shadow_divergences(self):
+        if self._shadow_validator is None:
+            return ()
+        return tuple(self._shadow_validator.divergences)
+
+    @property
+    def shadow_healthy(self) -> bool:
+        return self._shadow_validator is None or self._shadow_validator.healthy
+
+    def configure(self, instructions: Sequence[Mapping]) -> bool:
+        return self._backend.configure(instructions)
+
+    def set_inputs_ready(self, ready: bool) -> None:
+        self._backend.set_inputs_ready(ready)
+
+    def tick(self, context: ExecutionContext) -> ControllerSnapshot:
+        snapshot = self._backend.tick(context)
+        if self._shadow_validator is not None:
+            self._shadow_validator.observe(snapshot)
+        return snapshot
+
+    def stop(self, reason: str = "client stop requested") -> None:
+        self._backend.stop(reason)
+
+    def close(self) -> None:
+        close = getattr(self._backend, "close", None)
+        if callable(close):
+            close()
+
+    def snapshot(self) -> ControllerSnapshot:
+        snapshot = self._backend.snapshot()
+        if self._shadow_validator is not None:
+            self._shadow_validator.observe(snapshot)
+        return snapshot
 
 
 __all__ = [

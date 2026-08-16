@@ -31,6 +31,7 @@ from navigation.competition_adapter import (
     goal_reached_event,
     refresh_dynamic_overlay,
 )
+from navigation.footprint_checker import FootprintChecker
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import (
     NavigationGoal,
@@ -70,6 +71,12 @@ class Task1NavigationExecutor:
     YAW_TOLERANCE_RAD = 0.05
     TARGET_MAX_AGE_S = 1.5
     TARGET_WAIT_TIMEOUT_S = 20.0
+    # Scheduler candidate stands must stay inside this lateral corridor around
+    # the executor's own calibrated nominal stand and keep at least the same
+    # clearance as the navigation controller's path validator.
+    SCHEDULER_CANDIDATE_MAX_LATERAL_M = 0.15
+    SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M = 0.10
+    SCHEDULER_CANDIDATE_MIN_STAND_CLEARANCE_M = 0.22
 
     def __init__(self) -> None:
         speed_limits = SpeedLimits(
@@ -243,6 +250,184 @@ class Task1NavigationExecutor:
         self._navigation.reset()
         self.active_stage = None
         self._last_tick_s = None
+
+    def apply_scheduler_candidate(self, selected, outcome, context) -> None:
+        """Opt-in scheduler hook: switch the active nav goal to a ranked stand.
+
+        The v2 engine only offers candidates that already passed its own hard
+        filter and Multi-Critic ranking.  This executor repeats the critical
+        checks on its own layered grid and replans through the validated
+        :class:`NavigationController`, so a scheduler selection can never
+        bypass the existing navigation, footprint or clearance logic.
+
+        Rejections raise instead of being ignored: an executor that opted in
+        must fail closed when a selection cannot be applied safely.  Scheduler
+        candidates are optional — without this hook (legacy/shadow modes) the
+        executor keeps its deterministic calibrated stand.
+        """
+        if self.active_stage is not TaskStage.NAVIGATE_TO_PICK:
+            raise RuntimeError(
+                "task 1 scheduler candidates only apply during "
+                f"navigate_to_pick; active_stage={self.active_stage}"
+            )
+        candidate = getattr(selected, "candidate", selected)
+        if candidate is None or not bool(getattr(candidate, "is_navigation", False)):
+            raise ValueError("task 1 rejected a non-navigation scheduler candidate")
+        goal_pose = getattr(candidate, "goal_pose", None)
+        if goal_pose is None or not all(
+            math.isfinite(float(value)) for value in goal_pose
+        ):
+            raise ValueError(
+                "task 1 rejected a scheduler candidate without a finite goal pose"
+            )
+        target_x, target_y, target_z = self._require_calibrated_target(context)
+
+        nominal_x, nominal_y = target_x, target_y - self.TABLE_STANDOFF_M
+        nominal_yaw = math.pi / 2.0
+        forward_error, lateral_error = self._stand_errors_in_heading(
+            (float(goal_pose[0]), float(goal_pose[1])),
+            (nominal_x, nominal_y),
+            nominal_yaw,
+        )
+        if abs(lateral_error) > self.SCHEDULER_CANDIDATE_MAX_LATERAL_M:
+            raise ValueError(
+                "task 1 rejected scheduler candidate "
+                f"{getattr(candidate, 'action_id', candidate)!r}: lateral error "
+                f"{lateral_error:+.3f} m exceeds "
+                f"{self.SCHEDULER_CANDIDATE_MAX_LATERAL_M:.2f} m corridor"
+            )
+        if abs(forward_error) > self.SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M:
+            raise ValueError(
+                "task 1 rejected scheduler candidate "
+                f"{getattr(candidate, 'action_id', candidate)!r}: forward error "
+                f"{forward_error:+.3f} m exceeds "
+                f"{self.SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M:.2f} m corridor"
+            )
+
+        robot = self._odometry_pose(context.odometry)
+        if robot is None:
+            raise RuntimeError(
+                "task 1 cannot apply a scheduler candidate without valid odometry"
+            )
+        robot_x, robot_y, _robot_yaw = robot
+
+        refresh_dynamic_overlay(
+            self._navigation_grid,
+            context.target_observations,
+            exclude_color=str(context.instruction.get("target_color", "")).strip().lower(),
+            robot_xy=(robot_x, robot_y),
+        )
+        candidate_x, candidate_y, candidate_yaw = (
+            float(goal_pose[0]),
+            float(goal_pose[1]),
+            float(goal_pose[2]),
+        )
+        checker = FootprintChecker()
+        if not checker.is_pose_free(
+            self._navigation_grid,
+            candidate_x,
+            candidate_y,
+            candidate_yaw,
+            FootprintMode.TRANSIT_STOWED,
+        ):
+            raise ValueError(
+                "task 1 rejected scheduler candidate "
+                f"{getattr(candidate, 'action_id', candidate)!r}: stand pose "
+                "is not collision-free on the layered grid"
+            )
+        clearance = self._stand_clearance_m(candidate_x, candidate_y)
+        if (
+            clearance is None
+            or clearance < self.SCHEDULER_CANDIDATE_MIN_STAND_CLEARANCE_M
+        ):
+            display = "unavailable" if clearance is None else f"{clearance:.3f} m"
+            raise ValueError(
+                "task 1 rejected scheduler candidate "
+                f"{getattr(candidate, 'action_id', candidate)!r}: stand "
+                f"clearance {display} below "
+                f"{self.SCHEDULER_CANDIDATE_MIN_STAND_CLEARANCE_M:.2f} m"
+            )
+
+        goal = NavigationGoal(
+            x=candidate_x,
+            y=candidate_y,
+            yaw=candidate_yaw,
+            position_tolerance=self.POSITION_TOLERANCE_M,
+            yaw_tolerance=self.YAW_TOLERANCE_RAD,
+            safety_radius=self.TABLE_STANDOFF_M,
+            segment=NavigationSegment.NAV_TABLE,
+            source_tag=f"scheduler:{getattr(candidate, 'action_id', 'candidate')}",
+        )
+        if not self._navigation.set_goal(goal, robot_x, robot_y):
+            raise RuntimeError(
+                "task 1 could not plan a collision-free path to scheduler "
+                f"candidate {getattr(candidate, 'action_id', candidate)!r}"
+            )
+        if self._locked_target_world is None:
+            self._locked_target_world = (target_x, target_y, target_z)
+            self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+        self._goal = goal
+
+    def _require_calibrated_target(
+        self,
+        context: ExecutionContext,
+    ) -> tuple[float, float, float]:
+        """Return the calibrated slot target a candidate stand must reference."""
+        if self._locked_target_world is not None:
+            return self._locked_target_world
+        target_color = (
+            str(context.instruction.get("target_color", "")).strip().lower()
+        )
+        observation = context.target_observations.get(target_color)
+        if observation is None:
+            raise RuntimeError(
+                f"task 1 scheduler candidate has no {target_color!r} observation "
+                "to calibrate against"
+            )
+        age_s = max(0.0, float(context.now_s) - observation.received_at_s)
+        if age_s > self.TARGET_MAX_AGE_S:
+            raise RuntimeError(
+                f"task 1 scheduler candidate target observation is {age_s:.2f}s old"
+            )
+        if not all(math.isfinite(v) for v in observation.position_world):
+            raise RuntimeError(
+                "task 1 scheduler candidate target observation is non-finite"
+            )
+        calibrated = self._calibrated_table_source(observation.position_world)
+        if calibrated is None:
+            raise RuntimeError(
+                "task 1 scheduler candidate target is outside both calibrated "
+                "table-source slots"
+            )
+        return calibrated
+
+    @staticmethod
+    def _stand_errors_in_heading(
+        candidate_xy: tuple[float, float],
+        nominal_xy: tuple[float, float],
+        heading: float,
+    ) -> tuple[float, float]:
+        dx = float(candidate_xy[0]) - float(nominal_xy[0])
+        dy = float(candidate_xy[1]) - float(nominal_xy[1])
+        c = math.cos(float(heading))
+        s = math.sin(float(heading))
+        forward = c * dx + s * dy
+        lateral = -s * dx + c * dy
+        return forward, lateral
+
+    def _stand_clearance_m(self, x: float, y: float) -> float | None:
+        """Nearest-obstacle distance at ``(x, y)`` on the planning surface."""
+        planning = self._navigation_grid.planning_grid()
+        gx, gy = planning.world_to_grid(x, y)
+        if gx < 0 or gy < 0:
+            return None
+        try:
+            dist_cells = planning.distance_transform()[gy, gx]
+        except IndexError:
+            return None
+        if not math.isfinite(float(dist_cells)):
+            return None
+        return float(dist_cells) * planning.resolution
 
     def _wait_for_target(
         self,

@@ -1,0 +1,98 @@
+"""Pure-Python scheduling primitives for the material sorting client."""
+
+from .events import (
+    EventLog,
+    EventSink,
+    EventType,
+    InMemoryEventSink,
+    JSONLEventSink,
+    JsonlEventSink,
+    MemoryEventSink,
+    SchedulerEvent,
+)
+from .decision import DecisionConfig, DecisionOutcome, SchedulerDecisionService
+from .engine import EngineSnapshot, EngineState, SchedulerEngine
+from .models import (
+    ActionResult,
+    ActionStatus,
+    ArmCommandMode,
+    BaseCommand,
+    CommandFrame,
+    FailureCode,
+    PayloadMode,
+    RefereeSnapshot,
+    Resource,
+    ScheduledAction,
+    StepSpec,
+    TaskPlan,
+    WorldState,
+)
+from .recovery import (
+    DEFAULT_RECOVERY_POLICIES,
+    RecoverableStep,
+    RecoveryClassifier,
+    RecoveryDecision,
+    RecoveryLevel,
+    RecoveryPolicy,
+)
+from .referee import RefereeGateway, RefereeUpdate
+from .project_candidates import CandidateBatch, ProjectCandidateProvider
+from .resources import (
+    BaseCommandLease,
+    BaseLeaseSnapshot,
+    CommandValidationError,
+    CommandValidator,
+    ResourceConflictError,
+    ResourceLease,
+    ResourceManager,
+)
+from .safety import SafetySupervisor, SafetyViolation
+
+__all__ = [
+    "ActionResult",
+    "ActionStatus",
+    "ArmCommandMode",
+    "BaseCommand",
+    "BaseCommandLease",
+    "BaseLeaseSnapshot",
+    "CandidateBatch",
+    "CommandFrame",
+    "CommandValidationError",
+    "CommandValidator",
+    "DecisionConfig",
+    "DecisionOutcome",
+    "DEFAULT_RECOVERY_POLICIES",
+    "EventLog",
+    "EventSink",
+    "EventType",
+    "EngineSnapshot",
+    "EngineState",
+    "FailureCode",
+    "InMemoryEventSink",
+    "JSONLEventSink",
+    "JsonlEventSink",
+    "MemoryEventSink",
+    "PayloadMode",
+    "ProjectCandidateProvider",
+    "RecoverableStep",
+    "RecoveryClassifier",
+    "RecoveryDecision",
+    "RecoveryLevel",
+    "RecoveryPolicy",
+    "RefereeGateway",
+    "RefereeSnapshot",
+    "RefereeUpdate",
+    "Resource",
+    "ResourceConflictError",
+    "ResourceLease",
+    "ResourceManager",
+    "SafetySupervisor",
+    "SafetyViolation",
+    "ScheduledAction",
+    "SchedulerDecisionService",
+    "SchedulerEngine",
+    "SchedulerEvent",
+    "StepSpec",
+    "TaskPlan",
+    "WorldState",
+]

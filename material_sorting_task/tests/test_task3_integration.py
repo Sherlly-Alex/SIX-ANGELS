@@ -107,8 +107,8 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertLessEqual(executor.TASK3_INSERT_CLEARANCE_M, 0.20)
         self.assertEqual(executor.TASK3_ARM_INSERTION_M, 0.240)
         self.assertEqual(executor.TASK3_ARM_INSERT_TIMEOUT_S, 20.0)
-        self.assertEqual(executor.TASK3_MIN_PROP_CENTER_SEPARATION_M, 0.200)
-        self.assertEqual(executor.TASK3_RELEASE_SPREAD_M, 0.035)
+        self.assertEqual(executor.TASK3_MIN_PROP_CENTER_SEPARATION_M, 0.150)
+        self.assertEqual(executor.TASK3_RELEASE_SPREAD_M, 0.040)
         self.assertEqual(executor.TASK3_RELEASE_MIN_HALF_WIDTH_M, 0.110)
         self.assertEqual(executor.TASK3_RELEASE_MAX_HALF_WIDTH_M, 0.140)
         self.assertIsInstance(
@@ -208,7 +208,7 @@ class Task3IntegrationWiringTests(unittest.TestCase):
 
         self.assertEqual(result.status, StageStatus.SUCCEEDED)
         self.assertEqual(release.call[0], (0.897, -0.036, 0.498))
-        self.assertAlmostEqual(release.call[1], 0.114, places=6)
+        self.assertAlmostEqual(release.call[1], 0.119, places=6)
 
     def test_first_attempt_rejects_target_far_from_dynamic_reference(self) -> None:
         executor = Task3IntegratedExecutor(self._memory())
@@ -288,7 +288,7 @@ class Task3IntegrationWiringTests(unittest.TestCase):
                     "place_type": "shelf_prop_side",
                     "direction": "left",
                     # Packaging centre y=0.778: this formal target is already
-                    # closer than the configured 0.20 m minimum separation.
+                    # closer than the configured 0.15 m minimum separation.
                     "place_world": [-2.68, 0.590, 0.498],
                     "place_radius": 0.24,
                 },
@@ -297,8 +297,8 @@ class Task3IntegrationWiringTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(executor._task3_release_lateral_inset_m, 0.0)
-        self.assertAlmostEqual(executor._place_world[1], 0.590, places=6)
+        self.assertEqual(executor._task3_release_lateral_inset_m, 0.03)
+        self.assertAlmostEqual(executor._place_world[1], 0.620, places=6)
 
     def test_deeper_release_keeps_previous_shallow_base_stand_depth(self) -> None:
         # The target moved 0.08 m inward while arm insertion increased by the

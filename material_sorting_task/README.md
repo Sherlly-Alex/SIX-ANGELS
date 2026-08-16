@@ -19,10 +19,12 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 examples/material_sorting/
   client_task.py                 正式 Client 入口
   competition_controller.py      三任务连续调度与裁判同步
+  scheduler/                     V2 调度内核、TaskPlan、资源/安全、候选策略
+  learning/                      可选离散宏动作 RL 训练与运行时护栏
   executors/                     任务 1/2/3 执行器接口和安全占位实现
   instruction_parser.py          结构化指令解析与校验
   task_orchestration.py          三任务编排辅助函数
-  navigation/                    底盘导航模块
+  navigation/                    底盘导航与版本化全局代价地图
   perception/                    RGB-D / YOLO 感知模块
   desktop_grasp/                 任务 1/3 桌面双臂抓取模块
   mjcf/                          Client 坐标和碰撞计算所需模型
@@ -34,6 +36,7 @@ scripts/
   setup_env_gpu.sh               ROS 2 / GPU 环境初始化
 tests/                            不依赖 ROS 2 的单元测试
 docs/                             架构和开发说明
+semantic_research/                离线语义旁路（Regex/ML/SLM），不进入正式控制链
 ```
 
 ## 运行
@@ -81,6 +84,72 @@ bash scripts/run_client.sh
 dry-run 只验证任务 1 -> 任务 2 -> 任务 3 的内部调度、日志和进程生命周期，不产生机器人
 动作，也不会得到 Server 评分。正式模式的任务切换必须等待 `/referee/taskinfo`、
 `/referee/gameinfo` 和 `/referee/score`。
+
+### 调度器 V2 与实时候选评分
+
+调度入口支持三种可回退模式：
+
+```bash
+# 正式默认：原控制器
+MATERIAL_SCHEDULER_ENGINE=legacy bash scripts/run_client.sh
+
+# 原控制器执行，V2 只校验状态轨迹，不重复 tick 运动执行器
+MATERIAL_EXECUTION_MODE=dry_run \
+MATERIAL_SCHEDULER_ENGINE=shadow bash scripts/run_client.sh
+
+# 版本化 TaskPlan、裁判网关、资源租约和命令安全边界
+MATERIAL_EXECUTION_MODE=dry_run \
+MATERIAL_SCHEDULER_ENGINE=v2 \
+MATERIAL_SCHEDULER_POLICY=heuristic \
+bash scripts/run_client.sh
+```
+
+`v2` 在导航阶段通过后台单线程以最高 4 Hz 更新 `WorldCostmap`，生成中心/左偏/右偏有限
+站位，并先做碰撞、携物包络、资源和裁判硬过滤，再进行确定性 Multi-Critic 评分。评分线程
+不阻塞 20 Hz 控制 tick，也不直接发布底盘或机械臂命令。只有显式实现
+`apply_scheduler_candidate(...)` 的执行器才会接收通过约束的候选，其余执行器保持该链路为
+可观测旁路。当前仅 `nav_only` 的 Task 1 导航执行器实现了该 hook：候选必须再次通过站位
+走廊（横向 ≤0.15 m / 纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
+`NavigationController` 实际重规划四道校验，任一失败 fail-closed 停车；`legacy`/`shadow`
+和未接入 hook 的模式不受影响。因此正式实动仍应保持 `legacy`，先以 `shadow`、
+`v2 + dry_run` 收集轨迹，再在 `v2 + nav_only` 上逐段标定候选站位切换：
+
+```bash
+MATERIAL_EXECUTION_MODE=nav_only \
+MATERIAL_SCHEDULER_ENGINE=v2 \
+MATERIAL_SCHEDULER_POLICY=heuristic \
+MATERIAL_SCHEDULER_EVENT_LOG=/tmp/material_scheduler.jsonl \
+MATERIAL_DETECT_BACKEND=yolo \
+bash scripts/run_client.sh
+```
+
+可将结构化状态、候选 Critic 和选择结果写入 JSONL：
+
+```bash
+MATERIAL_SCHEDULER_ENGINE=v2 \
+MATERIAL_EXECUTION_MODE=dry_run \
+MATERIAL_SCHEDULER_POLICY=heuristic \
+MATERIAL_SCHEDULER_EVENT_LOG=/tmp/material_scheduler.jsonl \
+bash scripts/run_client.sh
+```
+
+强化学习仅能选择已经通过硬过滤的离散宏动作，不允许输出 `vx/wz` 或关节控制量。推荐先
+使用 `rl_shadow`；模型缺失、哈希/schema 不匹配、推理超时、NaN、越界或选择 masked 动作
+都会确定性回退到启发式策略：
+
+```bash
+MATERIAL_SCHEDULER_ENGINE=v2 \
+MATERIAL_EXECUTION_MODE=dry_run \
+MATERIAL_SCHEDULER_POLICY=rl_shadow \
+MATERIAL_SCHEDULER_MODEL=/workspace/models/scheduler_maskable_ppo.zip \
+MATERIAL_SCHEDULER_MODEL_SHA256=<approved-sha256> \
+MATERIAL_SCHEDULER_EVENT_LOG=/tmp/material_scheduler.jsonl \
+bash scripts/run_client.sh
+```
+
+`rl_guarded` 已提供运行时护栏，但在离线回放、Shadow、仿真和实机分段验收完成前不要用于
+正式比赛。项目不会自动下载模型，Gymnasium、Stable-Baselines3 和 sb3-contrib 也不会进入
+默认正式 Client 依赖。
 
 ### 任务 1 底盘实动测试
 
@@ -173,10 +242,23 @@ bash scripts/run_client.sh
 
 ## 测试
 
+正式（不发现 `tests/semantic_research`，无需 sklearn）：
+
 ```bash
-python3 -m unittest discover -s tests -t .
-python3 scripts/check_workspace.py
+bash scripts/run_formal_tests.sh
+python scripts/check_workspace.py
 ```
+
+研究旁路单测与离线评估（与 `run_client.sh` 互不依赖）：
+
+```bash
+bash scripts/run_semantic_research_tests.sh
+bash scripts/run_semantic_research_eval.sh
+```
+
+语义真值与旁路边界见 [docs/SEMANTIC_PARSING.md](docs/SEMANTIC_PARSING.md)、
+[docs/DEPENDENCIES_LICENSES.md](docs/DEPENDENCIES_LICENSES.md)、
+[semantic_research/README.md](semantic_research/README.md)。
 
 开发约束和后续实现顺序见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 导航 v3 的兼容边界、接入结构和本地/SSH 验证步骤见

@@ -37,6 +37,7 @@ from instruction_parser import (
     parse_instruction_message,
     validate_instruction,
 )
+from semantic_audit import SemanticAudit
 from task_orchestration import parse_gameinfo, sorted_instructions
 
 
@@ -84,12 +85,28 @@ class CompetitionClient(Node):
         self._last_wait_log_ns = 0
         self._last_progress_log_ns = 0
         self._last_controller_serial = -1
+        self._last_shadow_divergence_count = 0
+        self._last_scheduler_action_id: str | None = None
+        self._invalid_hold_command_logged = False
         self._last_task2_detection_reset_key: tuple[int, int, str] | None = None
         self._last_task3_detection_reset_key: tuple[int, int, str] | None = None
 
         self.execution_mode = (
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
         )
+        self.scheduler_mode = (
+            os.environ.get("MATERIAL_SCHEDULER_ENGINE", "legacy").strip().lower()
+        )
+        self.scheduler_policy = (
+            os.environ.get("MATERIAL_SCHEDULER_POLICY", "heuristic").strip().lower()
+        )
+        if self.scheduler_policy not in {"heuristic", "rl_shadow", "rl_guarded"}:
+            invalid_policy = self.scheduler_policy
+            self.scheduler_policy = "heuristic"
+            self.get_logger().error(
+                f"invalid MATERIAL_SCHEDULER_POLICY={invalid_policy!r}; "
+                "falling back to heuristic"
+            )
         try:
             dry_run_ticks = int(
                 os.environ.get("MATERIAL_DRY_RUN_TICKS_PER_STAGE", "2")
@@ -104,10 +121,113 @@ class CompetitionClient(Node):
             self.get_logger().error(
                 f"invalid executor configuration ({exc}); falling back to safe stub mode"
             )
-        self.controller = CompetitionController(
-            executors,
-            referee_driven=self.execution_mode != "dry_run",
-        )
+        event_log = None
+        decision_service = None
+        candidate_provider = None
+        decision_period_s = 0.25
+        event_log_path = os.environ.get("MATERIAL_SCHEDULER_EVENT_LOG", "").strip()
+        if event_log_path:
+            try:
+                from scheduler.events import EventLog, JsonlEventSink
+
+                event_log = EventLog([JsonlEventSink(event_log_path)])
+                event_log.emit(
+                    "scheduler_started",
+                    "scheduler event log initialized",
+                    details={"engine": self.scheduler_mode},
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self.get_logger().error(
+                    f"scheduler event log disabled ({exc}); control is unaffected"
+                )
+        if self.scheduler_mode == "v2":
+            try:
+                from learning.observation import ObservationBuilder
+                from navigation.costmap import WorldCostmap
+                from scheduler.decision import DecisionConfig, SchedulerDecisionService
+                from scheduler.policies import (
+                    PolicyGuard,
+                    PolicyGuardConfig,
+                    RLPolicy,
+                )
+                from scheduler.project_candidates import ProjectCandidateProvider
+
+                decision_period_s = float(
+                    os.environ.get("MATERIAL_POLICY_REEVALUATE_PERIOD_S", "0.25")
+                )
+                switch_margin = float(
+                    os.environ.get("MATERIAL_POLICY_SWITCH_MARGIN", "0.25")
+                )
+                minimum_hold_s = float(
+                    os.environ.get("MATERIAL_POLICY_MIN_HOLD_S", "0.75")
+                )
+                dynamic_ttl_s = float(
+                    os.environ.get("MATERIAL_COSTMAP_DYNAMIC_TTL_S", "1.0")
+                )
+                rl_timeout_ms = float(
+                    os.environ.get("MATERIAL_RL_TIMEOUT_MS", "25")
+                )
+                if rl_timeout_ms <= 0.0:
+                    raise ValueError("MATERIAL_RL_TIMEOUT_MS must be positive")
+
+                rl_policy = None
+                if self.scheduler_policy != "heuristic":
+                    model_path = os.environ.get("MATERIAL_SCHEDULER_MODEL", "").strip()
+                    expected_hash = os.environ.get(
+                        "MATERIAL_SCHEDULER_MODEL_SHA256", ""
+                    ).strip()
+                    builder = ObservationBuilder(8)
+                    rl_policy = RLPolicy(
+                        model_path=model_path or None,
+                        expected_sha256=expected_hash or None,
+                        expected_schema_hash=builder.schema_hash,
+                    )
+                decision_service = SchedulerDecisionService(
+                    config=DecisionConfig(
+                        policy_mode=self.scheduler_policy,
+                        minimum_action_hold_s=minimum_hold_s,
+                        switch_utility_margin=switch_margin,
+                    ),
+                    rl_policy=rl_policy,
+                    policy_guard=PolicyGuard(
+                        PolicyGuardConfig(inference_timeout_s=rl_timeout_ms / 1000.0)
+                    ),
+                    event_log=event_log,
+                )
+                candidate_provider = ProjectCandidateProvider(
+                    costmap=WorldCostmap(dynamic_ttl_s=dynamic_ttl_s)
+                )
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                if decision_service is not None:
+                    decision_service.close()
+                decision_service = None
+                candidate_provider = None
+                self.scheduler_policy = "heuristic"
+                self.get_logger().error(
+                    f"scheduler policy setup failed ({exc}); "
+                    "falling back to deterministic executor behavior"
+                )
+        try:
+            self.controller = CompetitionController(
+                executors,
+                referee_driven=self.execution_mode != "dry_run",
+                scheduler_mode=self.scheduler_mode,
+                event_sink=event_log,
+                decision_service=decision_service,
+                candidate_provider=candidate_provider,
+                decision_period_s=decision_period_s,
+            )
+        except ValueError as exc:
+            self.scheduler_mode = "legacy"
+            self.controller = CompetitionController(
+                executors,
+                referee_driven=self.execution_mode != "dry_run",
+                scheduler_mode="legacy",
+            )
+            self.get_logger().error(
+                f"invalid scheduler configuration ({exc}); falling back to legacy"
+            )
+        self.semantic_audit = SemanticAudit(self.get_logger().info)
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
         self.spine_pub = self.create_publisher(
@@ -166,8 +286,23 @@ class CompetitionClient(Node):
         self.create_timer(0.05, self.tick)
         self.get_logger().info(
             "client started; waiting for instruction, odometry and joint states; "
-            f"execution_mode={self.execution_mode}"
+            f"execution_mode={self.execution_mode}; scheduler={self.scheduler_mode}"
         )
+        self.get_logger().info(
+            f"scheduler_policy={self.scheduler_policy}; "
+            f"event_log={event_log_path or 'disabled'}"
+        )
+        if self.scheduler_mode == "shadow":
+            self.get_logger().info(
+                "scheduler shadow mode validates legacy traces and never ticks a "
+                "second motion executor"
+            )
+        elif self.scheduler_mode == "v2":
+            self.get_logger().warning(
+                "scheduler v2 is active: task plans and command/resource guards "
+                "are enforced"
+            )
+        self.get_logger().info(self.semantic_audit.describe())
         if self.execution_mode == "dry_run":
             self.get_logger().warning(
                 "dry_run is scheduling-only: all three tasks advance without robot motion "
@@ -249,6 +384,9 @@ class CompetitionClient(Node):
                     for task in instructions
                 )
             )
+            # Research-only sidecar.  It consumes a snapshot after formal JSON
+            # acceptance and cannot change instructions/controller state.
+            self.semantic_audit.submit(instructions)
 
     def _taskinfo_cb(self, msg: String) -> None:
         self.referee_taskinfo = msg.data
@@ -528,6 +666,38 @@ class CompetitionClient(Node):
             if rclpy.ok():
                 raise
 
+    @staticmethod
+    def _validate_snapshot_commands(snapshot) -> None:
+        if snapshot.controls_base and not all(
+            math.isfinite(float(value))
+            for value in (snapshot.base_linear_x, snapshot.base_angular_z)
+        ):
+            raise ValueError("controller base command contains non-finite values")
+        if not snapshot.controls_arm:
+            return
+        command = snapshot.arm_command
+        if command is None:
+            raise ValueError("controller asserted controls_arm without ArmCommand")
+        try:
+            if len(command.head_positions) != 2:
+                raise ValueError("ArmCommand head_positions must contain 2 values")
+            if len(command.left_arm_positions) != 6:
+                raise ValueError("ArmCommand left_arm_positions must contain 6 values")
+            if len(command.right_arm_positions) != 6:
+                raise ValueError("ArmCommand right_arm_positions must contain 6 values")
+            values = (
+                command.spine_position,
+                *command.head_positions,
+                *command.left_arm_positions,
+                command.left_gripper_position,
+                *command.right_arm_positions,
+                command.right_gripper_position,
+            )
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError("ArmCommand contains non-finite values")
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(f"malformed ArmCommand: {exc}") from exc
+
     def _missing_inputs(self) -> list[str]:
         missing = []
         if len(self.instructions) != 3:
@@ -557,7 +727,16 @@ class CompetitionClient(Node):
             self._publish_stop()
             snapshot = self.controller.snapshot()
             if snapshot.controls_arm and snapshot.arm_command is not None:
-                self._publish_arm_command(snapshot.arm_command)
+                try:
+                    self._validate_snapshot_commands(snapshot)
+                    self._publish_arm_command(snapshot.arm_command)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    if not self._invalid_hold_command_logged:
+                        self.get_logger().error(
+                            "invalid held arm command suppressed in safe state: "
+                            f"{exc}"
+                        )
+                        self._invalid_hold_command_logged = True
             return
 
         self._refresh_task2_detection_epoch()
@@ -601,6 +780,17 @@ class CompetitionClient(Node):
             )
         )
 
+        try:
+            self._validate_snapshot_commands(snapshot)
+        except (TypeError, ValueError) as exc:
+            self.controller.stop(f"controller command rejected before publish: {exc}")
+            self.phase = ClientPhase.SAFE_HOLD
+            self._publish_stop()
+            self.get_logger().error(
+                f"controller command rejected before publish: {exc}"
+            )
+            return
+
         if snapshot.controls_base:
             self._publish_base_command(
                 snapshot.base_linear_x,
@@ -635,6 +825,25 @@ class CompetitionClient(Node):
             )
             self._last_progress_log_ns = int(now_s * 1e9)
 
+        divergence_count = len(self.controller.shadow_divergences)
+        if divergence_count > self._last_shadow_divergence_count:
+            divergence = self.controller.shadow_divergences[-1]
+            self.get_logger().warning(
+                "scheduler shadow divergence "
+                f"serial={divergence.transition_serial}: {divergence.reason}"
+            )
+            self._last_shadow_divergence_count = divergence_count
+
+        decision = getattr(self.controller, "last_decision", None)
+        decision_action_id = getattr(decision, "action_id", None)
+        if decision_action_id and decision_action_id != self._last_scheduler_action_id:
+            self.get_logger().info(
+                "scheduler candidate "
+                f"action={decision_action_id} source={decision.source} "
+                f"reason={decision.reason} costmap_v={decision.costmap_version}"
+            )
+            self._last_scheduler_action_id = decision_action_id
+
         if snapshot.state is ControllerState.FINISHED:
             self.phase = ClientPhase.FINISHED
         elif snapshot.state is ControllerState.SAFE_HOLD:
@@ -649,6 +858,7 @@ class CompetitionClient(Node):
         snapshot = self.controller.snapshot()
         if snapshot.controls_arm and snapshot.arm_command is not None:
             self._publish_arm_command(snapshot.arm_command)
+        self.controller.close()
 
 
 def main() -> None:
