@@ -376,6 +376,28 @@ class Task3IntegratedHookTests(unittest.TestCase):
         self.executor._held_center_base = (0.82, 0.0, 0.58)
         self.context = execution_context(3)
 
+    def test_dynamic_pick_does_not_offer_task1_calibrated_slot_candidates(self) -> None:
+        self.executor.active_stage = TaskStage.NAVIGATE_TO_PICK
+        self.executor._goal = SimpleNamespace(x=-0.42, y=1.63, yaw=math.pi / 2.0)
+
+        self.assertIsNone(
+            self.executor.scheduler_nominal_goal(
+                TaskStage.NAVIGATE_TO_PICK, self.context
+            )
+        )
+
+    def test_racing_dynamic_pick_candidate_is_audit_only(self) -> None:
+        self.executor.active_stage = TaskStage.NAVIGATE_TO_PICK
+        selected, outcome = selection(
+            stand_candidate("task3-pick", -0.42, 1.63, math.pi / 2.0)
+        )
+
+        status = self.executor.apply_scheduler_candidate(
+            selected, outcome, self.context
+        )
+
+        self.assertIs(status, CandidateApplicationStatus.AUDIT_ONLY)
+
     def test_nominal_transport_stand_uses_packaging_centre_row(self) -> None:
         nominal = self.executor.scheduler_nominal_goal(
             TaskStage.TRANSPORT, self.context

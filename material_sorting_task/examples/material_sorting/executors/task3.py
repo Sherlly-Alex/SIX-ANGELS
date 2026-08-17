@@ -11,6 +11,7 @@ from desktop_grasp.pregrasp_core import (
     SPINE_MIN,
 )
 from executors.base import ExecutionContext, PlaceholderTaskExecutor, StageResult, TaskStage
+from executors.scheduler_candidate import CandidateApplicationStatus
 from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
 from executors.transfer_support import stand_from_held_center
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
@@ -42,6 +43,34 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
 
     task_id = 3
     name = "task3_integrated_table_top_to_packaging_left"
+
+    def scheduler_nominal_goal(
+        self,
+        stage: TaskStage,
+        context: ExecutionContext,
+    ) -> tuple[float, float, float] | None:
+        """Expose only scheduler goals whose task-3 contract is validated.
+
+        The task-3 pick stand is derived from the current white-cube reference
+        and the live top-box observation, then frozen by the executor.  It is
+        not one of task 1's calibrated source slots and must never be routed
+        through task 1's candidate validator.  Returning ``None`` suppresses
+        offers for this dynamic pick; transport and return retain the shared
+        validated scheduler hooks.
+        """
+
+        if stage is TaskStage.NAVIGATE_TO_PICK:
+            return None
+        return super().scheduler_nominal_goal(stage, context)
+
+    def apply_scheduler_candidate(
+        self, selected, outcome, context
+    ) -> CandidateApplicationStatus:
+        """Ignore a stale/racing pick offer without stopping the robot."""
+
+        if self.active_stage is TaskStage.NAVIGATE_TO_PICK:
+            return CandidateApplicationStatus.AUDIT_ONLY
+        return super().apply_scheduler_candidate(selected, outcome, context)
 
     SOURCE_ORIENTATION = "yaw90"
     # The official rules forbid hard-coding initial positions.  On the first
