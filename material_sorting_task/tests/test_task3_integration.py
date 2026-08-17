@@ -191,6 +191,11 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         executor._held_center_base = (0.897, -0.036, 0.498)
         executor._place_world = (-2.59, 0.57, 0.498)
         executor._contact._half_width = 0.079
+        executor._contact._orientation = "yaw0"
+        executor._capture_held_grasp_snapshot()
+        # Reproduce a later-stage reset before shelf release.  Task 3 must use
+        # the grasp snapshot rather than the mutable contact transaction.
+        executor._contact.reset()
         executor._release = release
         executor._phase = "release"
         executor._phase_started_s = 20.0

@@ -351,13 +351,28 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
     def test_task1_release_uses_grasp_latched_width_after_contact_reset(self) -> None:
         executor = Task1IntegratedExecutor(CompetitionTaskMemory())
         executor._contact._half_width = 0.109
-        executor._capture_held_grasp_half_width()
+        executor._contact._orientation = "yaw0"
+        executor._capture_held_grasp_snapshot()
 
         # Reproduce the remote failure: later controller lifecycle work clears
         # the contact planner although the arms still hold the same box.
         executor._contact.reset()
 
         self.assertAlmostEqual(executor._held_release_half_width(), 0.109)
+        self.assertEqual(executor._require_held_grasp_orientation(), "yaw0")
+
+    def test_task2_transport_uses_grasp_latched_width_after_contact_reset(self) -> None:
+        executor = Task2IntegratedExecutor(CompetitionTaskMemory())
+        executor._contact._half_width = 0.081
+        executor._contact._orientation = "yaw90"
+        executor._capture_held_grasp_snapshot()
+
+        # Transport/resource lifecycle work may reset the contact transaction;
+        # the held payload geometry must remain available until release.
+        executor._contact.reset()
+
+        self.assertAlmostEqual(executor._held_half_width(), 0.081)
+        self.assertEqual(executor._require_held_grasp_orientation(), "yaw90")
 
     def test_all_integrated_tasks_use_independent_compliant_place_lowering(self) -> None:
         memory = CompetitionTaskMemory()

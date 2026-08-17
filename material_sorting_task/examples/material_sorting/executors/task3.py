@@ -996,11 +996,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         )
 
     def _task3_release_half_width(self) -> float:
-        grasp_half_width = self._contact.half_width
-        if grasp_half_width is None or not math.isfinite(float(grasp_half_width)):
-            raise PregraspInputError(
-                "task 3 relative release has no measured grasp half-width"
-            )
+        grasp_half_width = self._require_held_grasp_half_width()
         return min(
             self.TASK3_RELEASE_MAX_HALF_WIDTH_M,
             max(

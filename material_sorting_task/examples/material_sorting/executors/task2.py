@@ -1306,12 +1306,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._measured_carry_guard_enabled = bool(enabled)
 
     def _held_half_width(self) -> float:
-        half_width = self._contact.half_width
-        if half_width is None or not math.isfinite(float(half_width)):
-            raise RuntimeError("task 2 lost the bilateral grasp half-width")
-        if float(half_width) <= 0.0:
-            raise RuntimeError("task 2 bilateral grasp half-width is not positive")
-        return float(half_width)
+        try:
+            return self._require_held_grasp_half_width()
+        except PregraspInputError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def _begin_carried_navigation(
         self,

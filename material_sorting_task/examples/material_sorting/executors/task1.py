@@ -15,6 +15,7 @@ from executors.base import (
     ExecutionContext,
     PlaceholderTaskExecutor,
     StageResult,
+    StageStatus,
     TaskStage,
 )
 from desktop_grasp.pregrasp_core import (
@@ -774,6 +775,13 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     ) -> None:
         super().__init__(pregrasp_controller=pregrasp_controller)
         self._contact = contact_controller or ContactGraspController()
+        # A ContactGraspController describes the *active* contact-search
+        # transaction.  Its fields are deliberately cleared by reset(), so
+        # later transport/release stages must never use them as ownership
+        # state for an object that is already being held.  Latch the successful
+        # grasp geometry here, in the common base used by tasks 1, 2 and 3.
+        self._held_grasp_half_width: float | None = None
+        self._held_grasp_orientation: str | None = None
         self._contact_since_s: float | None = None
         self._contact_search_used_m = 0.0
         self._contact_search_next_s = 0.0
@@ -785,6 +793,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     def reset(self) -> None:
         super().reset()
         self._contact.reset()
+        self._held_grasp_half_width = None
+        self._held_grasp_orientation = None
         self._contact_since_s = None
         self._contact_search_used_m = 0.0
         self._contact_search_next_s = 0.0
@@ -797,6 +807,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         super().enter_stage(stage, context)
         if stage is TaskStage.GRASP:
             self._contact.reset()
+            self._held_grasp_half_width = None
+            self._held_grasp_orientation = None
             self._contact_since_s = None
             self._contact_search_used_m = 0.0
             self._contact_search_next_s = float(context.now_s)
@@ -818,7 +830,10 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     "an unsafe collision",
                     arm_command=self._held_arm_command,
                 )
-            return self._tick_contact(context)
+            result = self._tick_contact(context)
+            if result.status is StageStatus.SUCCEEDED:
+                self._capture_held_grasp_snapshot()
+            return result
 
         if stage is TaskStage.LIFT:
             if stage is not self.active_stage:
@@ -844,6 +859,45 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_post_align_target_m = None
         self._compliance_retry_count = 0
         self._compliant_motion_last_s = None
+
+    def _capture_held_grasp_snapshot(self) -> None:
+        """Persist successful grasp geometry across later controller resets."""
+
+        half_width = getattr(self._contact, "half_width", None)
+        try:
+            value = float(half_width)
+        except (TypeError, ValueError):
+            value = math.nan
+        if math.isfinite(value) and value > 0.0:
+            self._held_grasp_half_width = value
+
+        orientation = getattr(self._contact, "orientation", None)
+        if orientation in {"yaw0", "yaw90"}:
+            self._held_grasp_orientation = str(orientation)
+
+    def _require_held_grasp_half_width(self) -> float:
+        """Return immutable held-object width, with one live capture fallback."""
+
+        if self._held_grasp_half_width is None:
+            self._capture_held_grasp_snapshot()
+        value = self._held_grasp_half_width
+        if value is None or not math.isfinite(value) or value <= 0.0:
+            raise PregraspInputError(
+                f"task {self.task_id} has no valid grasp-latched half-width"
+            )
+        return value
+
+    def _require_held_grasp_orientation(self) -> str:
+        """Return the orientation captured with the successful grasp."""
+
+        if self._held_grasp_orientation is None:
+            self._capture_held_grasp_snapshot()
+        orientation = self._held_grasp_orientation
+        if orientation not in {"yaw0", "yaw90"}:
+            raise PregraspInputError(
+                f"task {self.task_id} has no valid grasp-latched orientation"
+            )
+        return orientation
 
     def _tick_contact(self, context: ExecutionContext) -> StageResult:
         if self._locked_target_world is None:

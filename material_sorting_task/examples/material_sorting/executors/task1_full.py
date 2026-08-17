@@ -117,10 +117,6 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._arm_retract = ArmRetractController()
         self._shelf_state: ShelfState | None = None
         self._held_center_base: tuple[float, float, float] | None = None
-        # Release geometry belongs to the successful grasp, not to the mutable
-        # contact controller.  The latter may be reset by later stage/resource
-        # transitions while the arms continue holding the same object.
-        self._held_grasp_half_width: float | None = None
         self._place_world: tuple[float, float, float] | None = None
         self._shelf_scan_stand: tuple[float, float] | None = None
         self._final_place_stand: tuple[float, float] | None = None
@@ -175,7 +171,6 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._release.reset()
         self._arm_retract.reset()
         self._held_center_base = None
-        self._held_grasp_half_width = None
         self._place_world = None
         self._shelf_scan_stand = None
         self._final_place_stand = None
@@ -248,14 +243,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             TaskStage.LIFT,
         }:
             result = super().tick(stage, context)
-            if result.status is StageStatus.SUCCEEDED and stage is TaskStage.GRASP:
-                self._capture_held_grasp_half_width()
             if result.status is StageStatus.SUCCEEDED and stage is TaskStage.ACQUIRE_TARGET:
                 if self._locked_target_world is not None:
                     color = str(context.instruction.get("target_color", "")).strip().lower()
                     self._memory.record_task1_origin(self._locked_target_world, color)
             if result.status is StageStatus.SUCCEEDED and stage is TaskStage.LIFT:
-                self._capture_held_grasp_half_width()
                 self._capture_held_center(context)
             return result
 
@@ -310,26 +302,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             center[2] + self._lift.actual_lift_m,
         )
 
-    def _capture_held_grasp_half_width(self) -> None:
-        """Latch release geometry while the successful grasp is still live."""
-
-        half_width = getattr(self._contact, "half_width", None)
-        try:
-            value = float(half_width)
-        except (TypeError, ValueError):
-            return
-        if math.isfinite(value) and value > 0.0:
-            self._held_grasp_half_width = value
-
     def _held_release_half_width(self) -> float:
-        """Return the grasp-latched width, with a live-controller fallback."""
+        """Return release geometry captured by the common grasp lifecycle."""
 
-        if self._held_grasp_half_width is not None:
-            return self._held_grasp_half_width
-        half_width = float(self._contact.half_width)
-        if not math.isfinite(half_width) or half_width <= 0.0:
-            raise ValueError("held half-width is invalid")
-        return half_width
+        return self._require_held_grasp_half_width()
 
     def scheduler_nominal_goal(
         self,
@@ -458,13 +434,10 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         center = self._held_center_base
         if center is None:
             return None
-        contact = getattr(self, "_contact", None)
-        half = None if contact is None else getattr(contact, "half_width", None)
-        if half is None:
-            return None
         try:
-            return HeldObjectGeometry(center, float(half), source=f"task{self.task_id}")
-        except (TypeError, ValueError):
+            half = self._require_held_grasp_half_width()
+            return HeldObjectGeometry(center, half, source=f"task{self.task_id}")
+        except (PregraspInputError, TypeError, ValueError):
             return None
 
     def set_measured_carry_guard(self, enabled: bool) -> None:
