@@ -673,8 +673,8 @@ class Task1PregraspExecutorTests(unittest.TestCase):
         initial = context(
             0.0,
             odometry(-0.70, 0.55, math.pi / 2.0),
-            target_orientation="yaw0",
-            target_position=(-0.177, 2.225, 0.806),
+            target_orientation="yaw90",
+            target_position=(-0.173, 2.268, 0.807),
             target_quality="mask_cloud_cuboid",
         )
         executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
@@ -682,8 +682,8 @@ class Task1PregraspExecutorTests(unittest.TestCase):
 
         self.assertEqual(executor.goal.x, -0.18)
         self.assertAlmostEqual(executor.goal.y, 1.55)
-        self.assertEqual(executor._locked_target_world, (-0.177, 2.225, 0.806))
-        self.assertEqual(executor._locked_target_orientation, "yaw0")
+        self.assertEqual(executor._locked_target_world, (-0.173, 2.268, 0.807))
+        self.assertEqual(executor._locked_target_orientation, "yaw90")
         self.assertEqual(executor._locked_target_source, "rgbd_cuboid")
 
     def test_navigates_then_holds_open_pregrasp_before_contact(self) -> None:

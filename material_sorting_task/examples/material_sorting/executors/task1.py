@@ -70,9 +70,10 @@ class Task1NavigationExecutor:
     TABLE_SOURCE_SNAP_MAX_M = 0.18
     # Navigation is tied to the calibrated table slot, but a full RGB-D cuboid
     # fit carries a small, repeatable within-slot offset that matters to the
-    # two arm pads.  Keep that offset only when it stays well inside the slot;
-    # weaker surface-depth observations retain the calibrated arm target.
-    TABLE_ARM_CENTER_MAX_OFFSET_M = 0.06
+    # two arm pads.  A full cuboid fit is valid anywhere in the same legal
+    # randomized slot envelope; weaker surface-depth observations retain the
+    # calibrated arm target.
+    TABLE_ARM_CENTER_MAX_OFFSET_M = TABLE_SOURCE_SNAP_MAX_M
     TABLE_SOURCE_ORIENTATION = "yaw0"
     POSITION_TOLERANCE_M = 0.08
     YAW_TOLERANCE_RAD = 0.05
