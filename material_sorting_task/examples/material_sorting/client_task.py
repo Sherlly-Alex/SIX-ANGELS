@@ -20,7 +20,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray, Int32, String
+from std_msgs.msg import Bool, Float64MultiArray, Int32, String
 from vision_msgs.msg import Detection3DArray
 
 from competition_controller import (
