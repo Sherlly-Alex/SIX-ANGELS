@@ -39,6 +39,7 @@ from executors.transfer_support import (
 from navigation.carried_envelope import CarriedEnvelopeChecker, HeldObjectGeometry
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from navigation.robot_geometry import FootprintMode
+from scheduler.models import FailureCode
 from shelf.manipulation import (
     ArmRetractController,
     ReleaseSpreadController,
@@ -450,7 +451,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 observations=context.target_observations,
                 exclude_color=target_color,
             ):
-                return StageResult.blocked(
+                return StageResult.retryable_failure(
+                    FailureCode.NAV_NO_PATH,
                     "task 2 could not plan a safe path to the recognized shelf box"
                 )
             self._motion_started = True
@@ -463,7 +465,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 f"task 2 reached the far shelf arm-staging stand for {target_color}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-            return StageResult.blocked(f"task 2 shelf navigation stopped safely: {detail}")
+            return StageResult.retryable_failure(
+                FailureCode.NAV_STUCK,
+                f"task 2 shelf navigation stopped safely: {detail}",
+            )
         return StageResult.running(
             f"task 2 navigating to the {target_color} shelf box; {detail}",
             base_command=command,
@@ -600,7 +605,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     0.0, float(context.now_s) - self._phase_started_s
                 )
                 if elapsed >= self.SHELF_CENTER_ACQUIRE_TIMEOUT_S:
-                    return StageResult.blocked(
+                    return StageResult.retryable_failure(
+                        FailureCode.TARGET_LOST,
                         "task 2 could not lock a stable RGB-D shelf-box centre "
                         f"after {elapsed:.1f}s; "
                         f"{self._target_center_tracker.status()}",

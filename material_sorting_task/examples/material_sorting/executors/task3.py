@@ -17,6 +17,7 @@ from executors.transfer_support import stand_from_held_center
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from navigation.competition_adapter import goal_reached_event
 from navigation.robot_geometry import FootprintMode
+from scheduler.models import FailureCode
 from shelf.manipulation import HeldTransportController
 from shelf.placement_feedback import CompliantSlideLoweringController
 from shelf.task3_geometry import (
@@ -481,7 +482,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             if observation is None:
                 elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
                 if elapsed >= self.TASK3_TARGET_TIMEOUT_S:
-                    return StageResult.blocked(
+                    return StageResult.retryable_failure(
+                        FailureCode.TARGET_LOST,
                         f"task 3 timed out waiting for top-box {color} detection: {detail}"
                     )
                 return StageResult.running(
@@ -508,7 +510,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 source_tag="task3_top_box_rgbd",
             )
             if not self._navigation.set_goal(self._goal, pose[0], pose[1]):
-                return StageResult.blocked(
+                return StageResult.retryable_failure(
+                    FailureCode.NAV_NO_PATH,
                     "task 3 could not plan a collision-free path to the top-box pick stand"
                 )
         pose = self._odometry_pose(context.odometry)
@@ -524,7 +527,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 f"{goal_reached_event(self._goal)}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-            return StageResult.blocked(
+            return StageResult.retryable_failure(
+                FailureCode.NAV_STUCK,
                 f"task 3 top-box navigation stopped safely with status={status.value}"
             )
         return StageResult.running(
@@ -576,7 +580,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             )
         elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
         if elapsed >= self.TASK3_TARGET_TIMEOUT_S:
-            return StageResult.blocked(
+            return StageResult.retryable_failure(
+                FailureCode.TARGET_LOST,
                 f"task 3 timed out locking top-box {color} center after "
                 f"{elapsed:.1f}s: {detail}; {self._task3_target_tracker.status()}"
             )

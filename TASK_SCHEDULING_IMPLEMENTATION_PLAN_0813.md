@@ -60,8 +60,8 @@
   只有 `v2 + MATERIAL_MEASURED_CARRY_GUARD=1` 才启用，legacy/shadow 始终保持原验证路径。
   此开关必须在官方镜像完成尺寸、净空和误检标定后才能放行。
 - 当前在线候选 Provider 只覆盖导航阶段，且默认不生成恢复候选；结构化恢复桥已上线到 V2，
-  但 Executor 失败码迁移目前只有 Task 1 导航首批站点，其他未结构化 BLOCKED 仍保持
-  legacy fail-closed 语义，不能宣称全部失败均可自动恢复。
+  Executor 失败码迁移已覆盖 Task 1 以及 Task 2/3 的首批“不可逆动作前”导航/目标观测站点；
+  其他未结构化 BLOCKED 仍保持 legacy fail-closed 语义，不能宣称全部失败均可自动恢复。
 - odometry/joint state 已在 §18.4 接入统一 `INPUT_STALE` watchdog：短暂断流立即零底盘并
   保持最后有效手臂命令，2.0 s 有界宽限内允许恢复，超时进入 SAFE_HOLD；远程断流注入仍需
   在官方 Server 上确认 ROS 时序和默认 0.75 s 年龄门限。
@@ -1463,4 +1463,23 @@ IK、柔顺抓取和柔顺放置控制器。
 
 下一步只做官方 Server 故障注入，不再扩张调度内核：分别暂停 odom 与 joint_states 发布，
 验证 0.75 s 后底盘归零、2.0 s 内恢复可续跑、超过宽限必进 SAFE_HOLD，并从 JSONL 核对
-输入年龄和 20 Hz p95/p99。该项通过后再进入 Task 2/3 剩余失败码结构化迁移。
+输入年龄和 20 Hz p95/p99。
+
+### 18.5 Task 2/3 首批结构化失败迁移（当前批次）
+
+遵循“只迁移明确可恢复、尚未发生不可逆动作的失败”原则，本批次完成七个站点：
+
+- Task 2 货架远站位规划失败 → `NAV_NO_PATH`；导航 FAILED/EMERGENCY_STOP →
+  `NAV_STUCK`；稳定 RGB-D 货架箱中心超时 → `TARGET_LOST`。
+- Task 3 顶部物块检测/中心锁定超时 → `TARGET_LOST`；动态抓取站位规划失败 →
+  `NAV_NO_PATH`；导航 FAILED/EMERGENCY_STOP → `NAV_STUCK`。
+- 上述结果均使用 `StageResult.retryable_failure(...)`。legacy/shadow 仍按历史 BLOCKED
+  fail-closed；V2 复用 `RecoverableStageAction` 的每码预算，耗尽后停止，不会无限循环。
+- 没有迁移碰撞、持物状态缺失、抓取接触、挤压、抬升、放置和释放后的失败；这些站点可能
+  已涉及不可逆物理状态，继续维持原 BLOCKED/SAFE_HOLD 边界。
+
+验证：新增 7 项真实执行器失败注入，与 13 项恢复层测试合计 `20 passed`；全仓 pytest
+（排除本机缺少 cv2 的既有视觉导入项）`456 passed, 5 skipped, 1 warning`。
+
+下一代码批次应先实现“携物几何 feature gate 的远程标定结果回填和保守阈值验收”，再决定
+是否迁移对齐/IK 失败；在真实接触与放置故障数据不足时，不扩大自动恢复范围。
