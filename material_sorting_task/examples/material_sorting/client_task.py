@@ -346,9 +346,15 @@ class CompetitionClient(Node):
         elif self.execution_mode == "lift_only":
             self.get_logger().warning(
                 "lift_only enables task-1 navigation, open pregrasp, the "
-                "bounded 4 mm arm preload and a 0.15 m slide lift without "
-                "requiring Server bilateral-contact confirmation; it then "
+                "bilaterally confirmed bounded arm preload and a 0.15 m "
+                "slide lift; it then "
                 "holds and blocks before transport"
+            )
+        elif self.execution_mode == "task1_full":
+            self.get_logger().warning(
+                "task1_full enables only the integrated task-1 table pick, "
+                "shelf-state recognition, transport and empty-layer placement; "
+                "task 2 and task 3 remain fail-closed"
             )
         elif self.execution_mode == "task12_full":
             self.get_logger().warning(
@@ -722,6 +728,7 @@ class CompetitionClient(Node):
             "pregrasp_only",
             "contact_only",
             "lift_only",
+            "task1_full",
             "task12_full",
             "task123_full",
         } and self.instructions:

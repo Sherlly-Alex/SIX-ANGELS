@@ -23,6 +23,7 @@ EXECUTION_MODES = (
     "pregrasp_only",
     "contact_only",
     "lift_only",
+    "task1_full",
     "task12_full",
     "task123_full",
 )
@@ -63,6 +64,13 @@ def build_task_executors(
     if normalized == "lift_only":
         return {
             1: Task1LiftExecutor(),
+            2: Task2Executor(),
+            3: Task3Executor(),
+        }
+    if normalized == "task1_full":
+        memory = CompetitionTaskMemory()
+        return {
+            1: Task1IntegratedExecutor(memory),
             2: Task2Executor(),
             3: Task3Executor(),
         }

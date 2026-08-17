@@ -79,6 +79,13 @@ class CompetitionControllerTests(unittest.TestCase):
         self.assertEqual(executors[2].task_id, 2)
         self.assertEqual(executors[3].task_id, 3)
 
+    def test_task1_full_keeps_later_tasks_fail_closed(self) -> None:
+        executors = build_task_executors("task1_full")
+
+        self.assertEqual(executors[1].name, "task1_integrated_table_to_empty_shelf")
+        self.assertEqual(executors[2].name, "task2_shelf_to_original_table_point")
+        self.assertEqual(executors[3].name, "task3_table_top_to_shelf_prop_side")
+
     def test_last_arm_command_persists_through_safe_hold(self) -> None:
         command = ArmCommand(
             spine_position=0.4,
