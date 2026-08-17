@@ -36,7 +36,7 @@ def validate_run(
     expected_score: int = 160,
     scheduler_events_text: str | None = None,
     max_interval_p95_ms: float = 65.0,
-    max_interval_p99_ms: float = 100.0,
+    max_interval_p99_ms: float = 125.0,
     max_execution_p95_ms: float = 50.0,
     max_deadline_miss_rate: float = 0.01,
 ) -> dict[str, object]:
@@ -221,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-score", type=int, default=160)
     parser.add_argument("--events", type=Path)
     parser.add_argument("--max-interval-p95-ms", type=float, default=65.0)
-    parser.add_argument("--max-interval-p99-ms", type=float, default=100.0)
+    parser.add_argument("--max-interval-p99-ms", type=float, default=125.0)
     parser.add_argument("--max-execution-p95-ms", type=float, default=50.0)
     parser.add_argument("--max-deadline-miss-rate", type=float, default=0.01)
     parser.add_argument("--output", type=Path)

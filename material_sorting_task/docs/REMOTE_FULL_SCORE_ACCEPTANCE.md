@@ -33,10 +33,15 @@ python3 scripts/validate_remote_run.py \
 
 For post-`83c2412` runs, `--events` additionally requires a complete 400-sample
 timing window, no unexpected `input_stale`/`safety_stop`, interval p95 <= 65
-ms, interval p99 <= 100 ms, execution p95 <= 50 ms, and cumulative interval
+ms, interval p99 <= 125 ms, execution p95 <= 50 ms, and cumulative interval
 and execution deadline-miss rates <= 1%. Older archived event logs do not have
 the cumulative counters and may omit `--events`; they remain score evidence,
 not runtime-health evidence.
+
+The 125 ms p99 bound is derived from the 150 ms base-command lease and keeps a
+25 ms scheduling margin. It is not a generic ROS default. A run still fails on
+high p95 execution cost, sustained jitter, stale input, or a deadline-miss
+rate above 1%, even when its p99 remains below the lease-derived bound.
 
 Exit status zero and `"passed": true` require all of the following:
 

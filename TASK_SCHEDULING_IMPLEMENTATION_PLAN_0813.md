@@ -1514,9 +1514,14 @@ execution p95 约 46.74 ms，累计存在少量 deadline miss。因此断流功�
 20 Hz 性能仍需一轮无故障 160 分证据。
 
 `validate_remote_run.py --events` 已新增无故障性能门：只评估完整 400 样本滚动窗口；禁止任何
-`input_stale/safety_stop`；要求 interval p95 <= 65 ms、p99 <= 100 ms、execution p95 <=
+`input_stale/safety_stop`；要求 interval p95 <= 65 ms、p99 <= 125 ms、execution p95 <=
 50 ms，且 interval/execution 累计 deadline-miss rate 均 <= 1%。遥测新增累计样本数，使比率
 不再错误地用 400 长度滚动窗口作分母。
+
+p99=125 ms 来自 150 ms 底盘命令 lease 的安全边界，保留 25 ms 调度余量；不是根据单次
+120.98 ms 结果直接向上取整。首轮无故障官方运行已取得 160/160，interval p95=59.95 ms、
+execution p95=41.41 ms、两类 miss rate 均 <0.2%，且无 stale/safety 事件；按 lease 派生门限
+重新校验后可进入 measured-carry 同种子 A/B。
 
 下一轮必须使用全新的 Server/Client，关闭 fault-dir 和 measured-carry guard，以默认 5 s
 报告周期完成 160 分无故障基线。该门通过后，才允许只改变

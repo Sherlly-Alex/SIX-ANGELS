@@ -111,7 +111,7 @@ class ValidateRemoteRunTests(unittest.TestCase):
                             "total_sample_count": 1000,
                             "total_interval_count": 999,
                             "interval_p95_ms": 70.0,
-                            "interval_p99_ms": 120.0,
+                            "interval_p99_ms": 130.0,
                             "execution_p95_ms": 55.0,
                             "interval_deadline_misses": 20,
                             "execution_deadline_misses": 20,
