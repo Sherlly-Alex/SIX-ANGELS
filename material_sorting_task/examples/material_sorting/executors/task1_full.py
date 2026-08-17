@@ -69,15 +69,18 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     DIRECT_SHELF_POSITION_TOLERANCE_M = 0.05
     DIRECT_SHELF_YAW_TOLERANCE_RAD = 0.06
     DIRECT_SHELF_MAX_LINEAR_MPS = 0.22
+    FINAL_PLACE_LATERAL_TOLERANCE_M = 0.015
     SHELF_CLEARANCE_M = 0.055
     SHELF_RETREAT_M = 0.32
-    SHELF_SCAN_TIMEOUT_S = 35.0
+    SHELF_SCAN_TIMEOUT_S = 50.0
     # Positive MMK2 head pitch moves shelf objects down in the image.  The
     # randomized L1 packaging box is already close to the bottom edge at the
     # scan stand, so look downward first (negative pitch) before sweeping the
     # higher layers.  Keep zero first to reuse the normal transport view.
     SHELF_SCAN_PITCHES = (0.00, -0.08, -0.16, 0.08, 0.16)
     SHELF_SCAN_PITCH_DWELL_S = 3.0
+    L1_VISIBILITY_HELD_CENTER_Z = 0.68
+    L1_VISIBILITY_SETTLE_S = 0.60
     PLACE_TIMEOUT_S = 25.0
     ARM_RETRACT_TIMEOUT_S = 15.0
     RELEASE_SUPPORT_SETTLE_S = 0.40
@@ -89,7 +92,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         super().__init__()
         self._memory = memory
         self._expected_shelf_color: str | None = None
-        self._shelf_tracker = ShelfStateTracker()
+        self._shelf_tracker = ShelfStateTracker(require_empty_confirmation=True)
         self._transfer = TransferMotion()
         # Only the new task-1 shelf route receives the modest cruise-speed
         # increase.  The shared transfer helper and tasks 2/3 keep their
@@ -121,6 +124,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._motion_started = False
         self._slide_start: float | None = None
         self._slide_applied = False
+        self._l1_visibility_attempted = False
         # PLACE contains two independent arm motions (lower, then release).
         # Keep a phase-local deadline so a slow lowering motion cannot consume
         # the whole release timeout before the grippers even start to open.
@@ -174,6 +178,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._motion_started = False
         self._slide_start = None
         self._slide_applied = False
+        self._l1_visibility_attempted = False
         self._phase_started_s = 0.0
         self._release_half_widths = ()
         self._release_stage_index = 0
@@ -186,6 +191,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._motion_started = False
         self._slide_start = None
         self._slide_applied = False
+        self._l1_visibility_attempted = False
         if stage is TaskStage.TRANSPORT:
             self._transfer.reset()
             self._direct_shelf_transfer.reset()
@@ -649,6 +655,42 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             # sweep; the transport observation epoch is never cleared here.
             state = self._shelf_state or self._update_shelf_state(context)
             if state is None:
+                if (
+                    self.task_id == 1
+                    and not self._l1_visibility_attempted
+                    and self._shelf_tracker.semantic_empty_candidate == 1
+                ):
+                    target_held_z = min(
+                        self._held_center_base[2],
+                        self.L1_VISIBILITY_HELD_CENTER_Z,
+                    )
+                    target_slide = (
+                        self._held_arm_command.spine_position
+                        + self._held_center_base[2]
+                        - target_held_z
+                    )
+                    try:
+                        self._slide_start = self._held_arm_command.spine_position
+                        self._slide_applied = False
+                        self._held_arm_command = self._slide_hold.plan(
+                            self._held_arm_command,
+                            target_slide,
+                            context.joint_states,
+                        )
+                    except (PregraspInputError, PregraspPlanningError) as exc:
+                        return StageResult.blocked(
+                            "task 1 could not plan the L1 visibility posture: "
+                            f"{exc}",
+                            arm_command=self._held_arm_command,
+                        )
+                    self._l1_visibility_attempted = True
+                    self._phase = "l1_visibility_clearance"
+                    return StageResult.running(
+                        "task 1 identified L1 as the semantic empty candidate; "
+                        "lowering the carried box before explicit empty-layer "
+                        "confirmation",
+                        arm_command=self._held_arm_command,
+                    )
                 if scan_elapsed >= self.SHELF_SCAN_TIMEOUT_S:
                     return StageResult.blocked(
                         "task 1 shelf recognition timed out without two stable "
@@ -679,6 +721,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             try:
                 self._slide_start = self._held_arm_command.spine_position
+                self._slide_applied = False
                 self._held_arm_command = self._slide_hold.plan(
                     self._held_arm_command,
                     target_slide,
@@ -690,6 +733,33 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
             self._phase = "clearance"
+
+        if self._phase == "l1_visibility_clearance":
+            result = self._tick_slide(
+                context,
+                "lowering the carried box to expose candidate L1",
+            )
+            if result is not None:
+                return result
+            self._shelf_tracker.reset_empty_confirmation()
+            self._phase = "l1_visibility_settle"
+            self._phase_started_s = float(context.now_s)
+
+        if self._phase == "l1_visibility_settle":
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
+            if elapsed < self.L1_VISIBILITY_SETTLE_S:
+                return StageResult.running(
+                    "task 1 holding the L1 visibility posture before fresh "
+                    f"empty-layer voting ({elapsed:.2f}/"
+                    f"{self.L1_VISIBILITY_SETTLE_S:.2f}s)",
+                    arm_command=self._held_arm_command,
+                )
+            self._phase = "scan_shelf"
+            return StageResult.running(
+                "task 1 L1 visibility posture settled; reacquiring fresh "
+                "multi-frame empty-layer confirmation",
+                arm_command=self._held_arm_command,
+            )
 
         if self._phase == "clearance":
             result = self._tick_slide(context, "moving held box to shelf clearance height")
@@ -729,7 +799,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             )
             if (
                 not self._legacy_shelf_route_used
-                and abs(lateral_error) <= self.DIRECT_SHELF_POSITION_TOLERANCE_M
+                and abs(lateral_error) <= self.FINAL_PLACE_LATERAL_TOLERANCE_M
                 and abs(yaw_error) <= self.DIRECT_SHELF_YAW_TOLERANCE_RAD
             ):
                 self._phase = "approach_place_final"
@@ -757,6 +827,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     self.SHELF_YAW,
                     context.odometry,
                     context.now_s,
+                    position_tolerance_m=self.FINAL_PLACE_LATERAL_TOLERANCE_M,
                 ):
                     return StageResult.blocked(
                         "task 1 could not plan safe lateral shelf placement alignment",
@@ -1054,6 +1125,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 )
             if not self._arm_retract.planned:
                 try:
+                    self._phase_started_s = float(context.now_s)
                     self._held_arm_command = self._arm_retract.plan(
                         self._held_arm_command,
                         context.joint_states,
@@ -1074,7 +1146,7 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                     arm_command=self._held_arm_command,
                 )
             self._held_arm_command = command
-            elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+            elapsed = max(0.0, float(context.now_s) - self._phase_started_s)
             if reached:
                 self._phase = "navigate_end"
                 self._motion_started = False

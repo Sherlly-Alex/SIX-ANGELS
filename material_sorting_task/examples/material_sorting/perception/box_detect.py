@@ -21,10 +21,12 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo, JointState
+from std_msgs.msg import Bool
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 
 from discoverse.robots.mmk2.mmk2_fk import MMK2FK
+from perception.shelf_empty_confirm import ShelfEmptyLayerVerifier
 
 try:
     from .backends import COLOR_HSV, ColorBackend, GtProjectionBackend, YoloBackend
@@ -45,6 +47,7 @@ COLOR_BGR = {
     "yellow": (0, 220, 240),
     "brown": (40, 70, 120),
     "shelf_obstacle": (255, 255, 255),
+    "shelf_empty": (0, 255, 0),
 }
 
 # Geometry occupancy detector for shelf L1. It is color-independent: any
@@ -114,7 +117,11 @@ class BoxDetectNode(Node):
         self.slide = 0.0
         self.head = [0.0, 0.0]
         self.last_shelf_obstacle_t = 0.0
+        self.last_shelf_empty_t = 0.0
         self.last_detection_log_t = 0.0
+        self.shelf_empty_verifier = (
+            None if backend == "gt_direct" else ShelfEmptyLayerVerifier()
+        )
 
         self.backend_name = backend
         if backend == "gt":
@@ -145,10 +152,27 @@ class BoxDetectNode(Node):
 
         self.det_pub = self.create_publisher(Detection3DArray, "/material/detections", 10)
         self.img_pub = self.create_publisher(Image, "/material/result_image", 5)
+        self.create_subscription(
+            Bool,
+            "/material/shelf_recognition_enable",
+            self.shelf_empty_check_cb,
+            10,
+        )
         if backend == "gt_direct":
             self.create_timer(0.1, self._process_gt_direct)
 
     # ---- state callbacks ----
+    def shelf_empty_check_cb(self, msg):
+        if self.shelf_empty_verifier is None:
+            return
+        enabled = bool(msg.data)
+        if enabled and not self.shelf_empty_verifier.active:
+            self.shelf_empty_verifier.start()
+            self.get_logger().info("started task-stage shelf empty confirmation")
+        elif not enabled and self.shelf_empty_verifier.active:
+            self.shelf_empty_verifier.stop()
+            self.get_logger().info("stopped task-stage shelf empty confirmation")
+
     def camera_info_cb(self, msg):
         self.K = np.array(msg.k, dtype=float).reshape(3, 3)
 
@@ -585,6 +609,40 @@ class BoxDetectNode(Node):
             self.last_shelf_obstacle_t = now_t
             if shelf_obstacle is not None:
                 candidates.append(shelf_obstacle)
+        if (
+            self.shelf_empty_verifier is not None
+            and self.shelf_empty_verifier.active
+            and now_t - self.last_shelf_empty_t > 0.5
+        ):
+            evidence = self.shelf_empty_verifier.update(
+                depth, self.K, T_cam_world
+            )
+            self.last_shelf_empty_t = now_t
+            empty_layer = self.shelf_empty_verifier.confirmed_layer
+            empty_center = self.shelf_empty_verifier.confirmed_center_world()
+            if empty_layer is not None and empty_center is not None:
+                empty_evidence = evidence[empty_layer]
+                polygon = np.asarray(empty_evidence.polygon, dtype=np.int32)
+                x0, y0 = np.min(polygon, axis=0)
+                x1, y1 = np.max(polygon, axis=0)
+                candidates.append({
+                    "class": "shelf_empty",
+                    "conf": empty_evidence.confidence,
+                    "world": np.asarray(empty_center, dtype=float),
+                    "bbox_size": (0.0, 0.0, 0.0),
+                    "method": f"rgbd_visible_free_space_L{empty_layer}",
+                    "n_points": int(empty_evidence.mask_pixels),
+                    "center_u": int(round(0.5 * (x0 + x1))),
+                    "center_v": int(round(0.5 * (y0 + y1))),
+                    "bbox": (
+                        int(round(0.5 * (x0 + x1))),
+                        int(round(0.5 * (y0 + y1))),
+                        max(1, int(x1 - x0)),
+                        max(1, int(y1 - y0)),
+                    ),
+                    "score": 1000.0 * empty_evidence.confidence,
+                    "orientation": None,
+                })
 
         best_by_class = {}
         for rec in candidates:

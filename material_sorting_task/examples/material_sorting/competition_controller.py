@@ -49,6 +49,16 @@ class ControllerSnapshot:
     message: str
     transition_serial: int
 
+    @property
+    def requests_shelf_recognition(self) -> bool:
+        """Whether task 1 is inside its complete shelf-observation window."""
+
+        return (
+            self.state is ControllerState.EXECUTING_STAGE
+            and self.task_id == 1
+            and self.stage in {TaskStage.TRANSPORT, TaskStage.ALIGN_FOR_PLACE}
+        )
+
 
 class _LegacyCompetitionController:
     """Schedule task 1, task 2, and task 3 in one long-lived process."""

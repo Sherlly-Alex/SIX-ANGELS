@@ -103,6 +103,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # shelf placement motion used by task 1.
     SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M = 0.008
     SHELF_FINAL_YAW_TOLERANCE_RAD = 0.015
+    SHELF_LATERAL_ALIGNMENT_TIMEOUT_S = 40.0
     SHELF_PREGRASP_HALF_WIDTH_M = 0.20
     # ALIGN_FOR_PICK now contains camera settling, base approach/turn and the
     # final arm pregrasp; keep one bounded stage timeout for that sequence.
@@ -122,6 +123,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     RELEASE_SUPPORT_SETTLE_S = 0.40
     ARM_RETRACT_TIMEOUT_S = 15.0
     TRANSPORT_SEGMENT_TIMEOUT_S = 30.0
+    TABLE_COLUMN_REVERSE_TIMEOUT_MARGIN_S = 10.0
+    TABLE_COLUMN_REVERSE_SECONDS_PER_M = 40.0
+    TABLE_COLUMN_REVERSE_TIMEOUT_MAX_S = 60.0
     # Keep the successful shelf grasp completely unchanged during transport.
     # While still facing west, reverse east along the shelf aisle until the
     # base reaches the task-1 table column.  Rotating west -> north there keeps
@@ -159,6 +163,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_start: float | None = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._table_column_reverse_timeout_s = self.TRANSPORT_SEGMENT_TIMEOUT_S
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide: float | None = None
@@ -185,6 +190,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._slide_start = None
         self._slide_applied = False
         self._phase_started_s = 0.0
+        self._table_column_reverse_timeout_s = self.TRANSPORT_SEGMENT_TIMEOUT_S
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide = None
@@ -666,6 +672,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     context.now_s,
                     position_tolerance_m=self.SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M,
                     yaw_tolerance_rad=self.SHELF_FINAL_YAW_TOLERANCE_RAD,
+                    timeout_s=self.SHELF_LATERAL_ALIGNMENT_TIMEOUT_S,
                 ):
                     return StageResult.blocked(
                         "task 2 could not start shelf-box lateral alignment",
@@ -787,6 +794,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     context.now_s,
                     position_tolerance_m=self.SHELF_ALIGN_WORLD_LATERAL_TOLERANCE_M,
                     yaw_tolerance_rad=self.SHELF_FINAL_YAW_TOLERANCE_RAD,
+                    timeout_s=self.SHELF_LATERAL_ALIGNMENT_TIMEOUT_S,
                 ):
                     return StageResult.blocked(
                         "task 2 could not start the final post-approach centre recheck",
@@ -932,6 +940,18 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             center[0], center[1], center[2] + self._lift.actual_lift_m
         )
 
+
+    @classmethod
+    def _table_column_reverse_timeout(cls, distance_m: float) -> float:
+        scaled_timeout = (
+            cls.TABLE_COLUMN_REVERSE_TIMEOUT_MARGIN_S
+            + max(0.0, float(distance_m)) * cls.TABLE_COLUMN_REVERSE_SECONDS_PER_M
+        )
+        return min(
+            cls.TABLE_COLUMN_REVERSE_TIMEOUT_MAX_S,
+            max(cls.TRANSPORT_SEGMENT_TIMEOUT_S, scaled_timeout),
+        )
+
     def _tick_transport(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 2 transport has no stable held-object state")
@@ -1061,6 +1081,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                             "task 2 waiting to start the table-column reverse",
                             arm_command=self._held_arm_command,
                         )
+                    self._table_column_reverse_timeout_s = (
+                        self._table_column_reverse_timeout(distance)
+                    )
                     self._motion_started = True
             if self._phase == "reverse_to_table_column":
                 done, command, detail = self._transfer.tick_retreat(context.odometry)
@@ -1074,10 +1097,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     elapsed = max(
                         0.0, float(context.now_s) - self._phase_started_s
                     )
-                    if elapsed >= self.TRANSPORT_SEGMENT_TIMEOUT_S:
+                    if elapsed >= self._table_column_reverse_timeout_s:
                         return StageResult.blocked(
                             "task 2 table-column reverse timed out after "
-                            f"{elapsed:.1f}s: {detail}",
+                            f"{elapsed:.1f}s "
+                            f"(limit={self._table_column_reverse_timeout_s:.1f}s): "
+                            f"{detail}",
                             arm_command=self._held_arm_command,
                         )
                     return StageResult.running(

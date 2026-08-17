@@ -97,7 +97,7 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         executor = Task3IntegratedExecutor(self._memory())
         self.assertEqual(executor.task_id, 3)
         self.assertEqual(executor.SOURCE_ORIENTATION, "yaw90")
-        self.assertEqual(executor.TASK3_LATERAL_TIMEOUT_S, 35.0)
+        self.assertEqual(executor.TASK3_LATERAL_TIMEOUT_S, 50.0)
         self.assertEqual(executor.TASK3_LATERAL_POSITION_TOLERANCE_M, 0.015)
         # This is an intentional task-3 calibration knob.  Keep the wiring
         # test independent of the selected safe height (currently 0.12 m)

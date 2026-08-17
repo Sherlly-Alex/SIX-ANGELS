@@ -69,7 +69,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # packaging-left offset.  The remote run was still converging its final
     # yaw at the shared 20 s default, so give only this task enough time while
     # retaining all position/yaw/collision completion checks.
-    TASK3_LATERAL_TIMEOUT_S = 35.0
+    TASK3_LATERAL_TIMEOUT_S = 50.0
     TASK3_LATERAL_POSITION_TOLERANCE_M = 0.015
     TASK3_SHELF_TURN_TOLERANCE_RAD = 0.06
     TASK3_SHELF_TURN_MIN_ANGULAR_Z = 0.10
