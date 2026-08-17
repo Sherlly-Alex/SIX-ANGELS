@@ -43,6 +43,12 @@ The 125 ms p99 bound is derived from the 150 ms base-command lease and keeps a
 high p95 execution cost, sustained jitter, stale input, or a deadline-miss
 rate above 1%, even when its p99 remains below the lease-derived bound.
 
+JSONL files are append-only. The validator selects the last
+`scheduler_started` session and stops timing evaluation at that session's
+first `state=finished` scheduler transition. Reports written while the Client
+continues holding FINISHED cannot dilute the active-run deadline-miss rates;
+older sessions in a reused artifact directory cannot poison the new run.
+
 Exit status zero and `"passed": true` require all of the following:
 
 1. task 1 reaches cumulative score 40;

@@ -56,6 +56,7 @@ class ValidateRemoteRunTests(unittest.TestCase):
         events = "\n".join(
             json.dumps(event)
             for event in (
+                {"event_type": "scheduler_started", "details": {}},
                 {
                     "event_type": "control_loop_health",
                     "details": {
@@ -82,6 +83,10 @@ class ValidateRemoteRunTests(unittest.TestCase):
                         "execution_deadline_misses": 12,
                     },
                 },
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
             )
         )
 
@@ -97,6 +102,7 @@ class ValidateRemoteRunTests(unittest.TestCase):
     def test_rejects_stale_event_and_loop_threshold_violation(self) -> None:
         events = "\n".join(
             (
+                json.dumps({"event_type": "scheduler_started", "details": {}}),
                 json.dumps(
                     {
                         "event_type": "input_stale",
@@ -118,6 +124,12 @@ class ValidateRemoteRunTests(unittest.TestCase):
                         },
                     }
                 ),
+                json.dumps(
+                    {
+                        "event_type": "scheduler_transition",
+                        "details": {"state": "finished"},
+                    }
+                ),
             )
         )
 
@@ -130,3 +142,46 @@ class ValidateRemoteRunTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertFalse(report["runtime_health"]["passed"])
         self.assertGreaterEqual(len(report["runtime_health"]["failures"]), 6)
+
+    def test_uses_latest_session_and_stops_counters_at_finished(self) -> None:
+        def health(total, misses):
+            return {
+                "event_type": "control_loop_health",
+                "details": {
+                    "sample_count": 400,
+                    "total_sample_count": total,
+                    "total_interval_count": total,
+                    "interval_p95_ms": 55.0,
+                    "interval_p99_ms": 80.0,
+                    "execution_p95_ms": 20.0,
+                    "interval_deadline_misses": misses,
+                    "execution_deadline_misses": misses,
+                },
+            }
+
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                health(1000, 100),
+                {"event_type": "scheduler_transition", "details": {"state": "finished"}},
+                {"event_type": "scheduler_started", "details": {}},
+                health(1000, 5),
+                {"event_type": "scheduler_transition", "details": {"state": "finished"}},
+                # Idle reports after FINISHED must not dilute the accepted run.
+                health(10000, 500),
+            )
+        )
+
+        report = MODULE.validate_run(
+            PASSING_CLIENT,
+            PASSING_SERVER,
+            scheduler_events_text=events,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["runtime_health"]["report_count"], 1)
+        self.assertAlmostEqual(
+            report["runtime_health"]["execution_deadline_miss_rate"],
+            0.005,
+        )

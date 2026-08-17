@@ -1496,7 +1496,7 @@ IK、柔顺抓取和柔顺放置控制器。
 - 完整四终端命令见 `docs/RUNTIME_HEALTH_REMOTE_VALIDATION.md`。故障运行与满分运行必须使用
   新 Server/Client 进程，不能把预期 SAFE_HOLD 的故障日志交给 160 分验收器。
 - 当前离线回归：runtime-health/validator 专项通过；全仓 pytest（排除本机缺少 cv2
-  的既有视觉导入项）`463 passed, 5 skipped, 1 warning`。
+  的既有视觉导入项）`464 passed, 5 skipped, 1 warning`。
 
 ### 18.7 官方 Server 输入断流验收结果与无故障性能门
 
@@ -1522,6 +1522,11 @@ p99=125 ms 来自 150 ms 底盘命令 lease 的安全边界，保留 25 ms 调�
 120.98 ms 结果直接向上取整。首轮无故障官方运行已取得 160/160，interval p95=59.95 ms、
 execution p95=41.41 ms、两类 miss rate 均 <0.2%，且无 stale/safety 事件；按 lease 派生门限
 重新校验后可进入 measured-carry 同种子 A/B。
+
+远程复核时发现 Client 在 FINISHED 后会继续安全持位并输出健康报告，导致以 JSONL 最后一条
+报告作分母时，miss rate 会被空闲周期稀释；复用同一路径还可能混入旧 session。验收器已改为
+选择最后一个 `scheduler_started`，并在该 session 首个 `state=finished` transition 截断。
+完成后的日志既不能降低 miss rate，旧运行也不能抬高/降低当前结果。
 
 下一轮必须使用全新的 Server/Client，关闭 fault-dir 和 measured-carry guard，以默认 5 s
 报告周期完成 160 分无故障基线。该门通过后，才允许只改变

@@ -125,9 +125,8 @@ def validate_runtime_health(
     )
     if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in limits):
         raise ValueError("runtime-health limits must be finite and non-negative")
-    records: list[dict[str, object]] = []
+    parsed_events: list[dict[str, object]] = []
     malformed_lines = 0
-    unexpected_stale_events = 0
     for raw in events_text.splitlines():
         if not raw.strip():
             continue
@@ -139,9 +138,44 @@ def validate_runtime_health(
         if not isinstance(event, dict):
             malformed_lines += 1
             continue
+        parsed_events.append(event)
+
+    failures: list[str] = []
+    session_starts = [
+        index
+        for index, event in enumerate(parsed_events)
+        if str(event.get("event_type", "")) == "scheduler_started"
+    ]
+    if not session_starts:
+        failures.append("missing scheduler_started session boundary")
+        session_events = parsed_events
+    else:
+        session_events = parsed_events[session_starts[-1] :]
+
+    terminal_index = None
+    for index, event in enumerate(session_events):
+        details = event.get("details")
+        if (
+            str(event.get("event_type", "")) == "scheduler_transition"
+            and isinstance(details, dict)
+            and str(details.get("state", "")) == "finished"
+        ):
+            terminal_index = index
+            break
+    if terminal_index is None:
+        failures.append("missing scheduler finished event boundary")
+        evaluation_events = session_events
+    else:
+        evaluation_events = session_events[: terminal_index + 1]
+
+    unexpected_stale_events = sum(
+        1
+        for event in evaluation_events
+        if str(event.get("event_type", "")) in {"input_stale", "safety_stop"}
+    )
+    records: list[dict[str, object]] = []
+    for event in evaluation_events:
         event_type = str(event.get("event_type", ""))
-        if event_type in {"input_stale", "safety_stop"}:
-            unexpected_stale_events += 1
         details = event.get("details")
         if event_type != "control_loop_health" or not isinstance(details, dict):
             continue
@@ -151,7 +185,6 @@ def validate_runtime_health(
         except (TypeError, ValueError):
             malformed_lines += 1
 
-    failures: list[str] = []
     if malformed_lines:
         failures.append(f"malformed_event_lines={malformed_lines}")
     if unexpected_stale_events:
@@ -161,6 +194,7 @@ def validate_runtime_health(
         return {
             "passed": False,
             "report_count": 0,
+            "terminal_event_found": terminal_index is not None,
             "failures": failures,
         }
 
@@ -197,6 +231,9 @@ def validate_runtime_health(
     return {
         "passed": not failures,
         "report_count": len(records),
+        "session_event_count": len(session_events),
+        "evaluated_event_count": len(evaluation_events),
+        "terminal_event_found": terminal_index is not None,
         "max_interval_p95_ms": max_p95,
         "max_interval_p99_ms": max_p99,
         "max_execution_p95_ms": max_exec_p95,
