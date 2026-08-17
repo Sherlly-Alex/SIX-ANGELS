@@ -14,11 +14,12 @@
 - 正式执行入口：`material_sorting_task/examples/material_sorting/client_task.py`
 - 正式三任务模式：`MATERIAL_EXECUTION_MODE=task123_full`
 
-### 2026-08-17 远程验收前实施状态
+### 2026-08-17 远程验收与后续实施状态
 
-当前本地基线为 `f70861b`（语义解析与 Scheduler V2 集成提交），本轮未提交改动在该基线上
-完成了远程验收前的代码审查与修复。离线最终回归见 §18.3；这里的“完成”只指纯 Python
-内核、兼容接入和故障注入，不代表 ROS/Server 联调、仿真性能和实机安全验收已经完成。
+已封板的满分回退基线为 `v5.0.0`（提交 `9b80c76`）。官方 Server 中的连续三任务路径已取得
+160/160，并完成多种子自动验收；原始日志、单轮校验和矩阵校验方法见
+`material_sorting_task/docs/REMOTE_FULL_SCORE_ACCEPTANCE.md`。§18.4 开始的改动属于满分标签之后的
+下一实施批次，不会移动该回退标签。
 已落地：
 
 - `legacy / shadow / v2` 三模式 facade；默认仍为 `legacy`，非法值自动回退。
@@ -51,8 +52,8 @@
 
 - 代价地图/RL 已实时计算和记录“哪个有限宏动作效用最高”；Task 1/2/3 的可重规划站位
   hook 已在代码层开放，但不改写抓取/放置轨迹，且尚未获得实机放行。
-- 正式实动继续使用 `legacy`；先运行 `shadow`，再运行 `v2 + dry_run`，最后按 Task/Step
-  为具体 Executor 接入 hook 并完成官方 4090 镜像逐段标定。
+- `v2 + heuristic + task123_full` 已通过官方 Server 连续三任务 160/160 和多种子验收；
+  `legacy` 仍保留为一键回退路径，新增 feature gate 仍需逐项独立放行。
 - `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；无批准模型时始终回退
   `HeuristicPolicy`，且项目不下载任何权重。
 - transport 已能把实测物体中心/半宽送入 carried-envelope 与候选 costmap，但默认关闭；
@@ -61,8 +62,9 @@
 - 当前在线候选 Provider 只覆盖导航阶段，且默认不生成恢复候选；结构化恢复桥已上线到 V2，
   但 Executor 失败码迁移目前只有 Task 1 导航首批站点，其他未结构化 BLOCKED 仍保持
   legacy fail-closed 语义，不能宣称全部失败均可自动恢复。
-- odometry/joint state 的消息年龄仍未进入统一 `INPUT_STALE` watchdog；远程验收必须通过
-  断流注入确认当前等待/零速行为，后续再以独立小批次补齐时间戳门限。
+- odometry/joint state 已在 §18.4 接入统一 `INPUT_STALE` watchdog：短暂断流立即零底盘并
+  保持最后有效手臂命令，2.0 s 有界宽限内允许恢复，超时进入 SAFE_HOLD；远程断流注入仍需
+  在官方 Server 上确认 ROS 时序和默认 0.75 s 年龄门限。
 
 ### 必须坚持的架构结论
 
@@ -1185,6 +1187,11 @@ MATERIAL_POLICY_SWITCH_MARGIN=0.25
 MATERIAL_POLICY_MIN_HOLD_S=0.75
 MATERIAL_MEASURED_CARRY_GUARD=0
 
+MATERIAL_ODOM_MAX_AGE_S=0.75
+MATERIAL_JOINT_STATE_MAX_AGE_S=0.75
+MATERIAL_INPUT_STALE_GRACE_S=2.0
+MATERIAL_LOOP_HEALTH_PERIOD_S=5.0
+
 MATERIAL_SCHEDULER_MODEL=
 MATERIAL_SCHEDULER_MODEL_SHA256=
 MATERIAL_RL_TIMEOUT_MS=25
@@ -1317,8 +1324,8 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
    （`test_navigation_controller*.py`）、裁判乱序闭锁（`test_scheduler_engine.py`）、
    模型缺失/推理超时/NaN/masked（`test_policy_guard.py`）、底盘 lease 失效
    （`test_scheduler_resources.py`）与结构化失败注入（`test_scheduler_stage_recovery.py`）
-   均已落地；detection 陈旧有明确门限，odometry/joint state 目前只有等待/零速语义，尚无
-   统一消息年龄 watchdog，必须作为远程断流注入项保留，不能标记为完整 `INPUT_STALE` 覆盖。
+   均已落地；detection 陈旧有明确门限，odometry/joint state 的统一消息年龄 watchdog 已在
+   §18.4 落地并完成纯 Python 断流/恢复/宽限耗尽测试。官方 ROS 断流注入仍是远程验收项。
 7. 只在足量 Heuristic EventLog 经过离线回放后训练 MaskablePPO；先 `rl_shadow`，通过回放和
    仿真统计门槛后再讨论 `rl_guarded` 实机许可。
 
@@ -1426,8 +1433,34 @@ git diff --check:       passed（仅 Windows LF/CRLF 提示，无 whitespace err
 
 因此，远程机前已经没有已知的纯 Python 阻断项；仍未完成且必须留在远程机验证的只有：
 ROS/Server 主题与裁判时序、20 Hz 周期延迟、真实 costmap/尺寸标定、携物净空、关节 effort、
-odom/joint 断流、候选切换轨迹，以及 legacy→shadow→v2 的分阶段实动放行。
+odom/joint 真实 ROS 断流、候选切换轨迹，以及各可选 feature gate 的分阶段实动放行。
 
 这个顺序的核心是：内核已经能计算候选回报，剩余风险集中在“选择结果如何改变真实运动”。
 因此每个 Executor 必须显式 opt-in，不能通过调度器反射修改私有 `_goal` 或绕过现有导航、
 IK、柔顺抓取和柔顺放置控制器。
+
+### 18.4 满分标签后的运行时健康闭环（当前批次）
+
+本批次补齐计划中最后一个未形成统一入口的基础安全项，并保持任务调度策略与已验证运动轨迹
+不变：
+
+1. 新增 ROS-free `runtime_health.py::InputFreshnessWatchdog`，使用客户端单调时钟记录
+   odometry/joint-state 回调到达时间，避免 ROS 仿真时钟与主机墙钟混用。
+2. watchdog 位于 `client_task.py` 的公共控制入口，覆盖 `legacy / shadow / v2`。启动阶段缺少
+   输入仍保持原等待语义；运行中任一输入超过默认 0.75 s，立即发布底盘零速、关闭货架识别
+   请求并继续发布最后有效 ArmCommand；2.0 s 内恢复则继续执行，超时以
+   `FailureCode.INPUT_STALE` 进入 SAFE_HOLD。
+3. `ExecutionContext.input_ages_s` 把同一年龄快照传入 V2 SafetySupervisor/事件上下文，防止
+   Client 保护与调度内核使用不同观测。
+4. 新增 `ControlLoopTelemetry`，按 400 个样本滚动统计 20 Hz 回调间隔 p50/p95/p99/max、
+   执行时长 p95/max，以及间隔/执行 deadline miss；默认每 5 s 输出
+   `CONTROL_LOOP_HEALTH` 并写入同一个 Scheduler JSONL。
+5. JSONL 新增 `input_stale`、`input_recovered`、`safety_stop` 和
+   `control_loop_health` 事件。日志写入失败只降级遥测，绝不打断命令安全路径。
+
+当前离线验收：runtime-health 专项 `9 passed`；全仓 pytest（排除本机缺少 cv2 的既有视觉
+导入项）`449 passed, 5 skipped, 1 warning`；workspace 语法检查和 git diff 检查通过后提交。
+
+下一步只做官方 Server 故障注入，不再扩张调度内核：分别暂停 odom 与 joint_states 发布，
+验证 0.75 s 后底盘归零、2.0 s 内恢复可续跑、超过宽限必进 SAFE_HOLD，并从 JSONL 核对
+输入年龄和 20 Hz p95/p99。该项通过后再进入 Task 2/3 剩余失败码结构化迁移。

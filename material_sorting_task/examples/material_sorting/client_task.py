@@ -13,6 +13,7 @@ from enum import Enum, auto
 import math
 import os
 from statistics import median
+import time
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -45,6 +46,14 @@ from instruction_parser import (
 )
 from semantic_audit import SemanticAudit
 from task_orchestration import parse_gameinfo, sorted_instructions
+from runtime_health import (
+    ControlLoopHealth,
+    ControlLoopTelemetry,
+    FreshnessReport,
+    FreshnessState,
+    InputFreshnessWatchdog,
+)
+from scheduler.models import FailureCode
 
 
 class ClientPhase(Enum):
@@ -93,6 +102,38 @@ class CompetitionClient(Node):
         self._last_scheduler_action_id: str | None = None
         self._invalid_hold_command_logged = False
         self._last_detection_epoch_keys: dict[int, tuple] = {}
+        self._event_log = None
+        self._runtime_stale_active = False
+
+        try:
+            self._freshness_watchdog = InputFreshnessWatchdog(
+                {
+                    "odometry": float(
+                        os.environ.get("MATERIAL_ODOM_MAX_AGE_S", "0.75")
+                    ),
+                    "joint_states": float(
+                        os.environ.get("MATERIAL_JOINT_STATE_MAX_AGE_S", "0.75")
+                    ),
+                },
+                stale_grace_s=float(
+                    os.environ.get("MATERIAL_INPUT_STALE_GRACE_S", "2.0")
+                ),
+            )
+            self._loop_telemetry = ControlLoopTelemetry(
+                0.05,
+                report_period_s=float(
+                    os.environ.get("MATERIAL_LOOP_HEALTH_PERIOD_S", "5.0")
+                ),
+            )
+        except ValueError as exc:
+            self.get_logger().error(
+                f"invalid runtime health configuration ({exc}); using safe defaults"
+            )
+            self._freshness_watchdog = InputFreshnessWatchdog(
+                {"odometry": 0.75, "joint_states": 0.75},
+                stale_grace_s=2.0,
+            )
+            self._loop_telemetry = ControlLoopTelemetry(0.05)
 
         self.execution_mode = (
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
@@ -154,6 +195,7 @@ class CompetitionClient(Node):
                 self.get_logger().error(
                     f"scheduler event log disabled ({exc}); control is unaffected"
                 )
+        self._event_log = event_log
         if self.scheduler_mode == "v2":
             try:
                 from learning.observation import ObservationBuilder
@@ -314,6 +356,14 @@ class CompetitionClient(Node):
             f"event_log={event_log_path or 'disabled'}; "
             f"measured_carry_guard={self.measured_carry_guard_enabled}"
         )
+        limits = self._freshness_watchdog.limits_s
+        self.get_logger().info(
+            "runtime_health="
+            f"odom_max_age={limits['odometry']:.3f}s, "
+            f"joint_max_age={limits['joint_states']:.3f}s, "
+            f"stale_grace={self._freshness_watchdog.stale_grace_s:.3f}s, "
+            "control_period=0.050s"
+        )
         if self.scheduler_mode == "shadow":
             self.get_logger().info(
                 "scheduler shadow mode validates legacy traces and never ticks a "
@@ -427,10 +477,12 @@ class CompetitionClient(Node):
     def _odom_cb(self, msg: Odometry) -> None:
         self.latest_odometry = msg
         self.odom_received = True
+        self._freshness_watchdog.observe("odometry", time.monotonic())
 
     def _joints_cb(self, msg: JointState) -> None:
         self.latest_joint_states = msg
         self.joints_received = True
+        self._freshness_watchdog.observe("joint_states", time.monotonic())
 
     def _detections_cb(self, msg: Detection3DArray) -> None:
         now_s = self.get_clock().now().nanoseconds * 1e-9
@@ -752,28 +804,138 @@ class CompetitionClient(Node):
                 missing.append(f"detection:{target_color}")
         return missing
 
+    def _emit_runtime_event(
+        self,
+        event_type: str,
+        message: str,
+        *,
+        failure_code: FailureCode | None = None,
+        details: dict | None = None,
+    ) -> None:
+        if self._event_log is None:
+            return
+        try:
+            self._event_log.emit(
+                event_type,
+                message,
+                failure_code=failure_code,
+                details=details or {},
+            )
+        except Exception as exc:
+            # Runtime telemetry must never interrupt command publication.
+            self.get_logger().error(f"runtime event logging failed: {exc}")
+
+    def _publish_held_arm_if_valid(self) -> None:
+        snapshot = self.controller.snapshot()
+        if not snapshot.controls_arm or snapshot.arm_command is None:
+            return
+        try:
+            self._validate_snapshot_commands(snapshot)
+            self._publish_arm_command(snapshot.arm_command)
+        except (AttributeError, TypeError, ValueError) as exc:
+            if not self._invalid_hold_command_logged:
+                self.get_logger().error(
+                    f"invalid held arm command suppressed in safe state: {exc}"
+                )
+                self._invalid_hold_command_logged = True
+
+    def _report_freshness_transition(self, report: FreshnessReport) -> None:
+        details = {
+            "state": report.state.value,
+            "ages_s": dict(report.ages_s),
+            "stale_inputs": list(report.stale_inputs),
+            "stale_for_s": report.stale_for_s,
+        }
+        if report.state in {FreshnessState.STALE_GRACE, FreshnessState.EXHAUSTED}:
+            if not self._runtime_stale_active:
+                self.get_logger().warning(
+                    "runtime input stale; stopping base and holding arm: "
+                    + ", ".join(report.stale_inputs)
+                )
+                self._emit_runtime_event(
+                    "input_stale",
+                    "required runtime input exceeded its age limit",
+                    failure_code=FailureCode.INPUT_STALE,
+                    details=details,
+                )
+            self._runtime_stale_active = True
+        elif report.state is FreshnessState.FRESH and self._runtime_stale_active:
+            self.get_logger().info("runtime inputs recovered inside the stale grace window")
+            self._emit_runtime_event(
+                "input_recovered",
+                "required runtime inputs are fresh again",
+                details=details,
+            )
+            self._runtime_stale_active = False
+
+    def _report_loop_health(self, health: ControlLoopHealth) -> None:
+        details = health.to_dict()
+        self.get_logger().info(
+            "CONTROL_LOOP_HEALTH "
+            f"samples={health.sample_count} "
+            f"interval_p95={health.interval_p95_ms:.2f}ms "
+            f"interval_p99={health.interval_p99_ms:.2f}ms "
+            f"execution_p95={health.execution_p95_ms:.2f}ms "
+            f"interval_misses={health.interval_deadline_misses} "
+            f"execution_misses={health.execution_deadline_misses}"
+        )
+        self._emit_runtime_event(
+            "control_loop_health",
+            "rolling 20 Hz control-loop timing summary",
+            details=details,
+        )
+
     def tick(self) -> None:
+        """Measure one timer callback and run the guarded control cycle."""
+
+        started_at_s = time.monotonic()
+        self._loop_telemetry.begin(started_at_s)
+        try:
+            self._tick_once(started_at_s)
+        finally:
+            health = self._loop_telemetry.finish(started_at_s, time.monotonic())
+            if health is not None:
+                self._report_loop_health(health)
+
+    def _tick_once(self, monotonic_now_s: float) -> None:
         """Feed ROS observations into the non-blocking competition controller."""
         if self.phase in (ClientPhase.SAFE_HOLD, ClientPhase.FINISHED):
             self._publish_stop()
             self._publish_shelf_empty_check(False)
-            snapshot = self.controller.snapshot()
-            if snapshot.controls_arm and snapshot.arm_command is not None:
-                try:
-                    self._validate_snapshot_commands(snapshot)
-                    self._publish_arm_command(snapshot.arm_command)
-                except (AttributeError, TypeError, ValueError) as exc:
-                    if not self._invalid_hold_command_logged:
-                        self.get_logger().error(
-                            "invalid held arm command suppressed in safe state: "
-                            f"{exc}"
-                        )
-                        self._invalid_hold_command_logged = True
+            self._publish_held_arm_if_valid()
             return
 
         self._refresh_detection_epochs()
+        freshness = self._freshness_watchdog.evaluate(monotonic_now_s)
+        self._report_freshness_transition(freshness)
         missing = self._missing_inputs()
-        self.controller.set_inputs_ready(not missing)
+        if freshness.stale_inputs:
+            missing.extend(f"stale:{name}" for name in freshness.stale_inputs)
+        self.controller.set_inputs_ready(not missing and freshness.motion_allowed)
+        if not freshness.motion_allowed and not freshness.missing_inputs:
+            self._publish_stop()
+            self._publish_shelf_empty_check(False)
+            self._publish_held_arm_if_valid()
+            if freshness.terminal:
+                message = (
+                    "runtime input freshness grace exhausted after "
+                    f"{freshness.stale_for_s:.3f}s: "
+                    + ", ".join(freshness.stale_inputs)
+                )
+                self.controller.stop(message)
+                self.phase = ClientPhase.SAFE_HOLD
+                self.get_logger().error(message)
+                self._emit_runtime_event(
+                    "safety_stop",
+                    message,
+                    failure_code=FailureCode.INPUT_STALE,
+                    details={
+                        "ages_s": dict(freshness.ages_s),
+                        "stale_inputs": list(freshness.stale_inputs),
+                        "stale_for_s": freshness.stale_for_s,
+                    },
+                )
+            return
         if missing:
             self._publish_stop()
             self._publish_shelf_empty_check(False)
@@ -784,6 +946,7 @@ class CompetitionClient(Node):
             return
 
         if self.phase is ClientPhase.WAITING_FOR_SERVER:
+            self._freshness_watchdog.arm()
             self.phase = ClientPhase.READY
             self.get_logger().info(
                 "client inputs ready; starting three-task competition controller"
@@ -807,6 +970,7 @@ class CompetitionClient(Node):
                 referee_gameinfo=self.referee_gameinfo,
                 referee_taskinfo=self.referee_taskinfo,
                 score=self.score,
+                input_ages_s=dict(freshness.ages_s),
             )
         )
 

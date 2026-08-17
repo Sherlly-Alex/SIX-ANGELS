@@ -14,6 +14,7 @@ REQUIRED = (
     TASK / "competition_controller.py",
     TASK / "control_types.py",
     TASK / "instruction_parser.py",
+    TASK / "runtime_health.py",
     TASK / "task_orchestration.py",
     TASK / "executors" / "__init__.py",
     TASK / "executors" / "base.py",

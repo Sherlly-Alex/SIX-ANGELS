@@ -75,6 +75,7 @@ class ExecutionContext:
     referee_taskinfo: str = ""
     score: int = 0
     unsafe_collision: bool = False
+    input_ages_s: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

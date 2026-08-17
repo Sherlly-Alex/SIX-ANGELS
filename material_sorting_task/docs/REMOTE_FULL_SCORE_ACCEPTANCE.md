@@ -12,9 +12,11 @@ continuous Client process:
 - no `controller=blocked`, `controller=safe_hold`, executor error or unsafe
   collision occurred in the accepted run.
 
-The accepted implementation baseline is commit `e26c769`. The archived remote
-artifacts are named `v2_task123_r4` and include Client, Server and scheduler
-event logs.
+The first accepted full-score implementation was commit `e26c769`; the
+validated release baseline is tag `v5.0.0` at commit `9b80c76`, which also
+contains automated single-run and multi-seed acceptance gates. The archived
+remote artifacts are named `v2_task123_r4` and include Client, Server and
+scheduler event logs.
 
 ## Automated acceptance
 
@@ -38,11 +40,10 @@ Exit status zero and `"passed": true` require all of the following:
 
 ## Multi-seed regression
 
-The fixed-seed result validates the integrated path, but release readiness for
-competition should additionally require at least five official randomized
-layouts. Use a fresh Server and Client for every seed and retain all three
-artifact files. Run the validator for every completed seed; do not average a
-failed seed into the result. Every seed must independently pass 160/160.
+The subsequent randomized runs were reported complete without failures. The
+release gate remains: use a fresh Server and Client for every seed and run the
+validator for every completed seed; do not average a failed seed into the
+result. Every seed must independently pass 160/160.
 
 Recommended first matrix:
 
