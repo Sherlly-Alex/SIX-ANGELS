@@ -7,6 +7,7 @@ import unittest
 from competition_controller import CompetitionController, ControllerState
 from executors import build_task_executors
 from executors.base import ExecutionContext, TargetObservation, TaskStage
+from executors.scheduler_candidate import CandidateApplicationStatus
 from executors.task1 import Task1NavigationExecutor
 from navigation.occupancy_grid import ObstacleVolume
 from scheduler.candidate_generator import CandidateAction, CandidateGenerator
@@ -168,8 +169,9 @@ class Task1SchedulerCandidateTests(unittest.TestCase):
         self.assertEqual(executor._locked_target_world, (-1.0, 2.2, 0.834))
         self.assertEqual(executor._locked_target_orientation, "yaw0")
 
-    def test_rejects_candidate_outside_lateral_corridor(self) -> None:
+    def test_off_corridor_candidate_is_audit_only(self) -> None:
         executor, initial = self._entered_executor()
+        goal_before = executor.goal
         far = stand_candidate(
             "far_left",
             -1.0 - 0.50,
@@ -178,16 +180,21 @@ class Task1SchedulerCandidateTests(unittest.TestCase):
         )
         selected, outcome = self._selection(executor, far)
 
-        with self.assertRaisesRegex(ValueError, "lateral error"):
-            executor.apply_scheduler_candidate(selected, outcome, initial)
+        status = executor.apply_scheduler_candidate(selected, outcome, initial)
 
-    def test_rejects_candidate_overshooting_forward(self) -> None:
+        self.assertIs(status, CandidateApplicationStatus.AUDIT_ONLY)
+        self.assertEqual(executor.goal, goal_before)
+
+    def test_forward_mismatched_candidate_is_audit_only(self) -> None:
         executor, initial = self._entered_executor()
+        goal_before = executor.goal
         overshoot = stand_candidate("overshoot", -1.0, 1.55 + 0.30, math.pi / 2.0)
         selected, outcome = self._selection(executor, overshoot)
 
-        with self.assertRaisesRegex(ValueError, "forward error"):
-            executor.apply_scheduler_candidate(selected, outcome, initial)
+        status = executor.apply_scheduler_candidate(selected, outcome, initial)
+
+        self.assertIs(status, CandidateApplicationStatus.AUDIT_ONLY)
+        self.assertEqual(executor.goal, goal_before)
 
     def test_rejects_non_navigation_candidate(self) -> None:
         executor, initial = self._entered_executor()
@@ -370,14 +377,16 @@ class Task1SchedulerCandidateIntegrationTests(unittest.TestCase):
         self.assertEqual(executor.goal.source_tag, f"scheduler:{decision.action_id}")
         controller.close()
 
-    def test_v2_nav_only_fails_closed_on_rejected_candidate(self) -> None:
+    def test_v2_nav_only_keeps_nominal_goal_for_off_corridor_candidate(self) -> None:
         far_provider = ProjectCandidateProvider(
             generator=CandidateGenerator(lateral_offsets_m=(0.50,))
         )
-        controller, _executor = self._run_controller(far_provider)
+        controller, executor = self._run_controller(far_provider)
 
-        self.assertIs(controller.state, ControllerState.SAFE_HOLD)
-        self.assertIn("scheduler candidate", controller.snapshot().message)
+        self.assertIs(controller.state, ControllerState.EXECUTING_STAGE)
+        self.assertEqual(controller._backend.last_candidate_application, "audit_only")
+        self.assertIsNotNone(executor.goal)
+        self.assertFalse(executor.goal.source_tag.startswith("scheduler:"))
         controller.close()
 
 

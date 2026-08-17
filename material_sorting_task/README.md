@@ -110,7 +110,8 @@ bash scripts/run_client.sh
 `apply_scheduler_candidate(...)` 的执行器才会接收通过约束的候选，其余执行器保持该链路为
 可观测旁路。当前仅 `nav_only` 的 Task 1 导航执行器实现了该 hook：候选必须再次通过站位
 走廊（横向 ≤0.15 m / 纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
-`NavigationController` 实际重规划四道校验，任一失败 fail-closed 停车；`legacy`/`shadow`
+`NavigationController` 实际重规划四道校验；与已标定名义站位不一致的可选候选记录为
+`audit_only` 并继续名义轨迹，非法输入、碰撞/净空和实际重规划失败仍 fail-closed 停车；`legacy`/`shadow`
 和未接入 hook 的模式不受影响。因此正式实动仍应保持 `legacy`，先以 `shadow`、
 `v2 + dry_run` 收集轨迹，再在 `v2 + nav_only` 上逐段标定候选站位切换：
 

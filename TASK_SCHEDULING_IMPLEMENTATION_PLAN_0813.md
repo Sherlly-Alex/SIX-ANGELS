@@ -38,7 +38,7 @@
   `NAVIGATE_TO_PICK`）均持有完整机械臂资源，阶段间由持久 hold lease 接管，关闭时释放。
 - Task 1/2/3 的可重规划导航段已实现 `apply_scheduler_candidate(...)` opt-in hook：候选必须通过
   站位走廊（横向 ≤0.15 m、纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
-  `NavigationController` 实际重规划四道校验，任一失败 fail-closed。应用结果明确记录为
+  `NavigationController` 实际重规划四道校验。与已标定名义站位不一致的可选候选只记录为 `audit_only`并回退到名义轨迹；非法输入、碰撞/净空和重规划失败仍 fail-closed。应用结果明确记录为
   `applied / audit_only / too_late`；Task 2 分段 transport 保持 `audit_only`。
 - 首个导航候选提供 100 ms 可配置、有上限且不阻塞 ROS tick 的等待窗，消除后台决策线程
   恰好错过第一个 20 Hz tick 时的静默失效；超过窗口立即执行既有确定性轨迹。
@@ -1303,8 +1303,9 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 4. 运行 `v2 + nav_only + heuristic`，只为 Task 1 导航执行器实现
    `apply_scheduler_candidate(...)`，验证中心/左右候选切换和最小净空。
    **[代码已完成，待实机验证]**：hook 已在 `executors/task1.py` 落地并带单元/集成
-   测试（`tests/test_task1_scheduler_candidate.py`，15 项）；四道执行器侧校验（走廊、
-   碰撞、净空 ≥0.22 m、重规划）任一失败 fail-closed 进入 SAFE_HOLD；候选侧
+   测试（`tests/test_task1_scheduler_candidate.py`，15 项）；与已标定名义站位不一致的
+   可选候选只记为 `audit_only` 并继续名义轨迹；非法输入、碰撞、净空 ≥0.22 m 和重规划
+   失败仍 fail-closed 进入 SAFE_HOLD；候选侧
    `heuristic` 已通过 action mask 与硬过滤。剩余：官方镜像上录制中心/左右切换的
    周期延迟与净空遥测。
 5. 依次为 Task 2 货架观察/抓取站位、Task 1/2/3 transport、Return-to-End 开放 hook；每一步

@@ -267,10 +267,12 @@ class Task1NavigationExecutor:
         :class:`NavigationController`, so a scheduler selection can never
         bypass the existing navigation, footprint or clearance logic.
 
-        Rejections raise instead of being ignored: an executor that opted in
-        must fail closed when a selection cannot be applied safely.  Scheduler
-        candidates are optional — without this hook (legacy/shadow modes) the
-        executor keeps its deterministic calibrated stand.
+        Candidates are optional — without this hook (legacy/shadow modes) the
+        executor keeps its deterministic calibrated stand.  A candidate whose
+        position no longer agrees with that calibrated nominal stand is
+        recorded as ``audit_only`` and cannot redirect the robot.  Malformed
+        input, collision/clearance failures and navigation replan failures
+        remain fail-closed.
         """
         if self.active_stage is not TaskStage.NAVIGATE_TO_PICK:
             # Unsupported stages are audit-only pass-through: this base
@@ -298,20 +300,17 @@ class Task1NavigationExecutor:
             (nominal_x, nominal_y),
             nominal_yaw,
         )
-        if abs(lateral_error) > self.SCHEDULER_CANDIDATE_MAX_LATERAL_M:
-            raise ValueError(
-                "task 1 rejected scheduler candidate "
-                f"{getattr(candidate, 'action_id', candidate)!r}: lateral error "
-                f"{lateral_error:+.3f} m exceeds "
-                f"{self.SCHEDULER_CANDIDATE_MAX_LATERAL_M:.2f} m corridor"
-            )
-        if abs(forward_error) > self.SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M:
-            raise ValueError(
-                "task 1 rejected scheduler candidate "
-                f"{getattr(candidate, 'action_id', candidate)!r}: forward error "
-                f"{forward_error:+.3f} m exceeds "
-                f"{self.SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M:.2f} m corridor"
-            )
+        if (
+            abs(lateral_error) > self.SCHEDULER_CANDIDATE_MAX_LATERAL_M
+            or abs(forward_error) > self.SCHEDULER_CANDIDATE_MAX_FORWARD_ERROR_M
+        ):
+            # Candidates are an optional optimisation layer.  A stale or
+            # differently-calibrated nominal stand must never replace the
+            # executor's deterministic stand, but it also does not make that
+            # existing stand unsafe.  Keep the validated motion unchanged and
+            # report an auditable non-application instead of escalating this
+            # policy-side mismatch into a robot-wide SAFE_HOLD.
+            return CandidateApplicationStatus.AUDIT_ONLY
 
         robot = self._odometry_pose(context.odometry)
         if robot is None:

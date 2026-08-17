@@ -835,6 +835,19 @@ class SchedulerEngine:
             else:
                 status = str(application)
             self.last_candidate_application = status
+            candidate = selected.candidate
+            raw_goal_pose = getattr(candidate, "goal_pose", None)
+            goal_pose = (
+                tuple(float(value) for value in raw_goal_pose)
+                if raw_goal_pose is not None
+                else None
+            )
+            metadata = getattr(candidate, "metadata", {})
+            lateral_offset = (
+                metadata.get("lateral_offset_m")
+                if isinstance(metadata, Mapping)
+                else None
+            )
             self._emit_structured_event(
                 "candidate_application",
                 context,
@@ -842,6 +855,8 @@ class SchedulerEngine:
                 details={
                     "action_id": selected.action_id,
                     "application_status": status,
+                    "goal_pose": goal_pose,
+                    "lateral_offset_m": lateral_offset,
                 },
             )
         except Exception as exc:
