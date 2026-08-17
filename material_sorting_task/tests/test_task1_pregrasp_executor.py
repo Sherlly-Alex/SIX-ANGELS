@@ -910,48 +910,23 @@ class Task1LiftExecutorTests(unittest.TestCase):
         executor.enter_stage(TaskStage.GRASP, at_goal)
         return executor, contact_controller, lift_controller
 
-    def test_settled_max_preload_uses_lift_fallback(self) -> None:
+    def test_lift_rejects_exhausted_preload_without_bilateral_alignment(self) -> None:
         executor, contact_controller, lift_controller = self._reach_grasp_stage()
-        result = None
-        now_s = 0.10
-        for _ in range(20):
-            result = executor.tick(
-                TaskStage.GRASP,
-                context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
-            )
-            if result.status is StageStatus.SUCCEEDED:
-                break
-            now_s += 0.35
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.status, StageStatus.SUCCEEDED)
-        self.assertEqual(contact_controller.tighten_offsets, [0.001, 0.002, 0.003, 0.004])
-        self.assertIn("bounded-preload fallback", result.message)
-
-        lift_context = context(
-            now_s + 0.05,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+        executor.tick(
+            TaskStage.GRASP,
+            context(0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
         )
-        executor.enter_stage(TaskStage.LIFT, lift_context)
-        lifting = executor.tick(TaskStage.LIFT, lift_context)
-        self.assertEqual(lifting.status, StageStatus.RUNNING)
-        lifted = executor.tick(
-            TaskStage.LIFT,
-            context(now_s + 0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
-        )
-        self.assertEqual(lifted.status, StageStatus.SUCCEEDED)
-        self.assertEqual(lift_controller.plan_command, ARM_COMMAND)
-        self.assertEqual(lifted.arm_command, LIFTED_ARM_COMMAND)
+        executor._contact_search_used_m = executor.CONTACT_SEARCH_MAX_M
 
-        transport_context = context(
-            now_s + 0.15,
-            odometry(-0.18, 1.55, math.pi / 2.0),
+        result = executor.tick(
+            TaskStage.GRASP,
+            context(36.0, odometry(-0.18, 1.55, math.pi / 2.0)),
         )
-        executor.enter_stage(TaskStage.TRANSPORT, transport_context)
-        held = executor.tick(TaskStage.TRANSPORT, transport_context)
-        self.assertEqual(held.status, StageStatus.BLOCKED)
-        self.assertEqual(held.arm_command, LIFTED_ARM_COMMAND)
-        self.assertIn("transport", held.message)
+
+        self.assertFalse(executor.ALLOW_SETTLED_MAX_SEARCH)
+        self.assertEqual(result.status, StageStatus.BLOCKED)
+        self.assertIn("bilateral wrist alignment", result.message)
+        self.assertIsNone(lift_controller.plan_command)
 
     def test_compliant_alignment_adds_two_millimetres_locked_preload(self) -> None:
         contact_controller = FakeCompliantContactController()

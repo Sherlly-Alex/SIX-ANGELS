@@ -1272,7 +1272,9 @@ class Task1LiftExecutor(Task1ContactExecutor):
     """Apply the bounded preload, lift 15 cm, then hold before transport."""
 
     name = "task1_lift_only"
-    ALLOW_SETTLED_MAX_SEARCH = True
+    # Physical lift is authorized only after bilateral compliant alignment;
+    # exhausting the inward-travel bound is not evidence of a secure grasp.
+    ALLOW_SETTLED_MAX_SEARCH = False
     # The compliant phase now includes the visible 10 mm approach outside the
     # box surface.  Keep it bounded but leave enough time for a one-sided
     # 0.5 mm/s contact correction and the single safe retry.
