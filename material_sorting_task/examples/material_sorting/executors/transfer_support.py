@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
+from navigation.carried_envelope import CarriedEnvelopeChecker, HeldObjectGeometry
 from navigation.competition_adapter import (
     format_nav_telemetry,
     goal_reached_event,
@@ -12,7 +13,7 @@ from navigation.competition_adapter import (
 )
 from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import NavigationGoal, NavigationStatus, SpeedLimits
-from navigation.occupancy_grid import build_layered_scene_grid
+from navigation.occupancy_grid import LayeredGrid, build_layered_scene_grid
 from navigation.robot_geometry import FootprintMode
 
 
@@ -114,6 +115,10 @@ class TransferMotion:
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
         self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
         self._lateral_timeout_s = self.LATERAL_TIMEOUT_S
+        # Measured carried-object envelope for A* transport segments.
+        # None keeps the historical generic TRANSIT_CARRY behaviour.
+        self._held_geometry: HeldObjectGeometry | None = None
+        self._carried_checker = CarriedEnvelopeChecker()
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -122,6 +127,16 @@ class TransferMotion:
     @property
     def navigation_path(self) -> tuple[tuple[float, float], ...]:
         return self._navigation.path
+
+    @property
+    def navigation_grid(self) -> LayeredGrid:
+        """Read-only layered grid used by executor candidate hooks.
+
+        Scheduler stand candidates are re-validated on this same grid so
+        the executor-side footprint/clearance check can never disagree
+        with the controller that will actually drive the segment.
+        """
+        return self._navigation_grid
 
     def reset(self) -> None:
         self._navigation.reset()
@@ -139,6 +154,7 @@ class TransferMotion:
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
         self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
         self._lateral_timeout_s = self.LATERAL_TIMEOUT_S
+        self._held_geometry = None
 
     def begin_navigation(
         self,
@@ -149,6 +165,7 @@ class TransferMotion:
         observations: Mapping[str, Any] | None = None,
         exclude_color: str | None = None,
         payload_z: float | None = None,
+        held_geometry: HeldObjectGeometry | None = None,
     ) -> bool:
         pose = odometry_pose(odometry)
         if pose is None:
@@ -166,7 +183,26 @@ class TransferMotion:
         )
         self._goal = goal
         self._last_tick_s = None
-        return self._navigation.set_goal(goal, pose[0], pose[1])
+        self._held_geometry = held_geometry
+        if not self._navigation.set_goal(goal, pose[0], pose[1]):
+            self._goal = None
+            return False
+        if held_geometry is not None:
+            # The measured box/arms swept envelope must also survive the
+            # planned path.  The base-only A* grid cannot see the payload.
+            safety = self._carried_checker.check_path(
+                pose,
+                self._navigation.path,
+                goal.yaw,
+                held_geometry.center_base,
+                held_geometry.half_width_m,
+            )
+            if not safety.safe:
+                self._navigation.reset()
+                self._goal = None
+                self._held_geometry = None
+                return False
+        return True
 
     def tick_navigation(
         self,
@@ -185,6 +221,24 @@ class TransferMotion:
         self._last_tick_s = now
         command = self._navigation.update(*pose, dt, obs=None)
         status = self._navigation.status
+        if self._held_geometry is not None:
+            # Fail-closed per-tick payload gate: any commanded sweep of the
+            # measured box through the shelf/perimeter walls stops motion.
+            safety = self._carried_checker.check_command(
+                pose,
+                (command.linear_x, command.angular_z),
+                self._held_geometry.center_base,
+                self._held_geometry.half_width_m,
+            )
+            if not safety.safe:
+                self._navigation.reset()
+                self._goal = None
+                self._held_geometry = None
+                return (
+                    NavigationStatus.EMERGENCY_STOP,
+                    (0.0, 0.0),
+                    f"carried envelope guard stopped motion: {safety.detail}",
+                )
         detail = (
             f"goal=({self._goal.x:.2f}, {self._goal.y:.2f}, "
             f"{self._goal.yaw:.2f}); nav_status={status.value}; "

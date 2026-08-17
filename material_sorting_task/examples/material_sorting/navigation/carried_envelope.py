@@ -36,6 +36,49 @@ class EnvelopeCheck:
     detail: str
 
 
+@dataclass(frozen=True)
+class HeldObjectGeometry:
+    """Measured carried-object geometry fed into transport costmap checks.
+
+    'center_base' is the object centre in the robot base frame; 'z' is
+    retained so telemetry can record the held height even though the current
+    2-D envelope only consumes x/y.  'half_width_m' is the bilateral grasp
+    half-width reported by the contact controller.  Construction is the
+    validation boundary: a malformed value raises instead of silently
+    downgrading a carrying robot to the generic TRANSIT_CARRY footprint.
+    """
+
+    center_base: tuple[float, float, float]
+    half_width_m: float
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            center = tuple(float(value) for value in self.center_base)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("center_base must be three finite numbers") from exc
+        if len(center) != 3 or not all(math.isfinite(value) for value in center):
+            raise ValueError("center_base must be three finite numbers")
+        half_width = float(self.half_width_m)
+        if not math.isfinite(half_width) or half_width <= 0.0:
+            raise ValueError("half_width_m must be finite and positive")
+        object.__setattr__(self, "center_base", center)
+        object.__setattr__(self, "half_width_m", half_width)
+        object.__setattr__(self, "source", str(self.source))
+
+    @property
+    def center(self) -> tuple[float, float, float]:
+        return self.center_base
+
+    @property
+    def held_center_base(self) -> tuple[float, float, float]:
+        return self.center_base
+
+    @property
+    def held_half_width_m(self) -> float:
+        return self.half_width_m
+
+
 class CarriedEnvelopeChecker:
     """Check body/arm/payload discs against shelf and perimeter walls."""
 
@@ -372,4 +415,5 @@ __all__ = [
     "CarriedEnvelopeChecker",
     "EnvelopeCheck",
     "EnvelopeDisc",
+    "HeldObjectGeometry",
 ]

@@ -240,6 +240,14 @@ class _LegacyCompetitionController:
                 self._controls_base = False
                 self._finish_local_attempt(context, succeeded=False, message=result.message)
                 return self.snapshot()
+            if result.status is StageStatus.RETRYABLE_FAILURE:
+                # Legacy mode has no recovery layer: a structured retryable
+                # failure keeps the historical safe BLOCKED semantics of the
+                # message-based sites it replaced.
+                executor.cancel(result.message)
+                self._controls_base = False
+                self._transition(ControllerState.BLOCKED, result.message)
+                return self.snapshot()
 
             if self.stage_index + 1 < len(TASK_STAGE_SEQUENCE):
                 self.stage_index += 1
@@ -464,6 +472,7 @@ class CompetitionController:
         decision_service=None,
         candidate_provider=None,
         decision_period_s: float = 0.25,
+        candidate_initial_wait_s: float = 0.10,
     ) -> None:
         mode = str(scheduler_mode).strip().casefold()
         if mode not in self.VALID_SCHEDULER_MODES:
@@ -486,6 +495,7 @@ class CompetitionController:
                 decision_service=decision_service,
                 candidate_provider=candidate_provider,
                 decision_period_s=decision_period_s,
+                candidate_initial_wait_s=candidate_initial_wait_s,
             )
         else:
             self._backend = _LegacyCompetitionController(

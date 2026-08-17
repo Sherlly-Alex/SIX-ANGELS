@@ -23,8 +23,16 @@ from executors.base import (
     TaskExecutor,
     TaskStage,
 )
-from scheduler.legacy_adapter import LegacyStageAction
-from scheduler.models import ArmCommandMode, BaseCommand, CommandFrame, Resource
+from executors.scheduler_candidate import CandidateApplicationStatus
+from scheduler.legacy_adapter import LegacyStageAction, RecoverableStageAction
+from scheduler.models import (
+    ArmCommandMode,
+    BaseCommand,
+    CommandFrame,
+    FailureCode,
+    Resource,
+)
+from scheduler.recovery import FATAL_SAFETY_FAILURE_CODES, RecoveryClassifier
 from scheduler.plans import ExecutorTaskPlan, TerminalPolicy, build_executor_task_plans
 from scheduler.referee import RefereeGateway, RefereeUpdate
 from scheduler.resources import (
@@ -91,6 +99,8 @@ class SchedulerEngine:
         candidate_provider: Any = None,
         decision_period_s: float = 0.25,
         referee_desync_limit: int = 20,
+        stage_recovery_budget: int = 8,
+        candidate_initial_wait_s: float = 0.10,
     ) -> None:
         missing = {1, 2, 3} - set(executors)
         if missing:
@@ -119,6 +129,15 @@ class SchedulerEngine:
         self.decision_period_s = float(decision_period_s)
         if not math.isfinite(self.decision_period_s) or self.decision_period_s <= 0.0:
             raise ValueError("decision_period_s must be finite and positive")
+        if int(stage_recovery_budget) < 0:
+            raise ValueError("stage_recovery_budget cannot be negative")
+        self.stage_recovery_budget = int(stage_recovery_budget)
+        self.candidate_initial_wait_s = float(candidate_initial_wait_s)
+        if (
+            not math.isfinite(self.candidate_initial_wait_s)
+            or self.candidate_initial_wait_s < 0.0
+        ):
+            raise ValueError("candidate_initial_wait_s must be finite and non-negative")
         self._decision_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="scheduler-costmap")
             if decision_service is not None and candidate_provider is not None
@@ -128,6 +147,7 @@ class SchedulerEngine:
         self._decision_lifecycle_lock = threading.RLock()
         self._last_decision_submit_s: float | None = None
         self.last_decision: Any = None
+        self.last_candidate_application: str | None = None
         self._closing = False
         self.referee_desync_limit = max(1, int(referee_desync_limit))
 
@@ -137,7 +157,7 @@ class SchedulerEngine:
         self.task_index = 0
         self.attempt = 1
         self.stage_index = 0
-        self._active_action: LegacyStageAction | None = None
+        self._active_action: LegacyStageAction | RecoverableStageAction | None = None
         self._active_owner: str | None = None
         self._stage_started_s: float | None = None
         self._controls_base = False
@@ -210,6 +230,7 @@ class SchedulerEngine:
         self._referee_desync_count = 0
         self._terminal_referee_pending = False
         self.last_decision = None
+        self.last_candidate_application = None
         self._last_decision_submit_s = None
         self._transition(
             self._states.WAITING_FOR_INPUTS,
@@ -329,6 +350,17 @@ class SchedulerEngine:
 
         if self._active_action is None:
             action = LegacyStageAction(executor=executor, stage=spec.stage)
+            if spec.recovery_policy and not spec.irreversible:
+                # Structured retryable failures are consumed by a bounded
+                # deterministic recovery wrapper.  Without executor-provided
+                # recovery actions the recovery is a bounded step re-entry
+                # (Nav2 level L2); irreversible steps are never wrapped.
+                action = RecoverableStageAction(
+                    action,
+                    classifier=RecoveryClassifier(),
+                    recovery_factory=self._recovery_factory_for(executor, spec),
+                    max_total_recoveries=self.stage_recovery_budget,
+                )
             owner = self._owner_id(spec.stage)
             try:
                 self._release_arm_hold_lease()
@@ -366,6 +398,16 @@ class SchedulerEngine:
 
         self._update_decision_sidecar(context, spec)
         if self.state is self._states.SAFE_HOLD:
+            return self.snapshot()
+        if self._should_wait_for_initial_candidate(context, spec):
+            self.base_command_lease.revoke()
+            self._controls_base = False
+            self._base_linear_x = 0.0
+            self._base_angular_z = 0.0
+            self._message = (
+                f"task {self.task_id} waiting up to "
+                f"{self.candidate_initial_wait_s:.2f}s for initial safe candidate"
+            )
             return self.snapshot()
 
         if (
@@ -418,10 +460,64 @@ class SchedulerEngine:
             self._arm_command = result.arm_command
 
         if result.status is StageStatus.RUNNING:
+            recovery_name = result.metadata.get("recovery_requested")
+            if recovery_name:
+                self._emit_structured_event(
+                    "step_recovery",
+                    context,
+                    message=result.message,
+                    details=dict(result.metadata),
+                )
             if result.message:
                 self._message = result.message
             return self.snapshot()
+        if result.status is StageStatus.RETRYABLE_FAILURE:
+            # An unwrapped step (no recovery policy or an irreversible
+            # stage) cannot retry: fail closed with the legacy BLOCKED
+            # semantics and the structured code recorded.
+            code = self._result_failure_code(result)
+            code_label = self._failure_code_label(code)
+            cancel_error = self._cancel_action(result.message)
+            if cancel_error:
+                self.stop(
+                    f"executor cancel failed on retryable failure: {cancel_error}"
+                )
+                return self.snapshot()
+            self._controls_base = False
+            self._emit_structured_event(
+                "step_failed",
+                context,
+                message=result.message,
+                details={"failure_code": code_label, "retryable": True, "recovered": False},
+            )
+            self._transition(
+                self._states.BLOCKED,
+                f"stage {spec.stage.value} failed without a recovery path: "
+                f"{code_label}: {result.message}",
+            )
+            return self.snapshot()
         if result.status is StageStatus.BLOCKED:
+            code = self._result_failure_code(result)
+            if code in FATAL_SAFETY_FAILURE_CODES:
+                # Hard effort limits, collisions and internal errors must
+                # end in SAFE_HOLD; they must never wait for a referee.
+                cancel_error = self._cancel_action(result.message)
+                if cancel_error:
+                    self.stop(
+                        f"executor cancel failed on fatal failure: {cancel_error}"
+                    )
+                    return self.snapshot()
+                self._emit_structured_event(
+                    "step_failed",
+                    context,
+                    message=result.message,
+                    details={"failure_code": self._failure_code_label(code), "fatal": True},
+                )
+                self.stop(
+                    f"task {self.task_id} fatal structured failure {code.value} "
+                    f"at stage={spec.stage.value}: {result.message}"
+                )
+                return self.snapshot()
             cancel_error = self._cancel_action(result.message)
             if cancel_error:
                 self.stop(f"executor cancel failed while blocking: {cancel_error}")
@@ -435,6 +531,12 @@ class SchedulerEngine:
                 self.stop(f"executor cancel failed after failure: {cancel_error}")
                 return self.snapshot()
             self._controls_base = False
+            self._emit_structured_event(
+                "step_failed",
+                context,
+                message=result.message,
+                details={"failure_code": self._failure_code_label(self._result_failure_code(result))},
+            )
             self._finish_local_attempt(context, succeeded=False, message=result.message)
             return self.snapshot()
 
@@ -553,7 +655,19 @@ class SchedulerEngine:
         )
 
     def _compute_stage_decision(self, key, context, spec):
-        batch = self.candidate_provider.build(context, spec)
+        nominal_goal = self._probe_nominal_goal(context, spec)
+        try:
+            batch = self.candidate_provider.build(
+                context,
+                spec,
+                nominal_goal=nominal_goal,
+            )
+        except TypeError as exc:
+            # Duck-typed providers from earlier batches may not accept the
+            # nominal-goal keyword; they keep their own base-goal logic.
+            if "nominal_goal" not in str(exc):
+                raise
+            batch = self.candidate_provider.build(context, spec)
         if batch is None:
             return key, None
         constraints = dict(batch.constraints or {})
@@ -565,6 +679,10 @@ class SchedulerEngine:
             owner is not None
             and self.resource_manager.owns(owner, self._resource_set(spec))
         )
+        if getattr(spec, "stage", spec) is TaskStage.TRANSPORT:
+            held_center_base, held_half_width_m = self._probe_held_geometry(context)
+        else:
+            held_center_base, held_half_width_m = None, None
         with self._decision_lifecycle_lock:
             if self._closing:
                 return key, None
@@ -576,8 +694,73 @@ class SchedulerEngine:
                 start_pose=batch.start_pose,
                 constraints=constraints,
                 footprint_mode=batch.footprint_mode,
+                held_center_base=held_center_base,
+                held_half_width_m=held_half_width_m,
             )
         return key, outcome
+
+    def _probe_nominal_goal(
+        self,
+        context: ExecutionContext,
+        spec: Any,
+    ) -> tuple[float, float, float] | None:
+        """Best-effort nominal stand from an opt-in executor hook.
+
+        Candidates are offset around the executor's own current stand
+        instead of a provider-side approximation.  A missing hook or a hook
+        exception falls back to the provider's computed goal, so the
+        sidecar keeps its audit-only grading behaviour unchanged.
+        """
+        stage = getattr(spec, "stage", spec)
+        hook = getattr(self._executor(), "scheduler_nominal_goal", None)
+        if not callable(hook):
+            return None
+        try:
+            goal = hook(stage, context)
+        except Exception:
+            return None
+        if goal is None:
+            return None
+        try:
+            x, y, yaw = (float(value) for value in goal)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x, y, yaw)):
+            return None
+        return (x, y, yaw)
+
+    def _probe_held_geometry(
+        self,
+        context: ExecutionContext,
+    ) -> tuple[tuple[float, float, float] | None, float | None]:
+        """Best-effort measured held-object envelope for transport scoring.
+
+        The probe is read-only with respect to executors.  A missing hook, a
+        hook exception, or malformed geometry degrades to the generic
+        TRANSIT_CARRY footprint for scoring only; it never alters commands.
+        """
+        hook = getattr(self._executor(), "held_object_geometry", None)
+        if not callable(hook):
+            return None, None
+        try:
+            geometry = hook(context)
+        except Exception:
+            return None, None
+        if geometry is None:
+            return None, None
+        try:
+            center = tuple(float(value) for value in geometry.center_base)
+            half = float(geometry.half_width_m)
+        except (AttributeError, TypeError, ValueError):
+            return None, None
+        if (
+            len(center) != 3
+            or not all(math.isfinite(value) for value in center)
+            or not math.isfinite(half)
+            or half <= 0.0
+        ):
+            return None, None
+        return center, half
 
     def _update_decision_sidecar(self, context, spec, *, force: bool = False) -> None:
         """Poll/submit costmap decisions without blocking the 20 Hz tick."""
@@ -619,6 +802,22 @@ class SchedulerEngine:
             spec,
         )
 
+    def _should_wait_for_initial_candidate(self, context, spec) -> bool:
+        if self.candidate_initial_wait_s <= 0.0 or self._decision_future is None:
+            return False
+        if getattr(spec, "stage", spec) not in {
+            TaskStage.NAVIGATE_TO_PICK,
+            TaskStage.TRANSPORT,
+            TaskStage.RETURN_TO_END,
+        }:
+            return False
+        if not callable(getattr(self._executor(), "apply_scheduler_candidate", None)):
+            return False
+        if self._stage_started_s is None:
+            return False
+        elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
+        return elapsed <= self.candidate_initial_wait_s
+
     def _offer_candidate_to_executor(self, outcome, context) -> None:
         """Use an opt-in executor hook; absence means audit-only operation."""
         selected = getattr(outcome, "selected", None)
@@ -628,7 +827,23 @@ class SchedulerEngine:
         if not callable(hook):
             return
         try:
-            hook(selected.candidate, outcome, context)
+            application = hook(selected.candidate, outcome, context)
+            if isinstance(application, CandidateApplicationStatus):
+                status = application.value
+            elif application is None:
+                status = "unreported"
+            else:
+                status = str(application)
+            self.last_candidate_application = status
+            self._emit_structured_event(
+                "candidate_application",
+                context,
+                message=f"candidate {selected.action_id} application={status}",
+                details={
+                    "action_id": selected.action_id,
+                    "application_status": status,
+                },
+            )
         except Exception as exc:
             # An executor that opted into scheduler candidates must fail closed
             # if it cannot accept a validated selection.
@@ -693,6 +908,27 @@ class SchedulerEngine:
     @staticmethod
     def _resource_set(spec) -> frozenset[Resource]:
         return frozenset(Resource(value) for value in spec.resources)
+
+    @staticmethod
+    def _result_failure_code(result) -> FailureCode | None:
+        code = getattr(result, "failure_code", None)
+        return code if isinstance(code, FailureCode) else None
+
+    @staticmethod
+    def _failure_code_label(code) -> str:
+        return "unknown" if code is None else str(code.value)
+
+    @staticmethod
+    def _recovery_factory_for(executor: TaskExecutor, spec) -> Any | None:
+        """Opt-in per-executor recovery actions; None means step re-entry.
+
+        Executors that provide finer-grained recovery motions expose a
+        ``build_recovery_action(name)`` callable returning an entered
+        stage action.  The default is the bounded L2 re-entry executed by
+        :class:`RecoverableStageAction` itself.
+        """
+        builder = getattr(executor, "build_recovery_action", None)
+        return builder if callable(builder) else None
 
     def _release_owner(self, owner: str) -> None:
         try:
@@ -860,6 +1096,12 @@ class SchedulerEngine:
             )
         if not isinstance(result.status, StageStatus):
             raise ValueError(f"executor returned invalid stage status {result.status!r}")
+        if result.failure_code is not None and not isinstance(
+            result.failure_code, FailureCode
+        ):
+            raise TypeError(
+                "StageResult failure_code must be a scheduler FailureCode value"
+            )
         if result.controls_arm and not self._arm_command_is_finite(result.arm_command):
             raise ValueError(
                 "ArmCommand must contain finite spine, 2 head, 6 left-arm, "

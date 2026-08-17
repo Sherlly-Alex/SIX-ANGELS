@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Protocol
 
 from control_types import ArmCommand
 
@@ -40,6 +41,7 @@ class StageStatus(Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
+    RETRYABLE_FAILURE = "retryable_failure"
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,14 @@ class StageResult:
     and ``base_angular_z`` is valid for this control cycle.  ``client_task.py``
     owns the ROS publisher.  When no command is supplied it publishes zero
     velocity as a safety fallback.
+
+    ``failure_code`` carries the structured ``scheduler.models.FailureCode``
+    when an executor opts into the v2 recovery bridge.  It is deliberately
+    typed as ``Any`` here: importing the scheduler package from this module
+    would create an import cycle (scheduler.engine imports executors.base).
+    The scheduler engine performs the real type validation at the
+    orchestration boundary; legacy/shadow controllers ignore the field, so
+    annotating a failure can never change legacy behaviour.
     """
 
     status: StageStatus
@@ -93,6 +103,11 @@ class StageResult:
     base_angular_z: float = 0.0
     controls_arm: bool = False
     arm_command: ArmCommand | None = None
+    failure_code: Any = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     @classmethod
     def running(
@@ -101,16 +116,18 @@ class StageResult:
         *,
         base_command: tuple[float, float] | None = None,
         arm_command: ArmCommand | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "StageResult":
         linear_x, angular_z = (0.0, 0.0) if base_command is None else base_command
         return cls(
-            StageStatus.RUNNING,
-            message,
-            base_command is not None,
-            float(linear_x),
-            float(angular_z),
-            arm_command is not None,
-            arm_command,
+            status=StageStatus.RUNNING,
+            message=message,
+            controls_base=base_command is not None,
+            base_linear_x=float(linear_x),
+            base_angular_z=float(angular_z),
+            controls_arm=arm_command is not None,
+            arm_command=arm_command,
+            metadata=metadata or {},
         )
 
     @classmethod
@@ -119,20 +136,28 @@ class StageResult:
         message: str = "",
         *,
         arm_command: ArmCommand | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "StageResult":
         return cls(
-            StageStatus.SUCCEEDED,
-            message,
-            False,
-            0.0,
-            0.0,
-            arm_command is not None,
-            arm_command,
+            status=StageStatus.SUCCEEDED,
+            message=message,
+            controls_arm=arm_command is not None,
+            arm_command=arm_command,
+            metadata=metadata or {},
         )
 
     @classmethod
-    def failed(cls, message: str) -> "StageResult":
-        return cls(StageStatus.FAILED, message, False, 0.0, 0.0)
+    def failed(
+        cls,
+        message: str,
+        *,
+        failure_code: Any = None,
+    ) -> "StageResult":
+        return cls(
+            status=StageStatus.FAILED,
+            message=message,
+            failure_code=failure_code,
+        )
 
     @classmethod
     def blocked(
@@ -140,16 +165,120 @@ class StageResult:
         message: str,
         *,
         arm_command: ArmCommand | None = None,
+        failure_code: Any = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "StageResult":
         return cls(
-            StageStatus.BLOCKED,
-            message,
-            False,
-            0.0,
-            0.0,
-            arm_command is not None,
-            arm_command,
+            status=StageStatus.BLOCKED,
+            message=message,
+            controls_arm=arm_command is not None,
+            arm_command=arm_command,
+            failure_code=failure_code,
+            metadata=metadata or {},
         )
+
+    @classmethod
+    def retryable_failure(
+        cls,
+        failure_code: Any,
+        message: str = "",
+        *,
+        arm_command: ArmCommand | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "StageResult":
+        """Structured, bounded-recoverable failure.
+
+        Legacy and shadow controllers treat this exactly like the historical
+        BLOCKED sites it replaces, so a newly annotated executor failure
+        cannot change the validated legacy trace.
+        """
+        return cls(
+            status=StageStatus.RETRYABLE_FAILURE,
+            message=message,
+            controls_arm=arm_command is not None,
+            arm_command=arm_command,
+            failure_code=failure_code,
+            metadata=metadata or {},
+        )
+
+    @classmethod
+    def fatal(
+        cls,
+        failure_code: Any,
+        message: str = "",
+        *,
+        arm_command: ArmCommand | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "StageResult":
+        """Hard safety failure that must end in SAFE_HOLD, never recovery.
+
+        The status stays BLOCKED so the legacy controller keeps its existing
+        safe-stop behaviour; the v2 engine reads the structured code and
+        escalates the same result to SAFE_HOLD.
+        """
+        return cls(
+            status=StageStatus.BLOCKED,
+            message=message,
+            controls_arm=arm_command is not None,
+            arm_command=arm_command,
+            failure_code=failure_code,
+            metadata=metadata or {},
+        )
+
+
+def apply_detection_epoch_decisions(
+    decisions: Mapping[str, str],
+    *,
+    reset: Callable[[list[str]], None],
+    log: Callable[[str], None],
+) -> list[str]:
+    """Apply one executor's detection-epoch policy without ROS imports.
+
+    Returns the colours that were reset.  Unknown actions are logged and
+    ignored so a malformed executor policy can never clear production
+    detection history.
+    """
+    reset_colors = []
+    for color, action in decisions.items():
+        color = str(color).strip().lower()
+        if not color:
+            continue
+        if action == "reset":
+            reset_colors.append(color)
+        elif action == "keep":
+            log(f"task detection epoch retains {color} RGB-D history")
+        else:
+            log(
+                f"invalid detection epoch action {action!r} for {color!r}; ignored"
+            )
+    if reset_colors:
+        reset(sorted(set(reset_colors)))
+    return reset_colors
+
+
+def resolve_executor_for_task_index(
+    executors: Mapping[int, Any],
+    instructions: list[Mapping[str, Any]],
+    task_index: int,
+) -> Any:
+    """Resolve the active executor through the instruction's formal task id.
+
+    Controller ``task_index`` is zero-based while executor dictionaries are
+    keyed by Server task ids (1/2/3).  Keeping that conversion here makes the
+    ROS client testable without importing rclpy and prevents index/id mixups.
+    """
+    index = int(task_index)
+    if index < 0 or index >= len(instructions):
+        raise IndexError(f"task index {index} is outside configured instructions")
+    instruction = instructions[index]
+    try:
+        task_id = int(instruction["task"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("active instruction has no valid task id") from exc
+    try:
+        return executors[task_id]
+    except KeyError as exc:
+        raise KeyError(f"no executor configured for task id {task_id}") from exc
 
 
 class TaskExecutor(Protocol):

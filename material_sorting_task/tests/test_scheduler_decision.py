@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -8,6 +9,7 @@ import tempfile
 from competition_controller import CompetitionController
 from executors import build_task_executors
 from executors.base import ExecutionContext, StageResult, TargetObservation
+from executors.scheduler_candidate import CandidateApplicationStatus
 from scheduler.candidate_generator import CandidateAction
 from scheduler.decision import DecisionConfig, SchedulerDecisionService
 from scheduler.events import EventLog, MemoryEventSink
@@ -244,6 +246,7 @@ class SchedulerDecisionTests(unittest.TestCase):
 
             def __init__(self):
                 self.selected = []
+                self.call_order = []
 
             def reset(self):
                 pass
@@ -252,6 +255,7 @@ class SchedulerDecisionTests(unittest.TestCase):
                 pass
 
             def tick(self, stage, execution_context):
+                self.call_order.append("tick")
                 return StageResult.running("active")
 
             def cancel(self, reason):
@@ -259,9 +263,92 @@ class SchedulerDecisionTests(unittest.TestCase):
 
             def apply_scheduler_candidate(self, selected, outcome, context):
                 self.selected.append(selected.action_id)
+                self.call_order.append("apply")
+                return CandidateApplicationStatus.APPLIED
 
         class Provider:
             def build(self, context, spec):
+                return SimpleNamespace(
+                    candidates=(candidate("chosen", 1.0),),
+                    start_pose=None,
+                    costmap=None,
+                    constraints=None,
+                    footprint_mode="transit_stowed",
+                    world_state={},
+                )
+
+        tasks = [
+            {"task": task_id, "target_color": color, "place_world": [0, 0, 0]}
+            for task_id, color in ((1, "pink"), (2, "yellow"), (3, "brown"))
+        ]
+        hook = HookExecutor()
+        sink = MemoryEventSink()
+        executors = build_task_executors("stub")
+        executors[1] = hook
+        service = SchedulerDecisionService()
+        controller = CompetitionController(
+            executors,
+            referee_driven=False,
+            scheduler_mode="v2",
+            decision_service=service,
+            candidate_provider=Provider(),
+            event_sink=EventLog([sink]),
+        )
+        controller.configure(tasks)
+        controller.set_inputs_ready(True)
+        context = ExecutionContext(
+            now_s=1.0,
+            instruction=tasks[0],
+            task_index=0,
+            attempt=1,
+        )
+        controller.tick(context)
+        controller.tick(context)
+        controller.tick(context)
+        controller._backend._decision_future.result(timeout=1.0)
+        controller.tick(context)
+
+        self.assertEqual(hook.selected, ["chosen"])
+        self.assertEqual(hook.call_order[:2], ["apply", "tick"])
+        self.assertEqual(controller._backend.last_candidate_application, "applied")
+        applications = [
+            event for event in sink.events if event.type == "candidate_application"
+        ]
+        self.assertEqual(len(applications), 1)
+        self.assertEqual(applications[0].details["application_status"], "applied")
+        controller.close()
+
+    def test_initial_candidate_wait_is_nonblocking_and_strictly_bounded(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        class HookExecutor:
+            task_id = 1
+            name = "bounded-wait"
+
+            def __init__(self):
+                self.tick_count = 0
+
+            def reset(self):
+                pass
+
+            def enter_stage(self, stage, execution_context):
+                pass
+
+            def tick(self, stage, execution_context):
+                self.tick_count += 1
+                return StageResult.running("active")
+
+            def cancel(self, reason):
+                pass
+
+            def apply_scheduler_candidate(self, selected, outcome, context):
+                return CandidateApplicationStatus.APPLIED
+
+        class DelayedProvider:
+            def build(self, context, spec, **kwargs):
+                started.set()
+                release.wait(timeout=1.0)
                 return SimpleNamespace(
                     candidates=(candidate("chosen", 1.0),),
                     start_pose=None,
@@ -284,24 +371,35 @@ class SchedulerDecisionTests(unittest.TestCase):
             referee_driven=False,
             scheduler_mode="v2",
             decision_service=service,
-            candidate_provider=Provider(),
+            candidate_provider=DelayedProvider(),
+            candidate_initial_wait_s=0.10,
         )
         controller.configure(tasks)
         controller.set_inputs_ready(True)
-        context = ExecutionContext(
-            now_s=1.0,
-            instruction=tasks[0],
-            task_index=0,
-            attempt=1,
-        )
-        controller.tick(context)
-        controller.tick(context)
-        controller.tick(context)
-        controller._backend._decision_future.result(timeout=1.0)
-        controller.tick(context)
 
-        self.assertEqual(hook.selected, ["chosen"])
-        controller.close()
+        def context(now_s):
+            return ExecutionContext(
+                now_s=now_s,
+                instruction=tasks[0],
+                task_index=0,
+                attempt=1,
+            )
+
+        try:
+            controller.tick(context(0.0))
+            controller.tick(context(0.0))
+            controller.tick(context(0.0))
+            self.assertTrue(started.wait(timeout=1.0))
+
+            waiting = controller.tick(context(0.05))
+            self.assertEqual(hook.tick_count, 0)
+            self.assertIn("waiting up to", waiting.message)
+
+            controller.tick(context(0.11))
+            self.assertEqual(hook.tick_count, 1)
+        finally:
+            release.set()
+            controller.close()
 
 
 if __name__ == "__main__":

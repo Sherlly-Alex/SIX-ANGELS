@@ -24,13 +24,19 @@ from executors.base import (
     TaskStage,
 )
 from executors.task1 import Task1LiftExecutor
+from executors.scheduler_candidate import (
+    CandidateApplicationStatus,
+    CandidateStandPolicy,
+    candidate_goal_pose,
+    validate_scheduler_stand,
+)
 from executors.transfer_support import (
     TransferMotion,
     odometry_pose,
     stand_from_held_center,
     world_to_base,
 )
-from navigation.carried_envelope import CarriedEnvelopeChecker
+from navigation.carried_envelope import CarriedEnvelopeChecker, HeldObjectGeometry
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from navigation.robot_geometry import FootprintMode
 from shelf.manipulation import (
@@ -103,6 +109,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     PREGRASP_TIMEOUT_S = 75.0
     SHELF_YAW = math.pi
     TABLE_YAW = math.pi / 2.0
+    # Shared validated end-zone stand for RETURN_TO_END scheduler candidates.
+    END_ZONE_STAND = (-0.70, 0.55, TABLE_YAW)
     # The held shelf box is still roughly 0.75 m in front of the base.  A
     # 0.32 m retreat left its centre only about 0.15 m outside the shelf
     # front, so the subsequent turn swept the box/arms into the shelf.  Back
@@ -154,6 +162,11 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide: float | None = None
+        # Validated scheduler stand overrides, consumed only by the
+        # matching navigation segment of this executor.
+        self._scheduler_pick_stand: tuple[float, float] | None = None
+        self._scheduler_end_stand: tuple[float, float] | None = None
+        self._measured_carry_guard_enabled = False
 
     def reset(self) -> None:
         super().reset()
@@ -175,6 +188,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide = None
+        self._scheduler_pick_stand = None
+        self._scheduler_end_stand = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -288,6 +303,104 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._arm_retract.reset()
         self._pregrasp.reset()
 
+    def scheduler_nominal_goal(
+        self,
+        stage: TaskStage,
+        context: ExecutionContext,
+    ) -> tuple[float, float, float] | None:
+        """Read-only v2 hook: the stand the provider offsets candidates from.
+
+        Task 2 transport is a validated segmented reverse/turn/advance
+        route without a single replan-able stand, so it declares no
+        nominal goal and keeps audit-only behaviour there.
+        """
+        if stage is TaskStage.NAVIGATE_TO_PICK:
+            try:
+                _target_color, center = self._task2_target(context)
+            except RuntimeError:
+                return None
+            return (
+                self.SHELF_PICK_APPROACH_X,
+                max(0.58, min(0.98, float(center[1]))),
+                self.SHELF_YAW,
+            )
+        if stage is TaskStage.RETURN_TO_END:
+            return self.END_ZONE_STAND
+        return None
+
+    def apply_scheduler_candidate(
+        self, selected, outcome, context
+    ) -> CandidateApplicationStatus:
+        """Opt-in v2 hook: shelf observation/pick stand and end-zone stand.
+
+        The far shelf stand is switchable only before its A* goal is
+        committed; the end-zone stand only before the end navigation
+        segment starts.  All other stages, including the segmented
+        transport route, stay audit-only: the scheduler may rank them but
+        it can never change their validated motion.
+        """
+        del outcome
+        if self.active_stage is TaskStage.NAVIGATE_TO_PICK:
+            if self._motion_started:
+                return CandidateApplicationStatus.TOO_LATE
+            nominal = self.scheduler_nominal_goal(
+                TaskStage.NAVIGATE_TO_PICK, context
+            )
+            if nominal is None:
+                return CandidateApplicationStatus.AUDIT_ONLY
+            x, y, yaw = candidate_goal_pose(selected)
+            if abs(_wrap_angle(yaw - nominal[2])) > 0.06:
+                raise ValueError(
+                    "executor rejected a shelf stand with a changed heading"
+                )
+            self._scheduler_pick_stand = validate_scheduler_stand(
+                (x, y),
+                nominal,
+                self._transfer.navigation_grid,
+                FootprintMode.TRANSIT_STOWED,
+                policy=CandidateStandPolicy(),
+            )
+            return CandidateApplicationStatus.APPLIED
+        if self.active_stage is TaskStage.RETURN_TO_END:
+            if self._phase == "navigate_end" and self._motion_started:
+                return CandidateApplicationStatus.TOO_LATE
+            nominal = self.END_ZONE_STAND
+            x, y, yaw = candidate_goal_pose(selected)
+            if abs(_wrap_angle(yaw - nominal[2])) > 0.07:
+                raise ValueError(
+                    "executor rejected an end-zone stand with a changed heading"
+                )
+            self._scheduler_end_stand = validate_scheduler_stand(
+                (x, y),
+                nominal,
+                self._transfer.navigation_grid,
+                FootprintMode.TRANSIT_STOWED,
+                policy=CandidateStandPolicy(),
+            )
+            return CandidateApplicationStatus.APPLIED
+        return CandidateApplicationStatus.AUDIT_ONLY
+
+    def detection_epoch_policy(
+        self,
+        task_index: int,
+        attempt: int,
+        stage: TaskStage,
+        instruction: "dict[str, object]",
+    ) -> "dict[str, str]":
+        """Request a fresh RGB-D window when task 2 starts its arm staging.
+
+        Task 1 and the early task-2 navigation share one detector stream;
+        without this epoch boundary the seven-sample client median can
+        combine old table/shelf-edge frames with the final shelf view.
+        """
+        del task_index, attempt
+        if stage is not TaskStage.ALIGN_FOR_PICK:
+            return {}
+        color = str(instruction.get("target_color", "")).strip().lower()
+        if not color:
+            return {}
+        return {color: "reset"}
+
     def _task2_target(self, context: ExecutionContext) -> tuple[str, tuple[float, float, float]]:
         state = self._memory.require_shelf_state()
         target_color = str(context.instruction.get("target_color", "")).strip().lower()
@@ -307,15 +420,23 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         except RuntimeError as exc:
             return StageResult.blocked(str(exc))
         if not self._motion_started:
+            stand_xy = self._scheduler_pick_stand or (
+                self.SHELF_PICK_APPROACH_X,
+                max(0.58, min(0.98, center[1])),
+            )
             goal = NavigationGoal(
-                x=self.SHELF_PICK_APPROACH_X,
-                y=max(0.58, min(0.98, center[1])),
+                x=float(stand_xy[0]),
+                y=float(stand_xy[1]),
                 yaw=self.SHELF_YAW,
                 position_tolerance=0.06,
                 yaw_tolerance=0.06,
                 safety_radius=0.0,
                 segment=NavigationSegment.NAV_SHELF,
-                source_tag="task1_shelf_state",
+                source_tag=(
+                    "scheduler_shelf_pick_stand"
+                    if self._scheduler_pick_stand is not None
+                    else "task1_shelf_state"
+                ),
             )
             if not self._transfer.begin_navigation(
                 goal,
@@ -1139,6 +1260,26 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             arm_command=self._held_arm_command,
         )
 
+    def held_object_geometry(self, context: ExecutionContext) -> HeldObjectGeometry | None:
+        """Read-only opt-in hook: measured held-box envelope for costmap scoring."""
+        del context
+        if not self._measured_carry_guard_enabled:
+            return None
+        if self._held_center_base is None:
+            return None
+        try:
+            half = self._held_half_width()
+        except RuntimeError:
+            return None
+        try:
+            return HeldObjectGeometry(self._held_center_base, half, source="task2")
+        except (TypeError, ValueError):
+            return None
+
+    def set_measured_carry_guard(self, enabled: bool) -> None:
+        """Enable V2 measured geometry without altering legacy transport."""
+        self._measured_carry_guard_enabled = bool(enabled)
+
     def _held_half_width(self) -> float:
         half_width = self._contact.half_width
         if half_width is None or not math.isfinite(float(half_width)):
@@ -1556,15 +1697,20 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
 
         if self._phase == "navigate_end":
             if not self._motion_started:
+                end_xy = self._scheduler_end_stand or self.END_ZONE_STAND[:2]
                 goal = NavigationGoal(
-                    x=-0.70,
-                    y=0.55,
-                    yaw=self.TABLE_YAW,
+                    x=float(end_xy[0]),
+                    y=float(end_xy[1]),
+                    yaw=self.END_ZONE_STAND[2],
                     position_tolerance=0.08,
                     yaw_tolerance=0.07,
                     safety_radius=0.0,
                     segment=NavigationSegment.NAV_END,
-                    source_tag="layout_end_zone_center",
+                    source_tag=(
+                        "scheduler_end_stand"
+                        if self._scheduler_end_stand is not None
+                        else "layout_end_zone_center"
+                    ),
                 )
                 if not self._transfer.begin_navigation(
                     goal,

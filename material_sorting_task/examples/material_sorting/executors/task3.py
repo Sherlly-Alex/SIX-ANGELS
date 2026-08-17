@@ -636,6 +636,28 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         # placement radius.
         self._place_world = release_target
 
+    def detection_epoch_policy(
+        self,
+        task_index: int,
+        attempt: int,
+        stage: TaskStage,
+        instruction: "dict[str, object]",
+    ) -> "dict[str, str]":
+        """Deliberately retain the pre-task RGB-D history for the top box.
+
+        The task-3 target stays in the scene while tasks 1 and 2 run, so
+        its rolling median is useful as soon as the robot turns back
+        toward the table.  Unlike task 2's shelf target, this policy
+        declares "keep": the client logs the epoch but never clears it.
+        """
+        del task_index, attempt
+        if stage not in {TaskStage.NAVIGATE_TO_PICK, TaskStage.ACQUIRE_TARGET}:
+            return {}
+        color = str(instruction.get("target_color", "")).strip().lower()
+        if not color:
+            return {}
+        return {color: "keep"}
+
     def _tick_task3_transport(self, context: ExecutionContext) -> StageResult:
         if self._held_arm_command is None or self._held_center_base is None:
             return StageResult.blocked("task 3 transport has no stable held-object state")
@@ -794,6 +816,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 footprint_mode=FootprintMode.TRANSIT_CARRY,
                 observations=context.target_observations,
                 exclude_color=str(context.instruction.get("target_color", "")),
+                held_geometry=self.held_object_geometry(context),
             ):
                 return StageResult.blocked(
                     f"task 3 could not plan a collision-free route while {action}",

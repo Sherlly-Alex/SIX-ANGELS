@@ -29,7 +29,13 @@ from competition_controller import (
     ExecutionContext,
 )
 from executors import build_task_executors
-from executors.base import ArmCommand, TargetObservation, TaskStage
+from executors.base import (
+    ArmCommand,
+    TargetObservation,
+    TaskStage,
+    apply_detection_epoch_decisions,
+    resolve_executor_for_task_index,
+)
 from desktop_grasp.target_metadata import dominant_orientation, infer_box_orientation
 from instruction_parser import (
     InstructionParseError,
@@ -88,8 +94,7 @@ class CompetitionClient(Node):
         self._last_shadow_divergence_count = 0
         self._last_scheduler_action_id: str | None = None
         self._invalid_hold_command_logged = False
-        self._last_task2_detection_reset_key: tuple[int, int, str] | None = None
-        self._last_task3_detection_reset_key: tuple[int, int, str] | None = None
+        self._last_detection_epoch_keys: dict[int, tuple] = {}
 
         self.execution_mode = (
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
@@ -100,6 +105,16 @@ class CompetitionClient(Node):
         self.scheduler_policy = (
             os.environ.get("MATERIAL_SCHEDULER_POLICY", "heuristic").strip().lower()
         )
+        carry_guard_value = os.environ.get(
+            "MATERIAL_MEASURED_CARRY_GUARD", "0"
+        ).strip().lower()
+        if carry_guard_value not in {"0", "1", "false", "true", "no", "yes"}:
+            self.get_logger().error(
+                "invalid MATERIAL_MEASURED_CARRY_GUARD="
+                f"{carry_guard_value!r}; defaulting to disabled"
+            )
+            carry_guard_value = "0"
+        carry_guard_requested = carry_guard_value in {"1", "true", "yes"}
         if self.scheduler_policy not in {"heuristic", "rl_shadow", "rl_guarded"}:
             invalid_policy = self.scheduler_policy
             self.scheduler_policy = "heuristic"
@@ -125,6 +140,7 @@ class CompetitionClient(Node):
         decision_service = None
         candidate_provider = None
         decision_period_s = 0.25
+        candidate_initial_wait_s = 0.10
         event_log_path = os.environ.get("MATERIAL_SCHEDULER_EVENT_LOG", "").strip()
         if event_log_path:
             try:
@@ -154,6 +170,9 @@ class CompetitionClient(Node):
 
                 decision_period_s = float(
                     os.environ.get("MATERIAL_POLICY_REEVALUATE_PERIOD_S", "0.25")
+                )
+                candidate_initial_wait_s = float(
+                    os.environ.get("MATERIAL_CANDIDATE_INITIAL_WAIT_S", "0.10")
                 )
                 switch_margin = float(
                     os.environ.get("MATERIAL_POLICY_SWITCH_MARGIN", "0.25")
@@ -216,6 +235,7 @@ class CompetitionClient(Node):
                 decision_service=decision_service,
                 candidate_provider=candidate_provider,
                 decision_period_s=decision_period_s,
+                candidate_initial_wait_s=candidate_initial_wait_s,
             )
         except ValueError as exc:
             self.scheduler_mode = "legacy"
@@ -226,6 +246,18 @@ class CompetitionClient(Node):
             )
             self.get_logger().error(
                 f"invalid scheduler configuration ({exc}); falling back to legacy"
+            )
+        self.measured_carry_guard_enabled = bool(
+            carry_guard_requested and self.scheduler_mode == "v2"
+        )
+        for executor in executors.values():
+            configure_guard = getattr(executor, "set_measured_carry_guard", None)
+            if callable(configure_guard):
+                configure_guard(self.measured_carry_guard_enabled)
+        if carry_guard_requested and not self.measured_carry_guard_enabled:
+            self.get_logger().warning(
+                "MATERIAL_MEASURED_CARRY_GUARD is ignored outside scheduler v2; "
+                "legacy/shadow retain the validated physical path"
             )
         self.semantic_audit = SemanticAudit(self.get_logger().info)
 
@@ -290,7 +322,8 @@ class CompetitionClient(Node):
         )
         self.get_logger().info(
             f"scheduler_policy={self.scheduler_policy}; "
-            f"event_log={event_log_path or 'disabled'}"
+            f"event_log={event_log_path or 'disabled'}; "
+            f"measured_carry_guard={self.measured_carry_guard_enabled}"
         )
         if self.scheduler_mode == "shadow":
             self.get_logger().info(
@@ -375,8 +408,7 @@ class CompetitionClient(Node):
 
         self.instructions = instructions
         if instructions_changed:
-            self._last_task2_detection_reset_key = None
-            self._last_task3_detection_reset_key = None
+            self._last_detection_epoch_keys.clear()
             self.get_logger().info(
                 "instructions accepted: "
                 + ", ".join(
@@ -534,62 +566,61 @@ class CompetitionClient(Node):
             self._target_quality_histories.pop(color, None)
             self.target_observations.pop(color, None)
 
-    def _refresh_task2_detection_epoch(self) -> None:
-        """Clear the target colour once when task 2 starts its arm staging.
+    def _refresh_detection_epochs(self) -> None:
+        """Apply the active executor's opt-in detection-epoch policy.
 
-        Task 1 and the early task-2 navigation intentionally share the same
-        detector stream.  Without an epoch boundary, the seven-sample client
-        median can combine old table/shelf-edge frames with the final shelf
-        view, making a biased but apparently stable centre.
+        Detection history lives on the client, but the epoch-boundary
+        decision belongs to the executor lifecycle: task 2 requests a
+        fresh RGB-D window at its arm staging, task 3 deliberately retains
+        the pre-task history for its top box.  No task number special case
+        remains in this file, and a malformed policy can never clear
+        production detection history.
         """
-
-        if self.controller.task_index != 1 or self.controller.stage is not TaskStage.ALIGN_FOR_PICK:
+        task_index = self.controller.task_index
+        if task_index < 0 or task_index >= len(self.instructions):
             return
-        target_color = (
-            str(self.instructions[1].get("target_color", "")).strip().lower()
-            if len(self.instructions) > 1
-            else ""
+        stage = self.controller.stage
+        if stage is None:
+            return
+        try:
+            executor = resolve_executor_for_task_index(
+                self.controller.executors,
+                self.instructions,
+                task_index,
+            )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return
+        policy = getattr(executor, "detection_epoch_policy", None)
+        if not callable(policy):
+            return
+        instruction = self.instructions[task_index]
+        try:
+            decisions = dict(
+                policy(
+                    int(task_index),
+                    int(self.controller.attempt),
+                    stage,
+                    instruction,
+                )
+            )
+        except Exception as exc:
+            self.get_logger().error(f"detection epoch policy failed: {exc}")
+            return
+        if not decisions:
+            return
+        key = (
+            int(self.controller.attempt),
+            tuple(
+                sorted((str(color), str(action)) for color, action in decisions.items())
+            ),
         )
-        if not target_color:
+        if self._last_detection_epoch_keys.get(task_index) == key:
             return
-        key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
-        if key == self._last_task2_detection_reset_key:
-            return
-        self._reset_target_histories([target_color])
-        self._last_task2_detection_reset_key = key
-        self.get_logger().info(
-            f"task 2 detection epoch reset for {target_color}; waiting for fresh RGB-D frames"
-        )
-
-    def _refresh_task3_detection_epoch(self) -> None:
-        """Mark task 3 start without discarding its target observations.
-
-        The task-3 top box stays in the scene while tasks 1 and 2 run.  Its
-        rolling RGB-D median is therefore useful as soon as the robot turns
-        back toward the table.  Unlike task 2's shelf target, do not clear
-        this colour at the task boundary; the task-3 executor keeps fusing
-        the retained observation and any newer frames.
-        """
-
-        if self.controller.task_index != 2 or self.controller.stage not in {
-            TaskStage.NAVIGATE_TO_PICK,
-            TaskStage.ACQUIRE_TARGET,
-        }:
-            return
-        target_color = (
-            str(self.instructions[2].get("target_color", "")).strip().lower()
-            if len(self.instructions) > 2
-            else ""
-        )
-        if not target_color:
-            return
-        key = (int(self.controller.task_index), int(self.controller.attempt), target_color)
-        if key == self._last_task3_detection_reset_key:
-            return
-        self._last_task3_detection_reset_key = key
-        self.get_logger().info(
-            f"task 3 retaining existing {target_color} RGB-D history; "
-            "continuing centre tracking from navigation"
+        self._last_detection_epoch_keys[task_index] = key
+        apply_detection_epoch_decisions(
+            decisions,
+            reset=self._reset_target_histories,
+            log=self.get_logger().info,
         )
 
     def _publish_base_command(self, linear_x: float, angular_z: float) -> None:
@@ -739,8 +770,7 @@ class CompetitionClient(Node):
                         self._invalid_hold_command_logged = True
             return
 
-        self._refresh_task2_detection_epoch()
-        self._refresh_task3_detection_epoch()
+        self._refresh_detection_epochs()
         missing = self._missing_inputs()
         self.controller.set_inputs_ready(not missing)
         if missing:

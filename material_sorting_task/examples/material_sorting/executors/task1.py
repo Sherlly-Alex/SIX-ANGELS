@@ -41,6 +41,8 @@ from navigation.navigation_types import (
 )
 from navigation.occupancy_grid import build_layered_scene_grid
 from navigation.robot_geometry import FootprintMode
+from scheduler.models import FailureCode
+from executors.scheduler_candidate import CandidateApplicationStatus
 
 
 class Task1Executor(PlaceholderTaskExecutor):
@@ -167,8 +169,9 @@ class Task1NavigationExecutor:
                     detail=f"latest observation is {age_s:.2f}s old",
                 )
             if not all(math.isfinite(v) for v in observation.position_world):
-                return StageResult.blocked(
-                    f"task 1 target observation for {target_color!r} is non-finite"
+                return StageResult.retryable_failure(
+                    FailureCode.TARGET_LOST,
+                    f"task 1 target observation for {target_color!r} is non-finite",
                 )
             calibrated_target = self._calibrated_table_source(
                 observation.position_world
@@ -212,9 +215,10 @@ class Task1NavigationExecutor:
             if hasattr(self._navigation, "set_footprint_mode"):
                 self._navigation.set_footprint_mode(FootprintMode.TRANSIT_STOWED)
             if not self._navigation.set_goal(self._goal, robot_x, robot_y):
-                return StageResult.blocked(
+                return StageResult.retryable_failure(
+                    FailureCode.NAV_NO_PATH,
                     "task 1 could not plan a collision-free path to "
-                    f"({self._goal.x:.2f}, {self._goal.y:.2f})"
+                    f"({self._goal.x:.2f}, {self._goal.y:.2f})",
                 )
 
         dt = self._control_dt(context.now_s)
@@ -232,8 +236,9 @@ class Task1NavigationExecutor:
                 f"stopping before arm motion; {goal_reached_event(self._goal)}"
             )
         if status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-            return StageResult.blocked(
-                f"task 1 navigation stopped safely with status={status.value}"
+            return StageResult.retryable_failure(
+                FailureCode.NAV_STUCK,
+                f"task 1 navigation stopped safely with status={status.value}",
             )
         telemetry = (
             format_nav_telemetry(self._navigation.telemetry, phase="task1_pick")
@@ -251,7 +256,9 @@ class Task1NavigationExecutor:
         self.active_stage = None
         self._last_tick_s = None
 
-    def apply_scheduler_candidate(self, selected, outcome, context) -> None:
+    def apply_scheduler_candidate(
+        self, selected, outcome, context
+    ) -> CandidateApplicationStatus:
         """Opt-in scheduler hook: switch the active nav goal to a ranked stand.
 
         The v2 engine only offers candidates that already passed its own hard
@@ -266,10 +273,12 @@ class Task1NavigationExecutor:
         executor keeps its deterministic calibrated stand.
         """
         if self.active_stage is not TaskStage.NAVIGATE_TO_PICK:
-            raise RuntimeError(
-                "task 1 scheduler candidates only apply during "
-                f"navigate_to_pick; active_stage={self.active_stage}"
-            )
+            # Unsupported stages are audit-only pass-through: this base
+            # executor owns exactly the NAVIGATE_TO_PICK stand.  Later
+            # integrated executors override this method for transport and
+            # return stages.  Offers only arrive during navigation stages,
+            # so ignoring them here can never mask a real rejection.
+            return CandidateApplicationStatus.AUDIT_ONLY
         candidate = getattr(selected, "candidate", selected)
         if candidate is None or not bool(getattr(candidate, "is_navigation", False)):
             raise ValueError("task 1 rejected a non-navigation scheduler candidate")
@@ -367,6 +376,29 @@ class Task1NavigationExecutor:
             self._locked_target_world = (target_x, target_y, target_z)
             self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
         self._goal = goal
+        return CandidateApplicationStatus.APPLIED
+
+    def scheduler_nominal_goal(
+        self,
+        stage: TaskStage,
+        context: ExecutionContext,
+    ) -> tuple[float, float, float] | None:
+        """Read-only v2 hook: the stand the provider offsets candidates from.
+
+        Prefer the already-planned goal; before planning, derive the same
+        calibrated table-side stand the executor itself will use.
+        """
+        if stage is not TaskStage.NAVIGATE_TO_PICK:
+            return None
+        if self._goal is not None:
+            return (self._goal.x, self._goal.y, self._goal.yaw)
+        try:
+            target_x, target_y, _target_z = self._require_calibrated_target(
+                context
+            )
+        except RuntimeError:
+            return None
+        return (target_x, target_y - self.TABLE_STANDOFF_M, math.pi / 2.0)
 
     def _require_calibrated_target(
         self,
@@ -438,8 +470,9 @@ class Task1NavigationExecutor:
     ) -> StageResult:
         waited_s = max(0.0, float(context.now_s) - self._stage_started_s)
         if waited_s >= self.TARGET_WAIT_TIMEOUT_S:
-            return StageResult.blocked(
-                f"task 1 timed out waiting for {target_color!r} detection: {detail}"
+            return StageResult.retryable_failure(
+                FailureCode.TARGET_LOST,
+                f"task 1 timed out waiting for {target_color!r} detection: {detail}",
             )
         return StageResult.running(
             f"task 1 waiting for {target_color!r} detection: {detail}"

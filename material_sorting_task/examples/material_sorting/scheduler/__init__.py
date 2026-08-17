@@ -29,6 +29,7 @@ from .models import (
 )
 from .recovery import (
     DEFAULT_RECOVERY_POLICIES,
+    FATAL_SAFETY_FAILURE_CODES,
     RecoverableStep,
     RecoveryClassifier,
     RecoveryDecision,
@@ -63,6 +64,7 @@ __all__ = [
     "DecisionOutcome",
     "DEFAULT_RECOVERY_POLICIES",
     "EventLog",
+    "FATAL_SAFETY_FAILURE_CODES",
     "EventSink",
     "EventType",
     "EngineSnapshot",

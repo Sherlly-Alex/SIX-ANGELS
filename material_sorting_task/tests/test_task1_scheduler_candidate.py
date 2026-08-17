@@ -197,9 +197,10 @@ class Task1SchedulerCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-navigation"):
             executor.apply_scheduler_candidate(selected, outcome, initial)
 
-    def test_rejects_candidate_when_stage_is_not_navigate(self) -> None:
+    def test_unsupported_stage_is_audit_only_pass_through(self) -> None:
         executor, initial = self._entered_executor()
         executor.enter_stage(TaskStage.ACQUIRE_TARGET, initial)
+        goal_before = executor.goal
         candidate = self.generator.generate(
             (-1.0, 1.55, math.pi / 2.0),
             task_id=1,
@@ -207,8 +208,11 @@ class Task1SchedulerCandidateTests(unittest.TestCase):
         )[0]
         selected, outcome = self._selection(executor, candidate)
 
-        with self.assertRaisesRegex(RuntimeError, "navigate_to_pick"):
-            executor.apply_scheduler_candidate(selected, outcome, initial)
+        # Unsupported stages are audit-only: the offer must neither raise
+        # nor alter the executor goal.  Integrated subclasses override the
+        # hook for the transport and return stages they actually own.
+        executor.apply_scheduler_candidate(selected, outcome, initial)
+        self.assertEqual(executor.goal, goal_before)
 
     def test_rejects_candidate_when_target_is_not_calibratable(self) -> None:
         executor, initial = self._entered_executor(now_s=0.0)

@@ -14,12 +14,12 @@
 - 正式执行入口：`material_sorting_task/examples/material_sorting/client_task.py`
 - 正式三任务模式：`MATERIAL_EXECUTION_MODE=task123_full`
 
-### 2026-08-13 实施状态
+### 2026-08-17 远程验收前实施状态
 
-本工作区已完成计划中的可离线验证内核。2026-08-13 最终审查结果为
-`371 passed, 5 skipped, 1 warning`；正式 `unittest` 为 `220 tests OK`，
-`scripts/check_workspace.py` 也通过。这里的“完成”只指纯 Python 内核与兼容接入，
-不代表 ROS/Server 联调、仿真性能和实机安全验收已经完成。已落地：
+当前本地基线为 `f70861b`（语义解析与 Scheduler V2 集成提交），本轮未提交改动在该基线上
+完成了远程验收前的代码审查与修复。离线最终回归见 §18.3；这里的“完成”只指纯 Python
+内核、兼容接入和故障注入，不代表 ROS/Server 联调、仿真性能和实机安全验收已经完成。
+已落地：
 
 - `legacy / shadow / v2` 三模式 facade；默认仍为 `legacy`，非法值自动回退。
 - 三个独立 TaskPlan 实例（当前仍复用同一十阶段拓扑）；Task 3 终局清理由
@@ -27,8 +27,8 @@
 - `SchedulerEngine` 非阻塞执行、裁判同步、结构化事件、资源原子租约、命令校验、底盘
   150 ms lease、安全主管和重复裁判失配闭锁。
 - `WorldCostmap` 版本快照、动态障碍 TTL/置信度、现有 A*/footprint/携物包络复用。
-- 中心/左右偏站位候选、硬过滤、确定性 Multi-Critic、动作保持与切换滞回；有限恢复
-  候选与 `RecoverableStep` 已有独立内核和测试，但尚未接入当前 Executor 主执行路径。
+- 中心/左右偏站位候选、硬过滤、确定性 Multi-Critic、动作保持与切换滞回；结构化失败已通过
+  `RecoverableStageAction` 接入 V2 主执行路径，并按 Step 可逆性与恢复预算 fail-closed。
 - 后台单线程、最高 4 Hz 的导航候选重评估，不阻塞 20 Hz 控制 tick。
 - 固定离散宏动作、action mask、观测 schema、奖励去重、Gymnasium 兼容环境、域随机化、
   MaskablePPO 延迟加载接口。
@@ -36,25 +36,33 @@
 - 正式语义 JSON 严格准入和 Regex/ML/SLM 只读审计旁路已经合并进同一工作区。
 - 完整 ArmCommand 被视为持续位置保持；所有可能继续发布该命令的阶段（包括
   `NAVIGATE_TO_PICK`）均持有完整机械臂资源，阶段间由持久 hold lease 接管，关闭时释放。
-- Task 1 导航执行器已实现 `apply_scheduler_candidate(...)` opt-in hook：候选必须通过
+- Task 1/2/3 的可重规划导航段已实现 `apply_scheduler_candidate(...)` opt-in hook：候选必须通过
   站位走廊（横向 ≤0.15 m、纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
-  `NavigationController` 实际重规划四道校验，任一失败 fail-closed；未接 hook 的执行器
-  继续使用已验证固定站位，`legacy/shadow` 行为不变。
+  `NavigationController` 实际重规划四道校验，任一失败 fail-closed。应用结果明确记录为
+  `applied / audit_only / too_late`；Task 2 分段 transport 保持 `audit_only`。
+- 首个导航候选提供 100 ms 可配置、有上限且不阻塞 ROS tick 的等待窗，消除后台决策线程
+  恰好错过第一个 20 Hz tick 时的静默失效；超过窗口立即执行既有确定性轨迹。
+- detection epoch 通过正式 instruction 的 `task` id 解析执行器，已修复 0-based `task_index`
+  被误当作 1/2/3 执行器 key 的问题。
+- fatal safety code 和非法 failure code 不再被恢复包装层转换成普通恢复耗尽；前者直接
+  SAFE_HOLD，后者到达引擎类型校验边界后 SAFE_HOLD。
 
 当前明确保留的上线闸门：
 
-- 代价地图/RL 已实时计算和记录“哪个有限宏动作效用最高”，Task 1 `nav_only` 导航执行器
-  已声明 `apply_scheduler_candidate(...)` opt-in hook（仅中心/左右站位切换，不改写
-  抓取/放置轨迹）；Task 2 货架观察/抓取站位、Task 1/2/3 transport、Return-to-End 的
-  hook 仍未开放。
+- 代价地图/RL 已实时计算和记录“哪个有限宏动作效用最高”；Task 1/2/3 的可重规划站位
+  hook 已在代码层开放，但不改写抓取/放置轨迹，且尚未获得实机放行。
 - 正式实动继续使用 `legacy`；先运行 `shadow`，再运行 `v2 + dry_run`，最后按 Task/Step
   为具体 Executor 接入 hook 并完成官方 4090 镜像逐段标定。
 - `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；无批准模型时始终回退
   `HeuristicPolicy`，且项目不下载任何权重。
-- transport 当前使用保守的 `TRANSIT_CARRY` 机器人包络，但实测物体中心/半宽尚未送入
-  costmap 的可选 held-object 包络；正式携物导航前必须补齐并标定。
-- 当前在线候选 Provider 只覆盖导航阶段，且默认不生成恢复候选；`FailureCode` /
-  `RecoverableStep` 还没有桥接现有 `StageResult`，不能宣称自动恢复已经上线。
+- transport 已能把实测物体中心/半宽送入 carried-envelope 与候选 costmap，但默认关闭；
+  只有 `v2 + MATERIAL_MEASURED_CARRY_GUARD=1` 才启用，legacy/shadow 始终保持原验证路径。
+  此开关必须在官方镜像完成尺寸、净空和误检标定后才能放行。
+- 当前在线候选 Provider 只覆盖导航阶段，且默认不生成恢复候选；结构化恢复桥已上线到 V2，
+  但 Executor 失败码迁移目前只有 Task 1 导航首批站点，其他未结构化 BLOCKED 仍保持
+  legacy fail-closed 语义，不能宣称全部失败均可自动恢复。
+- odometry/joint state 的消息年龄仍未进入统一 `INPUT_STALE` watchdog；远程验收必须通过
+  断流注入确认当前等待/零速行为，后续再以独立小批次补齐时间戳门限。
 
 ### 必须坚持的架构结论
 
@@ -1172,8 +1180,10 @@ MATERIAL_SCHEDULER_EVENT_LOG=/tmp/material_scheduler.jsonl
 
 MATERIAL_COSTMAP_DYNAMIC_TTL_S=1.0
 MATERIAL_POLICY_REEVALUATE_PERIOD_S=0.25
+MATERIAL_CANDIDATE_INITIAL_WAIT_S=0.10
 MATERIAL_POLICY_SWITCH_MARGIN=0.25
 MATERIAL_POLICY_MIN_HOLD_S=0.75
+MATERIAL_MEASURED_CARRY_GUARD=0
 
 MATERIAL_SCHEDULER_MODEL=
 MATERIAL_SCHEDULER_MODEL_SHA256=
@@ -1185,8 +1195,10 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 ```
 
 以上除独立全局重规划周期外均已接入 `client_task.py`；全局路径仍按阶段进入、地图变化和现有
-导航控制器触发，不暴露 `MATERIAL_COSTMAP_REPLAN_PERIOD_S`。非法数值配置会关闭候选策略
-旁路并回退既有确定性 Executor，不影响正式 JSON 和 Legacy 控制链。
+导航控制器触发，不暴露 `MATERIAL_COSTMAP_REPLAN_PERIOD_S`。首候选等待只允许非负有限值，
+默认 0.10 s，设为 0 可禁用。实测携物包络默认关闭，并且仅在最终生效模式为 `v2` 时允许
+开启；legacy/shadow 即使误配为 1 也会忽略并记录警告。非法数值配置会关闭候选策略旁路并
+回退既有确定性 Executor，不影响正式 JSON 和 Legacy 控制链。
 
 所有新增配置必须：
 
@@ -1255,7 +1267,25 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] RL/模型/推理故障可自动回退。
 - [x] 语义旁路不能修改任务或阻塞控制。
 - [x] Legacy/Shadow/V2 三模式可切换。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（371 passed，5 skipped）。
+- [x] 结构化失败桥接已闭合：`StageResult` 携带 `FailureCode`，v2 引擎用有预算的
+  `RecoverableStageAction`（复用 `RecoveryClassifier` 轮转策略）执行恢复；legacy 对
+  `RETRYABLE_FAILURE` 保持原 BLOCKED 语义，不可逆 Step 永不重进，硬安全码直入 SAFE_HOLD。
+- [x] 实测 held-object 几何已接入 transport：`HeldObjectGeometry` 经 `TransferMotion`
+  送入 A* 路径检查与逐 tick 命令门（显式 feature gate，缺省仍为 TRANSIT_CARRY）；Task 1/2/3 暴露
+  `held_object_geometry(context)` 只读 hook，v2 决策 sidecar 用同一几何给候选路径做
+  carried-envelope 硬过滤，且只在 TRANSPORT 阶段读取，Return-to-End 不复用陈旧携物状态。
+- [x] Executor 候选 hook 已按 §18 第 5 步全部开放（代码层）：Task 2 货架观察/抓取站位、
+  Task 1/3 transport 观察站位、Task 1/2/3 Return-to-End 站位均经共享四道硬校验
+  （`executors/scheduler_candidate.py`：走廊 ≤0.15/0.10 m、分层栅格无碰撞、净空
+  ≥0.22 m、执行器自身控制器重规划）并只在「已承诺运动之前」生效；Task 2 分段 transport
+  明确保持 audit-only。候选基准由 `scheduler_nominal_goal(stage, context)` 只读 hook
+  供给，任一环节失败 fail-closed，`MATERIAL_SCHEDULER_ENGINE=legacy` 一键退回。
+- [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
+  `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
+  助手，客户端不再包含 task==2/task==3 分支。
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（420 passed，5 skipped，1 warning）。
+- [ ] 正式实动仍默认 `legacy`；携物包络、阶段恢复与新增站位 hook 需在官方 4090 镜像上
+  标定后方可与 `v2 + dry_run / nav_only / task123_full` 的实机放行合并。
 - [ ] ROS/Server 联调、仿真时序和实机故障注入回归通过。
 - [ ] 官方 4090 Server/Client 环境完成逐段实机标定。
 
@@ -1279,14 +1309,123 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
    周期延迟与净空遥测。
 5. 依次为 Task 2 货架观察/抓取站位、Task 1/2/3 transport、Return-to-End 开放 hook；每一步
    都必须能用环境变量立即退回 `legacy`。
+   **[代码已完成，待实机验证]**：见 §18.2。
 6. 完成故障注入：动态障碍过期、无路径、输入陈旧、裁判主题短暂乱序、模型缺失、推理超时、
    masked action、NaN 输出、底盘 lease 失效。
+   **[代码已完成]**：TTL 过期（`test_world_costmap.py`）、无路径/EMERGENCY_STOP
+   （`test_navigation_controller*.py`）、裁判乱序闭锁（`test_scheduler_engine.py`）、
+   模型缺失/推理超时/NaN/masked（`test_policy_guard.py`）、底盘 lease 失效
+   （`test_scheduler_resources.py`）与结构化失败注入（`test_scheduler_stage_recovery.py`）
+   均已落地；detection 陈旧有明确门限，odometry/joint state 目前只有等待/零速语义，尚无
+   统一消息年龄 watchdog，必须作为远程断流注入项保留，不能标记为完整 `INPUT_STALE` 覆盖。
 7. 只在足量 Heuristic EventLog 经过离线回放后训练 MaskablePPO；先 `rl_shadow`，通过回放和
    仿真统计门槛后再讨论 `rl_guarded` 实机许可。
 
 另外两项代码闭环应排在扩大 Executor hook 之前：把实际 held-object 几何传给 transport
 costmap；将现有 Executor 的失败结果结构化映射到 `FailureCode`，再由 `RecoverableStep`
 执行有预算的恢复。当前这两部分只有基础设施和单测，不属于已上线能力。
+
+### 18.1 本工作区已完成的两项代码闭环（离线内核，实机标定待办）
+
+**闭环 A：实测 held-object 几何 → transport costmap**
+
+- `navigation/carried_envelope.py` 新增 `HeldObjectGeometry`（base 系中心 + 双边半宽，
+  构造即校验）。
+- `executors/transfer_support.py::TransferMotion.begin_navigation(..., held_geometry=)`
+  在 A* 出路径后用 `CarriedEnvelopeChecker.check_path` 拒绝会扫入货架/墙体的携物路径；
+  `tick_navigation` 用 `check_command` 做逐 tick 短视界命令门，违规即 E-STOP 归零。
+  不传几何时行为与历史完全一致（opt-in）。
+- `task1_full.py` 的两条 transport A* 路线（direct + fallback）与 `task3.py` 的
+  `_tick_task3_transport_navigation` 已传实测几何；Task 1/2/3 集成执行器新增只读
+  `held_object_geometry(context)` hook。
+- v2 决策 sidecar（`SchedulerEngine._probe_held_geometry`）把同一几何传入
+  `SchedulerDecisionService.decide`，TRANSPORT 候选路径的 carried-envelope 硬过滤
+  不再缺实测半宽；hook 缺失/异常只降级评分，绝不改命令。
+- Task 2 原有的 shelf-to-table 分段包络守卫保持不变，二者互为对照。
+- 测试：`tests/test_transfer_held_geometry.py`（6 项）。
+
+**闭环 B：Executor 失败 → `FailureCode` → 有预算恢复**
+
+- `executors/base.py::StageResult` 增加 `failure_code` 与只读 `metadata`；新增
+  `StageStatus.RETRYABLE_FAILURE`、`retryable_failure(...)` 与 `fatal(...)` 构造；
+  `fatal` 保持 BLOCKED 状态，legacy/shadow 行为零变化。
+- `scheduler/legacy_adapter.py` 新增 `RecoverableStageAction`：复用
+  `RecoveryClassifier` 的有限轮转策略；无工厂时执行 L2“取消→重进 Step→重试”，
+  有 `build_recovery_action(name)` opt-in hook 时执行执行器自备恢复动作；
+  `max_total_recoveries`（默认 8）与每码策略上限双重封顶。
+- `SchedulerEngine` 为带 `recovery_policy` 且非 `irreversible` 的 Step 自动包恢复层；
+  `RETRYABLE_FAILURE` 漏出（不可逆 Step）→ BLOCKED；`BLOCKED + FATAL_SAFETY_FAILURE_CODES`
+  （hard effort/碰撞/资源冲突/非法命令/内部错误等）→ SAFE_HOLD；恢复事件写入
+  `step_recovery` / `step_failed` 结构化事件。
+- `executors/task1.py` 首批标注：非有限观测与检测等待超时 → `TARGET_LOST`，
+  `set_goal` 失败 → `NAV_NO_PATH`，导航 FAILED/EMERGENCY_STOP → `NAV_STUCK`。
+  `tests/test_task1_*` 不覆盖这四处历史 BLOCKED 断言，legacy 轨迹不变。
+- 测试：`tests/test_scheduler_stage_recovery.py`（13 项），覆盖预算耗尽、legacy 语义、
+  不可逆 Step 不重进、显式恢复动作与恢复失败 fail-closed。
+
+### 18.2 本工作区已完成的 Executor hook 开放与生命周期迁移（离线代码，实机标定待办）
+
+**候选 hook 全量开放（§18 第 5 步，代码层）**
+
+- 新增 `executors/scheduler_candidate.py`：共享四道硬校验（走廊 0.15/0.10 m、分层栅格
+  无碰撞、净空 ≥0.22 m、heading 不变），与 `Task1NavigationExecutor` 的既有校验一致；
+  重规划仍由各执行器的 `TransferMotion.begin_navigation` 承担（fail-closed）。
+- `scheduler_nominal_goal(stage, context)` 只读 hook（Task 1/2/3 集成执行器）向 v2
+  决策 sidecar 提供“候选偏移基准”，取代 provider 的近似目标；`ProjectCandidateProvider`
+  收到非法基准直接拒批，旧式 duck-typed provider 不受影响。
+- Task 2 `NAVIGATE_TO_PICK`：货架远观察站位可切换（未启动 A* 前），consumed by
+  `_tick_navigate_to_pick`；Task 1/3 `TRANSPORT`：货架预放置观察站位（基于实测
+  held-object 中心）仅在 table retreat 阶段可切换；Task 1/2/3 `RETURN_TO_END`：
+  终点站位仅在 end 导航段启动前可切换。所有已承诺运动的后续 offer 一律 audit-only，
+  不会改写正在执行的轨迹。Task 2 的分段 reverse/turn/advance transport 明确不开放
+  （无可重规划站位），保持其已验证的包络守卫。
+- `TransferMotion.navigation_grid` 只读暴露，保证执行器侧碰撞校验与实际控制器同网格。
+- Scheduler 记录每次候选交付的 `candidate_application` 事件以及
+  `applied / audit_only / too_late` 状态；导航段首次交付有默认 0.10 s 的有界等待窗，保证
+  能在首个运动 tick 前应用已及时完成的候选，超时后不等待、不阻塞。
+- 测试：`tests/test_scheduler_executor_hooks.py`（29 项）+ 既有
+  `tests/test_task1_scheduler_candidate.py` 更新为 audit-only 语义。
+
+**detection epoch 生命周期迁移（PR 7 遗留项）**
+
+- `client_task.py` 删除 `_refresh_task2/3_detection_epoch` 任务编号特判，改为通用
+  `_refresh_detection_epochs()`；epoch 决策由执行器只读策略 `detection_epoch_policy`
+  表达：Task 2 在 `ALIGN_FOR_PICK` 请求 reset，Task 3 在 pick 导航段声明 keep。
+- ROS-free 助手 `apply_detection_epoch_decisions`（`executors/base.py`）保证非法策略
+  动作只记日志、绝不清理生产检测历史。
+
+本批次回归：pytest `420 passed, 5 skipped, 1 warning`；正式 unittest `269 tests OK`；
+`scripts/check_workspace.py` 通过。默认执行路径仍是 `legacy + task123_full`；
+`shadow / v2 + dry_run / v2 + nav_only` 的实机放行顺序不变，全部新闭包的官方镜像
+标定（携物路径净空遥测、阶段恢复计时、新站位切换净空/周期延迟）统一排在最后。
+
+### 18.3 2026-08-17 远程验收前审查闭环
+
+本轮在不运行 ROS/官方 Server 的前提下完成以下阻断项修复：
+
+1. detection epoch 从零基 `task_index` 改为通过 instruction 正式 `task` id 查找执行器，
+   防止 Task 1 查不到 key 0、Task 2/3 错绑前一任务执行器。
+2. measured carried-envelope 增加 `MATERIAL_MEASURED_CARRY_GUARD=0` 默认关闭闸门；仅 V2
+   可显式开启，legacy/shadow 始终维持原轨迹。V2 也只在 TRANSPORT 候选评分中注入该几何。
+3. 恢复包装层对主动作和执行器自带恢复动作都保留 fatal safety code 与非法 failure code：
+   fatal 直接 SAFE_HOLD，非法类型交给引擎边界校验后 SAFE_HOLD，不再被改写成
+   `RECOVERY_EXHAUSTED`。
+4. 候选 hook 增加应用回执和 JSONL 事件；首候选增加
+   `MATERIAL_CANDIDATE_INITIAL_WAIT_S=0.10` 有界窗口，解决后台线程结果错过首个控制 tick。
+5. 新增专项故障注入覆盖上述映射、feature gate、阶段限定、恢复码保持、应用回执和等待上限。
+
+离线验收结果：
+
+```text
+pytest:                 420 passed, 5 skipped, 1 warning
+formal unittest:        Ran 269 tests — OK
+workspace check:        29 required files present; Python syntax valid
+git diff --check:       passed（仅 Windows LF/CRLF 提示，无 whitespace error）
+```
+
+因此，远程机前已经没有已知的纯 Python 阻断项；仍未完成且必须留在远程机验证的只有：
+ROS/Server 主题与裁判时序、20 Hz 周期延迟、真实 costmap/尺寸标定、携物净空、关节 effort、
+odom/joint 断流、候选切换轨迹，以及 legacy→shadow→v2 的分阶段实动放行。
 
 这个顺序的核心是：内核已经能计算候选回报，剩余风险集中在“选择结果如何改变真实运动”。
 因此每个 Executor 必须显式 opt-in，不能通过调度器反射修改私有 `_goal` 或绕过现有导航、

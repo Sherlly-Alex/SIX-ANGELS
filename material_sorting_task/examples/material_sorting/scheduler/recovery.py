@@ -85,6 +85,22 @@ DEFAULT_RECOVERY_POLICIES: Mapping[FailureCode, RecoveryPolicy] = MappingProxyTy
 )
 
 
+# Structured failures that must escalate to SAFE_HOLD instead of recovery.
+# BLOCKED results carrying one of these codes are fail-closed in the v2
+# engine; every other code keeps the historical BLOCKED / referee semantics.
+FATAL_SAFETY_FAILURE_CODES: frozenset[FailureCode] = frozenset(
+    {
+        FailureCode.EFFORT_HARD_LIMIT,
+        FailureCode.UNSAFE_COLLISION,
+        FailureCode.RESOURCE_CONFLICT,
+        FailureCode.COMMAND_NON_FINITE,
+        FailureCode.COMMAND_EXPIRED,
+        FailureCode.REFEREE_DESYNC,
+        FailureCode.INTERNAL_ERROR,
+    }
+)
+
+
 class RecoveryClassifier:
     """Map a failure code and consumed budget to the next finite recovery."""
 
@@ -304,6 +320,7 @@ class RecoverableStep:
 
 __all__ = [
     "DEFAULT_RECOVERY_POLICIES",
+    "FATAL_SAFETY_FAILURE_CODES",
     "RecoverableStep",
     "RecoveryClassifier",
     "RecoveryDecision",

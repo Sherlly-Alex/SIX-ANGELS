@@ -31,6 +31,7 @@ class EventType(Enum):
     SAFETY_STOP = "safety_stop"
     CANDIDATES_EVALUATED = "candidates_evaluated"
     ACTION_SELECTED = "action_selected"
+    CANDIDATE_APPLICATION = "candidate_application"
 
 
 def _json_safe(value: Any) -> Any:

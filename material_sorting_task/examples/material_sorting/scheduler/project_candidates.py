@@ -64,7 +64,13 @@ class ProjectCandidateProvider:
         )
         self._end_goal = self._read_end_goal(path)
 
-    def build(self, context: ExecutionContext, stage_spec: Any) -> CandidateBatch | None:
+    def build(
+        self,
+        context: ExecutionContext,
+        stage_spec: Any,
+        *,
+        nominal_goal: tuple[float, float, float] | None = None,
+    ) -> CandidateBatch | None:
         stage = getattr(stage_spec, "stage", stage_spec)
         if stage not in self.NAVIGATION_STAGES:
             return None
@@ -73,7 +79,8 @@ class ProjectCandidateProvider:
             return None
         instruction = dict(context.instruction)
         task_id = int(instruction.get("task", context.task_index + 1))
-        goal = self._goal_for(
+        goal = self._resolve_goal(
+            nominal_goal,
             stage,
             task_id,
             instruction,
@@ -175,6 +182,34 @@ class ProjectCandidateProvider:
             footprint_mode=footprint,
             world_state=world_state,
         )
+
+    def _resolve_goal(
+        self,
+        nominal_goal: tuple[float, float, float] | None,
+        stage: TaskStage,
+        task_id: int,
+        instruction: Mapping[str, Any],
+        observations: Mapping[str, Any],
+        *,
+        now_s: float,
+    ) -> tuple[float, float, float] | None:
+        """Prefer the executor-declared nominal stand over the provider's.
+
+        The executor hook is the only source allowed to change the base
+        goal: a malformed value rejects the batch instead of silently
+        offsetting candidates around a wrong stand.
+        """
+        if nominal_goal is None:
+            return self._goal_for(
+                stage, task_id, instruction, observations, now_s=now_s
+            )
+        try:
+            x, y, yaw = (float(value) for value in nominal_goal)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x, y, yaw)):
+            return None
+        return (x, y, yaw)
 
     @staticmethod
     def _referee_finished(context: ExecutionContext) -> bool:
