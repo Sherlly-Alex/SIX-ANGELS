@@ -134,6 +134,7 @@ class _WristContactState:
     nominal_command: float | None = None
     contact_candidate_since_s: float | None = None
     contact_seen: bool = False
+    firm_contact_seen: bool = False
     aligned_since_s: float | None = None
     aligned: bool = False
     locked_position: float | None = None
@@ -151,6 +152,7 @@ class _WristContactState:
         self.nominal_command = None
         self.contact_candidate_since_s = None
         self.contact_seen = False
+        self.firm_contact_seen = False
         self.aligned_since_s = None
         self.aligned = False
         self.locked_position = None
@@ -745,6 +747,7 @@ class ContactGraspController(OpenPregraspController):
                 continue
             wrist.contact_candidate_since_s = None
             wrist.contact_seen = False
+            wrist.firm_contact_seen = False
             wrist.aligned_since_s = None
             wrist.aligned = False
             wrist.locked_position = None
@@ -986,6 +989,17 @@ class ContactGraspController(OpenPregraspController):
                 wrist.latest_effort_delta
                 >= WRIST_FIRM_CONTACT_EFFORT_DELTA
             )
+            # A firmly seated pad can unload joint 6 immediately after its
+            # contact impulse without rotating through 1.5 degrees.  Preserve
+            # that high-confidence event only when contact is already latched,
+            # the arm pose is settled and wrist velocity is low.  The normal
+            # alignment debounce below still has to complete afterwards.
+            if (
+                firm_contact
+                and pose_settled
+                and wrist.latest_velocity <= WRIST_ALIGN_VELOCITY_RAD_S
+            ):
+                wrist.firm_contact_seen = True
             # Effort is required to latch first contact above.  It is not
             # required to remain high while the free wrist rotates into full
             # surface contact: that rotation can unload joint 6 even though
@@ -994,7 +1008,7 @@ class ContactGraspController(OpenPregraspController):
             # the separate soft/absolute effort limits continue to protect the
             # subsequent preload.
             stable = (
-                (angle_aligned or firm_contact)
+                (angle_aligned or wrist.firm_contact_seen)
                 and wrist.latest_velocity <= WRIST_ALIGN_VELOCITY_RAD_S
             )
             if stable:
@@ -1031,6 +1045,7 @@ class ContactGraspController(OpenPregraspController):
             f"effort_threshold={wrist.effort_threshold:.2f}, "
             "firm="
             f"{wrist.latest_effort_delta >= WRIST_FIRM_CONTACT_EFFORT_DELTA}, "
+            f"firm_latched={wrist.firm_contact_seen}, "
             f"velocity={wrist.latest_velocity:.3f}"
         )
 

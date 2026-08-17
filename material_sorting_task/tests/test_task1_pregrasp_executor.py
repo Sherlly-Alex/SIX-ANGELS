@@ -517,6 +517,56 @@ class OpenPregraspControllerTests(unittest.TestCase):
             math.radians(1.5),
         )
 
+    def test_transient_firm_contact_survives_effort_unload(self) -> None:
+        controller = ContactGraspController(kdl=FakeKdl())
+        expected_slide = 1.32163718 - 0.854
+        baseline = joint_states(slide=expected_slide)
+        for tick in range(9):
+            controller.prepare_compliance(tick * 0.05, baseline)
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            baseline,
+        )
+
+        firm = joint_states(
+            slide=expected_slide,
+            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.01],
+            left_effort=[0.0, 0.0, 0.0, 0.0, 0.0, 2.5],
+            right_effort=[0.0, 0.0, 0.0, 0.0, 0.0, -2.5],
+        )
+        now_s = 0.50
+        for _ in range(20):
+            controller.update(now_s, firm)
+            now_s += 0.05
+            if (
+                controller._left_wrist.firm_contact_seen
+                and controller._right_wrist.firm_contact_seen
+            ):
+                break
+
+        self.assertTrue(controller._left_wrist.firm_contact_seen)
+        self.assertTrue(controller._right_wrist.firm_contact_seen)
+
+        unloaded = joint_states(
+            slide=expected_slide,
+            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.01],
+        )
+        for _ in range(20):
+            controller.update(now_s, unloaded)
+            now_s += 0.05
+            if controller.bilateral_aligned:
+                break
+
+        self.assertTrue(controller.bilateral_aligned)
+        self.assertLess(
+            controller._right_wrist.latest_angle_delta,
+            math.radians(1.5),
+        )
+
     def test_wrist_alignment_survives_effort_release_after_contact(self) -> None:
         controller = ContactGraspController(kdl=FakeKdl())
         expected_slide = 1.32163718 - 0.854
