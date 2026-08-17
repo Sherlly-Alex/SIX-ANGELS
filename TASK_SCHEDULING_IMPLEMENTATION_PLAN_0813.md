@@ -1483,3 +1483,17 @@ IK、柔顺抓取和柔顺放置控制器。
 
 下一代码批次应先实现“携物几何 feature gate 的远程标定结果回填和保守阈值验收”，再决定
 是否迁移对齐/IK 失败；在真实接触与放置故障数据不足时，不扩大自动恢复范围。
+
+### 18.6 可重复的远程输入断流注入（当前批次）
+
+- 新增默认关闭的 `InputDropFaultInjector`。只有显式设置 `MATERIAL_INPUT_FAULT_DIR` 时，
+  `drop_odometry` / `drop_joint_states` 文件才会让对应 Client 回调停止更新时间戳；不设置该
+  环境变量时不执行文件访问，也不改变正式路径。
+- 该机制只丢弃 Client 观测，不暂停官方 Server、裁判、物理仿真或其他 ROS 主题，可分别验证
+  odom 与 joint_states，优于暂停整个 Server 容器。
+- 新增 `scripts/validate_runtime_health_run.py`，从 Scheduler JSONL 自动核对两类输入的
+  `input_stale → input_recovered`，终端 `INPUT_STALE safety_stop` 和至少一条 20 Hz 周期报告。
+- 完整四终端命令见 `docs/RUNTIME_HEALTH_REMOTE_VALIDATION.md`。故障运行与满分运行必须使用
+  新 Server/Client 进程，不能把预期 SAFE_HOLD 的故障日志交给 160 分验收器。
+- 当前离线回归：runtime-health/validator 专项 `14 passed`；全仓 pytest（排除本机缺少 cv2
+  的既有视觉导入项）`461 passed, 5 skipped, 1 warning`。

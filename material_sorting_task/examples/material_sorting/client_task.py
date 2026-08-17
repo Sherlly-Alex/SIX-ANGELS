@@ -51,6 +51,7 @@ from runtime_health import (
     ControlLoopTelemetry,
     FreshnessReport,
     FreshnessState,
+    InputDropFaultInjector,
     InputFreshnessWatchdog,
 )
 from scheduler.models import FailureCode
@@ -104,6 +105,9 @@ class CompetitionClient(Node):
         self._last_detection_epoch_keys: dict[int, tuple] = {}
         self._event_log = None
         self._runtime_stale_active = False
+        self._input_fault_injector = InputDropFaultInjector(
+            os.environ.get("MATERIAL_INPUT_FAULT_DIR", "")
+        )
 
         try:
             self._freshness_watchdog = InputFreshnessWatchdog(
@@ -364,6 +368,11 @@ class CompetitionClient(Node):
             f"stale_grace={self._freshness_watchdog.stale_grace_s:.3f}s, "
             "control_period=0.050s"
         )
+        if self._input_fault_injector.enabled:
+            self.get_logger().warning(
+                "TEST-ONLY input fault injection enabled; marker_dir="
+                f"{self._input_fault_injector.marker_directory}"
+            )
         if self.scheduler_mode == "shadow":
             self.get_logger().info(
                 "scheduler shadow mode validates legacy traces and never ticks a "
@@ -475,11 +484,15 @@ class CompetitionClient(Node):
         self.score = int(msg.data)
 
     def _odom_cb(self, msg: Odometry) -> None:
+        if self._input_fault_injector.should_drop("odometry"):
+            return
         self.latest_odometry = msg
         self.odom_received = True
         self._freshness_watchdog.observe("odometry", time.monotonic())
 
     def _joints_cb(self, msg: JointState) -> None:
+        if self._input_fault_injector.should_drop("joint_states"):
+            return
         self.latest_joint_states = msg
         self.joints_received = True
         self._freshness_watchdog.observe("joint_states", time.monotonic())

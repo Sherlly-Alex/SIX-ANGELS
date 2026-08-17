@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 import math
-from statistics import median
+from pathlib import Path
 from typing import Mapping
 
 
@@ -131,6 +131,47 @@ class InputFreshnessWatchdog:
             stale_for_s=stale_for_s,
             transitioned=state is not previous,
         )
+
+
+class InputDropFaultInjector:
+    """Explicit opt-in file markers for remote callback-drop validation.
+
+    Production behavior is unchanged when ``marker_directory`` is blank.
+    A remote operator can create ``drop_odometry`` or ``drop_joint_states``
+    inside the configured container directory, then remove it to restore the
+    stream without modifying the ROS graph or restarting the Client.
+    """
+
+    INPUT_NAMES = frozenset({"odometry", "joint_states"})
+
+    def __init__(self, marker_directory: str | Path | None = None) -> None:
+        raw = "" if marker_directory is None else str(marker_directory).strip()
+        self._directory = Path(raw) if raw else None
+
+    @property
+    def enabled(self) -> bool:
+        return self._directory is not None
+
+    @property
+    def marker_directory(self) -> Path | None:
+        return self._directory
+
+    def marker_path(self, input_name: str) -> Path:
+        name = str(input_name)
+        if name not in self.INPUT_NAMES:
+            raise KeyError(f"unsupported fault-injection input: {name}")
+        if self._directory is None:
+            raise RuntimeError("input-drop fault injection is disabled")
+        return self._directory / f"drop_{name}"
+
+    def should_drop(self, input_name: str) -> bool:
+        if self._directory is None:
+            return False
+        try:
+            return self.marker_path(input_name).is_file()
+        except OSError:
+            # A broken/unreadable marker path must not disable live inputs.
+            return False
 
 
 @dataclass(frozen=True)

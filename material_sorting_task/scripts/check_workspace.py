@@ -40,6 +40,7 @@ REQUIRED = (
     TASK / "shelf" / "placement_feedback.py",
     ROOT / "scripts" / "run_client.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
+    ROOT / "scripts" / "validate_runtime_health_run.py",
 )
 
 

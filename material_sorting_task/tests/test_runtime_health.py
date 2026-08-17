@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from runtime_health import (
     ControlLoopTelemetry,
     FreshnessState,
+    InputDropFaultInjector,
     InputFreshnessWatchdog,
 )
 
@@ -130,6 +132,37 @@ class ControlLoopTelemetryTests(unittest.TestCase):
         self.assertIsNotNone(report)
         assert report is not None
         self.assertEqual(report.sample_count, 2)
+
+
+class InputDropFaultInjectorTests(unittest.TestCase):
+    def test_blank_configuration_never_drops_live_inputs(self) -> None:
+        injector = InputDropFaultInjector("")
+
+        self.assertFalse(injector.enabled)
+        self.assertFalse(injector.should_drop("odometry"))
+        self.assertFalse(injector.should_drop("joint_states"))
+
+    def test_markers_selectively_drop_and_restore_each_input(self) -> None:
+        with TemporaryDirectory() as directory:
+            injector = InputDropFaultInjector(directory)
+            odom_marker = injector.marker_path("odometry")
+            joints_marker = injector.marker_path("joint_states")
+
+            odom_marker.touch()
+            self.assertTrue(injector.should_drop("odometry"))
+            self.assertFalse(injector.should_drop("joint_states"))
+            odom_marker.unlink()
+            joints_marker.touch()
+            self.assertFalse(injector.should_drop("odometry"))
+            self.assertTrue(injector.should_drop("joint_states"))
+            joints_marker.unlink()
+            self.assertFalse(injector.should_drop("joint_states"))
+
+    def test_unknown_marker_name_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            injector = InputDropFaultInjector(directory)
+            with self.assertRaises(KeyError):
+                injector.marker_path("detections")
 
 
 class RuntimeHealthWiringTests(unittest.TestCase):
