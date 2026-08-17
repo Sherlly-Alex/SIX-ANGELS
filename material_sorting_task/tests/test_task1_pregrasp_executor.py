@@ -851,6 +851,38 @@ class Task1ContactExecutorTests(unittest.TestCase):
         self.assertIn("unsafe collision", result.message)
         self.assertEqual(result.arm_command, ARM_COMMAND)
 
+    def test_retries_when_both_contacts_latched_but_one_wrist_unaligned(self) -> None:
+        contact_controller = FakeCompliantContactController()
+        # Reproduce the remote trace: both wrists once latched contact, but
+        # only one completed the angle/velocity alignment debounce.
+        contact_controller.any_contact = True
+        contact_controller.bilateral_contact_seen = True
+        contact_controller.bilateral_aligned = False
+        executor = Task1ContactExecutor(
+            pregrasp_controller=FakePregraspController(),
+            contact_controller=contact_controller,
+        )
+        executor._locked_target_world = (-0.18, 2.20, 0.834)
+        executor._held_arm_command = ARM_COMMAND
+        executor._contact_search_used_m = executor.COMPLIANT_SOFT_MAX_M
+        executor._compliance_wait_since_s = 0.0
+
+        result = executor._tick_compliant_contact_search(
+            context(2.10, odometry(-0.18, 1.55, math.pi / 2.0)),
+            ARM_COMMAND,
+            True,
+            "fake settled pose",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._compliance_retry_count, 1)
+        self.assertAlmostEqual(
+            executor._contact_search_used_m,
+            executor.COMPLIANT_SOFT_MAX_M - executor.COMPLIANT_RETRY_BACKOFF_M,
+        )
+        self.assertIn("incomplete bilateral wrist alignment", result.message)
+
 
 class Task1LiftExecutorTests(unittest.TestCase):
     def _reach_grasp_stage(self):

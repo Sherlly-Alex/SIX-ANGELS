@@ -1144,12 +1144,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             wait_s = max(0.0, now_s - self._compliance_wait_since_s)
             if wait_s >= self.COMPLIANT_SINGLE_SIDE_WAIT_S:
                 any_contact = bool(getattr(self._contact, "any_contact", False))
-                bilateral_contact_seen = bool(
-                    getattr(self._contact, "bilateral_contact_seen", False)
-                )
                 if (
                     any_contact
-                    and not bilateral_contact_seen
+                    and not bilateral_aligned
                     and self._compliance_retry_count
                     < self.COMPLIANT_MAX_RETRIES
                 ):
@@ -1174,8 +1171,8 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     self._compliance_wait_since_s = None
                     self._held_arm_command = replanned
                     return StageResult.running(
-                        "task 1 backed off 1.0 mm after one-sided compliant "
-                        f"contact; retry={self._compliance_retry_count}/"
+                        "task 1 backed off 1.0 mm after incomplete bilateral "
+                        f"wrist alignment; retry={self._compliance_retry_count}/"
                         f"{self.COMPLIANT_MAX_RETRIES}; {diagnostic}",
                         arm_command=replanned,
                     )
