@@ -710,8 +710,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     COMPLIANT_MAX_RETRIES = 1
     # The official Server exposes referee state, odometry, TF, joint state and
     # cameras, but no grasp-confirmation topic.  Completion therefore depends
-    # on bilateral local wrist compliance plus a bounded preload only.
-    ALLOW_SETTLED_MAX_SEARCH = True
+    # on bilateral local wrist compliance plus a bounded preload only.  The
+    # contact-only validator must never interpret exhausted travel as a grasp.
+    ALLOW_SETTLED_MAX_SEARCH = False
 
     def __init__(
         self,
@@ -914,7 +915,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         ):
             return StageResult.succeeded(
                 "task 1 maximum bounded inward preload settled; "
-                "proceeding without Server bilateral-contact confirmation",
+                "proceeding through the configured bounded-preload fallback",
                 arm_command=command,
             )
 

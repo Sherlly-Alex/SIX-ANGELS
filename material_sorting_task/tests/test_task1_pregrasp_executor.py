@@ -754,12 +754,25 @@ class Task1ContactExecutorTests(unittest.TestCase):
             context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
         )
         self.assertEqual(len(contact_controller.tighten_offsets), 4)
-        completed = executor.tick(
+        held = executor.tick(
             TaskStage.GRASP,
             context(now_s + 0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
         )
-        self.assertEqual(completed.status, StageStatus.SUCCEEDED)
-        self.assertIn("maximum bounded inward preload", completed.message)
+        self.assertEqual(held.status, StageStatus.RUNNING)
+        self.assertIn("moving both open grippers inward", held.message)
+
+    def test_contact_only_rejects_exhausted_preload_without_bilateral_alignment(self) -> None:
+        executor, _contact_controller, at_goal = self._reach_contact_stage()
+        executor.tick(TaskStage.GRASP, at_goal)
+        executor._contact_search_used_m = executor.CONTACT_SEARCH_MAX_M
+
+        result = executor.tick(
+            TaskStage.GRASP,
+            context(16.0, odometry(-0.18, 1.55, math.pi / 2.0)),
+        )
+
+        self.assertEqual(result.status, StageStatus.BLOCKED)
+        self.assertIn("bilateral wrist alignment", result.message)
 
     def test_unsafe_structure_collision_holds_contact_command(self) -> None:
         executor, _contact_controller, at_goal = self._reach_contact_stage()
@@ -843,7 +856,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         executor.enter_stage(TaskStage.GRASP, at_goal)
         return executor, contact_controller, lift_controller
 
-    def test_settled_max_preload_lifts_without_server_contact_confirmation(self) -> None:
+    def test_settled_max_preload_uses_lift_fallback(self) -> None:
         executor, contact_controller, lift_controller = self._reach_grasp_stage()
         result = None
         now_s = 0.10
@@ -859,7 +872,7 @@ class Task1LiftExecutorTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.status, StageStatus.SUCCEEDED)
         self.assertEqual(contact_controller.tighten_offsets, [0.001, 0.002, 0.003, 0.004])
-        self.assertIn("without Server", result.message)
+        self.assertIn("bounded-preload fallback", result.message)
 
         lift_context = context(
             now_s + 0.05,
