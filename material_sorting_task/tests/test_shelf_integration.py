@@ -348,6 +348,17 @@ class SlideHoldControllerTests(unittest.TestCase):
 
 
 class IntegratedExecutorWiringTests(unittest.TestCase):
+    def test_task1_release_uses_grasp_latched_width_after_contact_reset(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._contact._half_width = 0.109
+        executor._capture_held_grasp_half_width()
+
+        # Reproduce the remote failure: later controller lifecycle work clears
+        # the contact planner although the arms still hold the same box.
+        executor._contact.reset()
+
+        self.assertAlmostEqual(executor._held_release_half_width(), 0.109)
+
     def test_all_integrated_tasks_use_independent_compliant_place_lowering(self) -> None:
         memory = CompetitionTaskMemory()
         task1 = Task1IntegratedExecutor(memory)
