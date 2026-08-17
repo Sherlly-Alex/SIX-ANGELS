@@ -62,6 +62,10 @@ WRIST_BASELINE_MIN_SAMPLES = 8
 WRIST_EFFORT_FILTER_ALPHA = 0.25
 WRIST_MIN_EFFORT_DELTA = 0.35
 WRIST_EFFORT_NOISE_MULTIPLIER = 5.0
+# A pad can be firmly seated without rotating joint 6 through the full surface
+# angle.  This threshold is deliberately well above the contact latch level,
+# below the preload soft limit, and still requires low velocity plus debounce.
+WRIST_FIRM_CONTACT_EFFORT_DELTA = 1.00
 WRIST_FREE_ANGLE_LIMIT_RAD = math.radians(8.0)
 WRIST_CONTACT_MIN_ROTATION_RAD = math.radians(1.5)
 WRIST_CONTACT_CONFIRM_TIME_S = 0.15
@@ -978,6 +982,10 @@ class ContactGraspController(OpenPregraspController):
             angle_aligned = (
                 wrist.latest_angle_delta >= WRIST_CONTACT_MIN_ROTATION_RAD
             )
+            firm_contact = (
+                wrist.latest_effort_delta
+                >= WRIST_FIRM_CONTACT_EFFORT_DELTA
+            )
             # Effort is required to latch first contact above.  It is not
             # required to remain high while the free wrist rotates into full
             # surface contact: that rotation can unload joint 6 even though
@@ -986,7 +994,7 @@ class ContactGraspController(OpenPregraspController):
             # the separate soft/absolute effort limits continue to protect the
             # subsequent preload.
             stable = (
-                angle_aligned
+                (angle_aligned or firm_contact)
                 and wrist.latest_velocity <= WRIST_ALIGN_VELOCITY_RAD_S
             )
             if stable:
@@ -1021,6 +1029,8 @@ class ContactGraspController(OpenPregraspController):
             f"angle={math.degrees(wrist.latest_angle_delta):.1f}deg, "
             f"effort_delta={wrist.latest_effort_delta:.2f}, "
             f"effort_threshold={wrist.effort_threshold:.2f}, "
+            "firm="
+            f"{wrist.latest_effort_delta >= WRIST_FIRM_CONTACT_EFFORT_DELTA}, "
             f"velocity={wrist.latest_velocity:.3f}"
         )
 

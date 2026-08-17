@@ -486,6 +486,37 @@ class OpenPregraspControllerTests(unittest.TestCase):
         self.assertAlmostEqual(tightened.left_arm_positions[5], 0.04, places=6)
         self.assertAlmostEqual(tightened.right_arm_positions[5], -0.04, places=6)
 
+    def test_firm_low_velocity_contact_locks_without_large_wrist_rotation(self) -> None:
+        controller = ContactGraspController(kdl=FakeKdl())
+        expected_slide = 1.32163718 - 0.854
+        baseline = joint_states(slide=expected_slide)
+        for tick in range(9):
+            controller.prepare_compliance(tick * 0.05, baseline)
+        controller.plan(
+            (-0.18, 2.20, 0.834),
+            "yaw0",
+            odometry(-0.18, 1.55, math.pi / 2.0),
+            baseline,
+        )
+
+        firm_contact = joint_states(
+            slide=expected_slide,
+            left_arm=[0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            right_arm=[0.0, 0.0, 0.0, 0.0, 0.0, -0.01],
+            left_effort=[0.0, 0.0, 0.0, 0.0, 0.0, 2.0],
+            right_effort=[0.0, 0.0, 0.0, 0.0, 0.0, -2.0],
+        )
+        for tick in range(50):
+            controller.update(0.50 + tick * 0.05, firm_contact)
+            if controller.bilateral_aligned:
+                break
+
+        self.assertTrue(controller.bilateral_aligned)
+        self.assertLess(
+            controller._left_wrist.latest_angle_delta,
+            math.radians(1.5),
+        )
+
     def test_wrist_alignment_survives_effort_release_after_contact(self) -> None:
         controller = ContactGraspController(kdl=FakeKdl())
         expected_slide = 1.32163718 - 0.854
