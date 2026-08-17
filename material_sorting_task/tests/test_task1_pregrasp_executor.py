@@ -283,6 +283,8 @@ def context(
     *,
     unsafe_collision=False,
     target_orientation="yaw90",
+    target_position=(-0.18, 2.20, 0.851),
+    target_quality=None,
 ):
     return ExecutionContext(
         now_s=now_s,
@@ -299,10 +301,11 @@ def context(
         target_observations={
             "brown": TargetObservation(
                 color="brown",
-                position_world=(-0.18, 2.20, 0.851),
+                position_world=target_position,
                 received_at_s=now_s,
                 orientation=target_orientation,
                 score=0.9,
+                quality=target_quality,
             )
         },
         unsafe_collision=unsafe_collision,
@@ -632,6 +635,26 @@ class SlideLiftControllerTests(unittest.TestCase):
 
 
 class Task1PregraspExecutorTests(unittest.TestCase):
+    def test_uses_full_rgbd_center_for_arms_but_keeps_slot_for_navigation(self) -> None:
+        pregrasp = FakePregraspController()
+        executor = Task1PregraspExecutor(pregrasp_controller=pregrasp)
+        executor._navigation = FakeNavigationController()
+        initial = context(
+            0.0,
+            odometry(-0.70, 0.55, math.pi / 2.0),
+            target_orientation="yaw0",
+            target_position=(-0.177, 2.225, 0.806),
+            target_quality="mask_cloud_cuboid",
+        )
+        executor.enter_stage(TaskStage.NAVIGATE_TO_PICK, initial)
+        executor.tick(TaskStage.NAVIGATE_TO_PICK, initial)
+
+        self.assertEqual(executor.goal.x, -0.18)
+        self.assertAlmostEqual(executor.goal.y, 1.55)
+        self.assertEqual(executor._locked_target_world, (-0.177, 2.225, 0.806))
+        self.assertEqual(executor._locked_target_orientation, "yaw0")
+        self.assertEqual(executor._locked_target_source, "rgbd_cuboid")
+
     def test_navigates_then_holds_open_pregrasp_before_contact(self) -> None:
         pregrasp = FakePregraspController()
         executor = Task1PregraspExecutor(pregrasp_controller=pregrasp)

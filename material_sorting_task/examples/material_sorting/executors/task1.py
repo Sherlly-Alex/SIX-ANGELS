@@ -68,6 +68,11 @@ class Task1NavigationExecutor:
     # its calibrated center instead of sending that depth bias to the arms.
     TABLE_SOURCE_SLOTS_M = ((-1.00, 2.20), (-0.18, 2.20))
     TABLE_SOURCE_SNAP_MAX_M = 0.18
+    # Navigation is tied to the calibrated table slot, but a full RGB-D cuboid
+    # fit carries a small, repeatable within-slot offset that matters to the
+    # two arm pads.  Keep that offset only when it stays well inside the slot;
+    # weaker surface-depth observations retain the calibrated arm target.
+    TABLE_ARM_CENTER_MAX_OFFSET_M = 0.06
     TABLE_SOURCE_ORIENTATION = "yaw0"
     POSITION_TOLERANCE_M = 0.08
     YAW_TOLERANCE_RAD = 0.05
@@ -104,7 +109,9 @@ class Task1NavigationExecutor:
         self._stage_started_s = 0.0
         self._last_tick_s: float | None = None
         self._locked_target_world: tuple[float, float, float] | None = None
+        self._calibrated_target_world: tuple[float, float, float] | None = None
         self._locked_target_orientation: str | None = None
+        self._locked_target_source = "unlocked"
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -117,7 +124,9 @@ class Task1NavigationExecutor:
         self._stage_started_s = 0.0
         self._last_tick_s = None
         self._locked_target_world = None
+        self._calibrated_target_world = None
         self._locked_target_orientation = None
+        self._locked_target_source = "unlocked"
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         self.active_stage = stage
@@ -204,8 +213,7 @@ class Task1NavigationExecutor:
                 segment=NavigationSegment.NAV_TABLE,
                 source_tag="perception_slot_calibrated",
             )
-            self._locked_target_world = calibrated_target
-            self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+            self._lock_arm_target(observation, calibrated_target)
             refresh_dynamic_overlay(
                 self._navigation_grid,
                 context.target_observations,
@@ -372,8 +380,18 @@ class Task1NavigationExecutor:
                 f"candidate {getattr(candidate, 'action_id', candidate)!r}"
             )
         if self._locked_target_world is None:
-            self._locked_target_world = (target_x, target_y, target_z)
-            self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+            target_color = str(
+                context.instruction.get("target_color", "")
+            ).strip().lower()
+            observation = context.target_observations.get(target_color)
+            calibrated_target = (target_x, target_y, target_z)
+            if observation is None:
+                self._calibrated_target_world = calibrated_target
+                self._locked_target_world = calibrated_target
+                self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+                self._locked_target_source = "calibrated_slot"
+            else:
+                self._lock_arm_target(observation, calibrated_target)
         self._goal = goal
         return CandidateApplicationStatus.APPLIED
 
@@ -404,8 +422,8 @@ class Task1NavigationExecutor:
         context: ExecutionContext,
     ) -> tuple[float, float, float]:
         """Return the calibrated slot target a candidate stand must reference."""
-        if self._locked_target_world is not None:
-            return self._locked_target_world
+        if self._calibrated_target_world is not None:
+            return self._calibrated_target_world
         target_color = (
             str(context.instruction.get("target_color", "")).strip().lower()
         )
@@ -431,6 +449,40 @@ class Task1NavigationExecutor:
                 "table-source slots"
             )
         return calibrated
+
+    def _lock_arm_target(self, observation, calibrated_target) -> None:
+        """Keep slot geometry for navigation and safe RGB-D geometry for arms."""
+
+        calibrated_x, calibrated_y, calibrated_z = (
+            float(value) for value in calibrated_target
+        )
+        self._calibrated_target_world = calibrated_target
+        observed_x, observed_y, _observed_z = (
+            float(value) for value in observation.position_world
+        )
+        offset_m = math.hypot(
+            observed_x - calibrated_x,
+            observed_y - calibrated_y,
+        )
+        orientation = str(observation.orientation or "").strip().lower()
+        high_quality = str(observation.quality or "").strip().lower()
+        if (
+            high_quality == "mask_cloud_cuboid"
+            and orientation in {"yaw0", "yaw90"}
+            and offset_m <= self.TABLE_ARM_CENTER_MAX_OFFSET_M
+        ):
+            self._locked_target_world = (
+                observed_x,
+                observed_y,
+                calibrated_z,
+            )
+            self._locked_target_orientation = orientation
+            self._locked_target_source = "rgbd_cuboid"
+            return
+
+        self._locked_target_world = calibrated_target
+        self._locked_target_orientation = self.TABLE_SOURCE_ORIENTATION
+        self._locked_target_source = "calibrated_slot"
 
     @staticmethod
     def _stand_errors_in_heading(
@@ -590,7 +642,7 @@ class Task1PregraspExecutor(Task1NavigationExecutor):
             return StageResult.succeeded(
                 "task 1 target locked for open pregrasp at "
                 f"{tuple(round(value, 3) for value in self._locked_target_world)}; "
-                f"orientation={orientation}"
+                f"orientation={orientation}; source={self._locked_target_source}"
             )
 
         if stage is TaskStage.ALIGN_FOR_PICK:
