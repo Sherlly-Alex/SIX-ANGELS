@@ -21,11 +21,14 @@ from shelf_geometry import ShelfGeometry, layer_from_object_center_z, load_shelf
 
 
 COLORED_CLASSES = frozenset(("pink", "yellow", "brown"))
-# ``shelf_obstacle`` in the current perception node is intentionally a sparse
-# L1-only occupancy probe.  It cannot identify the randomized packaging layer,
-# so task 1/2 must use the semantic packaging-box class and fail closed when it
-# is unavailable.
-WHITE_CLASSES = frozenset(("packaging_box",))
+# The official YOLO checkpoint occasionally calls the white shelf prop
+# ``material_box`` (the visually similar white desktop prop).  Spatial
+# validation in ``_classify`` is authoritative here: a material-box detection
+# inside the shelf ROI is the packaging box, while the real desktop
+# material_box remains far outside that ROI and is rejected.
+# ``shelf_obstacle`` is deliberately excluded because its sparse L1 occupancy
+# probe does not identify the randomized prop reliably across all layers.
+WHITE_CLASSES = frozenset(("packaging_box", "material_box"))
 
 
 @dataclass(frozen=True)

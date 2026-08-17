@@ -102,6 +102,30 @@ class ShelfStateTrackerTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.layer_contents, ("packaging_box", "brown", "EMPTY"))
 
+    def test_shelf_local_material_box_label_is_packaging_alias(self) -> None:
+        tracker = ShelfStateTracker(required_votes=3)
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "pink": observation("pink", (-2.63, 0.778, 0.837), stamp),
+                    # The official YOLO checkpoint can confuse the two white
+                    # props.  Shelf coordinates disambiguate this safely.
+                    "material_box": observation(
+                        "material_box", (-2.636, 0.690, 0.563), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.colored_layer, 2)
+        self.assertEqual(result.white_obstacle_layer, 1)
+        self.assertEqual(result.empty_layer, 3)
+        self.assertEqual(result.layer_contents, ("packaging_box", "pink", "EMPTY"))
+
     def test_uses_recent_static_packaging_during_fresh_colored_scan(self) -> None:
         tracker = ShelfStateTracker(required_votes=3, max_observation_age_s=2.0)
         result = None

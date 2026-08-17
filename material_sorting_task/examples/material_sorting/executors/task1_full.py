@@ -72,7 +72,11 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     SHELF_CLEARANCE_M = 0.055
     SHELF_RETREAT_M = 0.32
     SHELF_SCAN_TIMEOUT_S = 35.0
-    SHELF_SCAN_PITCHES = (0.00, 0.08, 0.16)
+    # Positive MMK2 head pitch moves shelf objects down in the image.  The
+    # randomized L1 packaging box is already close to the bottom edge at the
+    # scan stand, so look downward first (negative pitch) before sweeping the
+    # higher layers.  Keep zero first to reuse the normal transport view.
+    SHELF_SCAN_PITCHES = (0.00, -0.08, -0.16, 0.08, 0.16)
     SHELF_SCAN_PITCH_DWELL_S = 3.0
     PLACE_TIMEOUT_S = 25.0
     ARM_RETRACT_TIMEOUT_S = 15.0
