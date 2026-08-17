@@ -1495,5 +1495,29 @@ IK、柔顺抓取和柔顺放置控制器。
   `input_stale → input_recovered`，终端 `INPUT_STALE safety_stop` 和至少一条 20 Hz 周期报告。
 - 完整四终端命令见 `docs/RUNTIME_HEALTH_REMOTE_VALIDATION.md`。故障运行与满分运行必须使用
   新 Server/Client 进程，不能把预期 SAFE_HOLD 的故障日志交给 160 分验收器。
-- 当前离线回归：runtime-health/validator 专项 `14 passed`；全仓 pytest（排除本机缺少 cv2
-  的既有视觉导入项）`461 passed, 5 skipped, 1 warning`。
+- 当前离线回归：runtime-health/validator 专项通过；全仓 pytest（排除本机缺少 cv2
+  的既有视觉导入项）`463 passed, 5 skipped, 1 warning`。
+
+### 18.7 官方 Server 输入断流验收结果与无故障性能门
+
+远程 `v2_runtime_health_r1` 已通过自动验收：
+
+- odometry 短断流在 stale 事件后约 0.65 s 恢复；joint_states 短断流约 0.60 s 恢复；
+- joint_states 长断流从 stale 到 `freshness grace exhausted` 为约 2.00 s，按设计进入
+  `INPUT_STALE` SAFE_HOLD；
+- 验收器观测到两类 stale、两类 recovered、joint_states terminal 和 62 条周期报告，最终
+  `passed: true`。
+
+周期数据不能与断流安全结论混为一谈：故障/高频 2 s 日志运行中，早期不足 400 样本的窗口
+曾出现 interval p99=115.62 ms；完整窗口最忙时 interval p95 约 60.43 ms、p99 约 84.91 ms、
+execution p95 约 46.74 ms，累计存在少量 deadline miss。因此断流功能已经放行，但正常比赛
+20 Hz 性能仍需一轮无故障 160 分证据。
+
+`validate_remote_run.py --events` 已新增无故障性能门：只评估完整 400 样本滚动窗口；禁止任何
+`input_stale/safety_stop`；要求 interval p95 <= 65 ms、p99 <= 100 ms、execution p95 <=
+50 ms，且 interval/execution 累计 deadline-miss rate 均 <= 1%。遥测新增累计样本数，使比率
+不再错误地用 400 长度滚动窗口作分母。
+
+下一轮必须使用全新的 Server/Client，关闭 fault-dir 和 measured-carry guard，以默认 5 s
+报告周期完成 160 分无故障基线。该门通过后，才允许只改变
+`MATERIAL_MEASURED_CARRY_GUARD=1` 做同 seed A/B 验证。

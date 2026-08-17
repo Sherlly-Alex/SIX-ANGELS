@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -33,6 +34,11 @@ def validate_run(
     server_text: str,
     *,
     expected_score: int = 160,
+    scheduler_events_text: str | None = None,
+    max_interval_p95_ms: float = 65.0,
+    max_interval_p99_ms: float = 100.0,
+    max_execution_p95_ms: float = 50.0,
+    max_deadline_miss_rate: float = 0.01,
 ) -> dict[str, object]:
     """Return a stable machine-readable acceptance report."""
 
@@ -75,6 +81,20 @@ def validate_run(
     if not server_total_visible:
         failures.append(f"server missing total-score evidence {expected_score}")
 
+    runtime_health = None
+    if scheduler_events_text is not None:
+        runtime_health = validate_runtime_health(
+            scheduler_events_text,
+            max_interval_p95_ms=max_interval_p95_ms,
+            max_interval_p99_ms=max_interval_p99_ms,
+            max_execution_p95_ms=max_execution_p95_ms,
+            max_deadline_miss_rate=max_deadline_miss_rate,
+        )
+        failures.extend(
+            f"runtime_health: {message}"
+            for message in runtime_health["failures"]
+        )
+
     return {
         "passed": not failures,
         "expected_score": expected_score,
@@ -84,6 +104,110 @@ def validate_run(
         },
         "server_all_tasks_done": server_all_done,
         "fatal_counts": fatal_counts,
+        "runtime_health": runtime_health,
+        "failures": failures,
+    }
+
+
+def validate_runtime_health(
+    events_text: str,
+    *,
+    max_interval_p95_ms: float,
+    max_interval_p99_ms: float,
+    max_execution_p95_ms: float,
+    max_deadline_miss_rate: float,
+) -> dict[str, object]:
+    limits = (
+        max_interval_p95_ms,
+        max_interval_p99_ms,
+        max_execution_p95_ms,
+        max_deadline_miss_rate,
+    )
+    if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in limits):
+        raise ValueError("runtime-health limits must be finite and non-negative")
+    records: list[dict[str, object]] = []
+    malformed_lines = 0
+    unexpected_stale_events = 0
+    for raw in events_text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed_lines += 1
+            continue
+        if not isinstance(event, dict):
+            malformed_lines += 1
+            continue
+        event_type = str(event.get("event_type", ""))
+        if event_type in {"input_stale", "safety_stop"}:
+            unexpected_stale_events += 1
+        details = event.get("details")
+        if event_type != "control_loop_health" or not isinstance(details, dict):
+            continue
+        try:
+            if int(details.get("sample_count", 0)) >= 400:
+                records.append(details)
+        except (TypeError, ValueError):
+            malformed_lines += 1
+
+    failures: list[str] = []
+    if malformed_lines:
+        failures.append(f"malformed_event_lines={malformed_lines}")
+    if unexpected_stale_events:
+        failures.append(f"unexpected_stale_or_safety_events={unexpected_stale_events}")
+    if not records:
+        failures.append("missing full-window control_loop_health report")
+        return {
+            "passed": False,
+            "report_count": 0,
+            "failures": failures,
+        }
+
+    def maximum(name: str) -> float:
+        return max(float(record.get(name, math.inf)) for record in records)
+
+    max_p95 = maximum("interval_p95_ms")
+    max_p99 = maximum("interval_p99_ms")
+    max_exec_p95 = maximum("execution_p95_ms")
+    latest = records[-1]
+    try:
+        interval_total = int(latest["total_interval_count"])
+        sample_total = int(latest["total_sample_count"])
+        interval_misses = int(latest["interval_deadline_misses"])
+        execution_misses = int(latest["execution_deadline_misses"])
+        interval_miss_rate = interval_misses / max(1, interval_total)
+        execution_miss_rate = execution_misses / max(1, sample_total)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        interval_miss_rate = math.inf
+        execution_miss_rate = math.inf
+        failures.append("missing cumulative loop counters")
+
+    checks = (
+        (max_p95, max_interval_p95_ms, "interval_p95_ms"),
+        (max_p99, max_interval_p99_ms, "interval_p99_ms"),
+        (max_exec_p95, max_execution_p95_ms, "execution_p95_ms"),
+        (interval_miss_rate, max_deadline_miss_rate, "interval_deadline_miss_rate"),
+        (execution_miss_rate, max_deadline_miss_rate, "execution_deadline_miss_rate"),
+    )
+    for observed, limit, name in checks:
+        if not math.isfinite(observed) or observed > limit:
+            failures.append(f"{name}={observed:.6f} exceeds {limit:.6f}")
+
+    return {
+        "passed": not failures,
+        "report_count": len(records),
+        "max_interval_p95_ms": max_p95,
+        "max_interval_p99_ms": max_p99,
+        "max_execution_p95_ms": max_exec_p95,
+        "interval_deadline_miss_rate": interval_miss_rate,
+        "execution_deadline_miss_rate": execution_miss_rate,
+        "limits": {
+            "max_interval_p95_ms": max_interval_p95_ms,
+            "max_interval_p99_ms": max_interval_p99_ms,
+            "max_execution_p95_ms": max_execution_p95_ms,
+            "max_deadline_miss_rate": max_deadline_miss_rate,
+        },
         "failures": failures,
     }
 
@@ -95,6 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--client", required=True, type=Path)
     parser.add_argument("--server", required=True, type=Path)
     parser.add_argument("--expected-score", type=int, default=160)
+    parser.add_argument("--events", type=Path)
+    parser.add_argument("--max-interval-p95-ms", type=float, default=65.0)
+    parser.add_argument("--max-interval-p99-ms", type=float, default=100.0)
+    parser.add_argument("--max-execution-p95-ms", type=float, default=50.0)
+    parser.add_argument("--max-deadline-miss-rate", type=float, default=0.01)
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -105,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
         _read(args.client),
         _read(args.server),
         expected_score=args.expected_score,
+        scheduler_events_text=_read(args.events) if args.events is not None else None,
+        max_interval_p95_ms=args.max_interval_p95_ms,
+        max_interval_p99_ms=args.max_interval_p99_ms,
+        max_execution_p95_ms=args.max_execution_p95_ms,
+        max_deadline_miss_rate=args.max_deadline_miss_rate,
     )
     payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:

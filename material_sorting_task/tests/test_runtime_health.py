@@ -115,6 +115,8 @@ class ControlLoopTelemetryTests(unittest.TestCase):
         health = telemetry.snapshot()
 
         self.assertEqual(health.sample_count, 3)
+        self.assertEqual(health.total_sample_count, 3)
+        self.assertEqual(health.total_interval_count, 2)
         self.assertAlmostEqual(health.interval_p50_ms, 50.0)
         self.assertAlmostEqual(health.interval_p95_ms, 90.0)
         self.assertAlmostEqual(health.execution_p95_ms, 61.0)
@@ -132,6 +134,7 @@ class ControlLoopTelemetryTests(unittest.TestCase):
         self.assertIsNotNone(report)
         assert report is not None
         self.assertEqual(report.sample_count, 2)
+        self.assertEqual(report.total_sample_count, 2)
 
 
 class InputDropFaultInjectorTests(unittest.TestCase):

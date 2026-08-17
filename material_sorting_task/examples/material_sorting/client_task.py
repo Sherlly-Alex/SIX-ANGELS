@@ -885,7 +885,7 @@ class CompetitionClient(Node):
         details = health.to_dict()
         self.get_logger().info(
             "CONTROL_LOOP_HEALTH "
-            f"samples={health.sample_count} "
+            f"samples={health.sample_count}/{health.total_sample_count} "
             f"interval_p95={health.interval_p95_ms:.2f}ms "
             f"interval_p99={health.interval_p99_ms:.2f}ms "
             f"execution_p95={health.execution_p95_ms:.2f}ms "

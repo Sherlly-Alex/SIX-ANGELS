@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -50,3 +51,82 @@ class ValidateRemoteRunTests(unittest.TestCase):
         self.assertIsNone(report["final_score"])
         self.assertIn("missing controller=finished task=3", report["failures"])
         self.assertIn("server missing all_tasks_done", report["failures"])
+
+    def test_accepts_full_score_with_steady_20hz_health_evidence(self) -> None:
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {
+                    "event_type": "control_loop_health",
+                    "details": {
+                        "sample_count": 399,
+                        "total_sample_count": 399,
+                        "total_interval_count": 398,
+                        "interval_p95_ms": 200.0,
+                        "interval_p99_ms": 250.0,
+                        "execution_p95_ms": 80.0,
+                        "interval_deadline_misses": 3,
+                        "execution_deadline_misses": 3,
+                    },
+                },
+                {
+                    "event_type": "control_loop_health",
+                    "details": {
+                        "sample_count": 400,
+                        "total_sample_count": 2000,
+                        "total_interval_count": 1999,
+                        "interval_p95_ms": 58.0,
+                        "interval_p99_ms": 82.0,
+                        "execution_p95_ms": 42.0,
+                        "interval_deadline_misses": 10,
+                        "execution_deadline_misses": 12,
+                    },
+                },
+            )
+        )
+
+        report = MODULE.validate_run(
+            PASSING_CLIENT,
+            PASSING_SERVER,
+            scheduler_events_text=events,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["runtime_health"]["passed"])
+
+    def test_rejects_stale_event_and_loop_threshold_violation(self) -> None:
+        events = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "event_type": "input_stale",
+                        "details": {"stale_inputs": ["odometry"]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_type": "control_loop_health",
+                        "details": {
+                            "sample_count": 400,
+                            "total_sample_count": 1000,
+                            "total_interval_count": 999,
+                            "interval_p95_ms": 70.0,
+                            "interval_p99_ms": 120.0,
+                            "execution_p95_ms": 55.0,
+                            "interval_deadline_misses": 20,
+                            "execution_deadline_misses": 20,
+                        },
+                    }
+                ),
+            )
+        )
+
+        report = MODULE.validate_run(
+            PASSING_CLIENT,
+            PASSING_SERVER,
+            scheduler_events_text=events,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["runtime_health"]["passed"])
+        self.assertGreaterEqual(len(report["runtime_health"]["failures"]), 6)

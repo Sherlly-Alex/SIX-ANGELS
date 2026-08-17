@@ -27,8 +27,16 @@ run:
 python3 scripts/validate_remote_run.py \
   --client /path/to/client_v2_task123.log \
   --server /path/to/server_v2_task123.log \
+  --events /path/to/scheduler_v2_task123.jsonl \
   --output /path/to/acceptance_report.json
 ```
+
+For post-`83c2412` runs, `--events` additionally requires a complete 400-sample
+timing window, no unexpected `input_stale`/`safety_stop`, interval p95 <= 65
+ms, interval p99 <= 100 ms, execution p95 <= 50 ms, and cumulative interval
+and execution deadline-miss rates <= 1%. Older archived event logs do not have
+the cumulative counters and may omit `--events`; they remain score evidence,
+not runtime-health evidence.
 
 Exit status zero and `"passed": true` require all of the following:
 

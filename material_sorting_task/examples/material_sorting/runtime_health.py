@@ -177,6 +177,8 @@ class InputDropFaultInjector:
 @dataclass(frozen=True)
 class ControlLoopHealth:
     sample_count: int
+    total_sample_count: int
+    total_interval_count: int
     interval_p50_ms: float
     interval_p95_ms: float
     interval_p99_ms: float
@@ -218,12 +220,15 @@ class ControlLoopTelemetry:
         self._last_report_s: float | None = None
         self._interval_deadline_misses = 0
         self._execution_deadline_misses = 0
+        self._total_interval_count = 0
+        self._total_sample_count = 0
 
     def begin(self, now_s: float) -> None:
         now = float(now_s)
         if self._last_start_s is not None:
             interval = max(0.0, now - self._last_start_s)
             self._intervals_s.append(interval)
+            self._total_interval_count += 1
             if interval > self.period_s * self.interval_miss_ratio:
                 self._interval_deadline_misses += 1
         self._last_start_s = now
@@ -233,6 +238,7 @@ class ControlLoopTelemetry:
     def finish(self, started_at_s: float, finished_at_s: float) -> ControlLoopHealth | None:
         duration = max(0.0, float(finished_at_s) - float(started_at_s))
         self._executions_s.append(duration)
+        self._total_sample_count += 1
         if duration > self.period_s:
             self._execution_deadline_misses += 1
         if (
@@ -256,6 +262,8 @@ class ControlLoopTelemetry:
         executions = tuple(self._executions_s)
         return ControlLoopHealth(
             sample_count=len(executions),
+            total_sample_count=self._total_sample_count,
+            total_interval_count=self._total_interval_count,
             interval_p50_ms=self._percentile(intervals, 0.50) * 1000.0,
             interval_p95_ms=self._percentile(intervals, 0.95) * 1000.0,
             interval_p99_ms=self._percentile(intervals, 0.99) * 1000.0,
