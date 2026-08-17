@@ -84,8 +84,9 @@ Task 3 remains fail-closed.
 - Perception enters through `Mapping[str, TargetObservation]`.
 - Cross-task data uses one `CompetitionTaskMemory` instance injected into both
   executors by `build_task_executors`.
-- Server `/referee/*`, `/material/grasp_confirmed`, and
-  `/material/unsafe_collision` remain authoritative.
+- Server `/referee/*` remains authoritative.  The official Server interface
+  does not include `/material/grasp_confirmed`; contact completion uses local
+  wrist compliance and bounded preload rather than a private Server topic.
 
 Important files:
 

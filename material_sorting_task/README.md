@@ -184,16 +184,16 @@ bash scripts/run_client.sh
 ```
 
 该模式会真实移动底盘、升降轴、头部和双臂，但不会执行向内合拢、柔顺挤压或抬升。
-Server 的 `/material/unsafe_collision` 会让执行器立即停止推进并保持最后的机械臂命令。
+执行器的本地安全检查会在检测到不安全状态时停止推进并保持最后的机械臂命令。
 测试期间不得同时运行 `run_desktop_grasp.sh` 或其他机械臂控制节点。
 
 ### 任务 1 双侧接触测试
 
 `contact_only` 继续调用桌面抓取模块的标定逆解：完成开放预抓取后，按照任务 1
-货源槽位的固定 `yaw0` 方向让两个张开的夹爪缓慢向内移动。Server 的
-`/material/grasp_confirmed` 必须连续为真 0.30 秒；首次检测到双侧接触时会立即冻结
-当前命令。如果标定接触位尚未得到双侧反馈，则复用桌面抓取模块的 1 mm 步进、最大
-4 mm 有限向内搜索；确认后保持接触姿态，并在确认后的柔顺挤压和抬升前阻塞。
+货源槽位的固定 `yaw0` 方向让两个张开的夹爪缓慢向内移动。接触仅依据本地双侧腕部
+柔顺反馈和有界预紧判定，不等待官方 Server 未公开的抓取确认话题。如果标定接触位
+尚未获得双侧腕部对齐，则复用桌面抓取模块的 1 mm 步进、最大 4 mm 有限向内搜索；
+确认后保持接触姿态，并在确认后的柔顺挤压和抬升前阻塞。
 
 ```bash
 MATERIAL_EXECUTION_MODE=contact_only \
@@ -237,7 +237,7 @@ bash scripts/run_client.sh
 真实物体坐标。详细接口、目录和停机条件见
 [`docs/SHELF_TASK12_INTEGRATION.md`](docs/SHELF_TASK12_INTEGRATION.md)。
 
-该模式仍会响应 `/material/unsafe_collision` 并立即停止推进。
+该模式仍会在本地安全检查失败时立即停止推进。
 
 桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
 

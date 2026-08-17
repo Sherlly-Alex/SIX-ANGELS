@@ -35,8 +35,8 @@ copied because this repository already has a verified long-lived architecture:
                      -> competition_adapter.py
                      -> LayeredGrid dynamic overlay
 
-/material/unsafe_collision -> ExecutionContext
-                           -> executor fail-closed stop
+local safety check -> ExecutionContext
+                   -> executor fail-closed stop
 ```
 
 `client_task.py` remains the only owner of `/cmd_vel` and the arm publishers.
@@ -156,7 +156,6 @@ public inputs are alive:
 ros2 topic info /cmd_vel -v
 ros2 topic hz /slamware_ros_sdk_server_node/odom
 ros2 topic hz /material/detections
-ros2 topic echo /material/unsafe_collision --once
 ```
 
 Start with a fresh Server and navigation only:

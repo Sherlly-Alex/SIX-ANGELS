@@ -684,7 +684,6 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     # reliable than the bbox yaw, which becomes noisy as the arms occlude the
     # target during approach.
     SOURCE_ORIENTATION = "yaw0"
-    CONTACT_CONFIRM_TIME_S = 0.30
     CONTACT_TIMEOUT_S = 15.0
     CONTACT_SEARCH_STEP_M = 0.001
     CONTACT_SEARCH_MAX_M = 0.004
@@ -709,8 +708,10 @@ class Task1ContactExecutor(Task1PregraspExecutor):
     COMPLIANT_SINGLE_SIDE_WAIT_S = 2.0
     COMPLIANT_RETRY_BACKOFF_M = 0.001
     COMPLIANT_MAX_RETRIES = 1
-    REQUIRE_SERVER_CONTACT = True
-    ALLOW_SETTLED_MAX_SEARCH = False
+    # The official Server exposes referee state, odometry, TF, joint state and
+    # cameras, but no grasp-confirmation topic.  Completion therefore depends
+    # on bilateral local wrist compliance plus a bounded preload only.
+    ALLOW_SETTLED_MAX_SEARCH = True
 
     def __init__(
         self,
@@ -816,41 +817,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     arm_command=self._held_arm_command,
                 )
 
-        observe_server_contact = getattr(
-            self._contact, "observe_server_contact", None
-        )
-        if callable(observe_server_contact):
-            observe_server_contact(context.grasp_confirmed)
         compliance_enabled = bool(
             getattr(self._contact, "compliance_enabled", False)
         )
-
-        # Once bilateral contact appears, freeze the last command instead of
-        # continuing toward the unconstrained IK solution.  A short stable
-        # confirmation rejects single-frame contact noise.  If contact drops,
-        # resume the bounded inward ramp from the same command.  The compliant
-        # controller instead keeps ticking so joint 6 can follow the measured
-        # surface angle before it is locked.
-        if (
-            not compliance_enabled
-            and self.REQUIRE_SERVER_CONTACT
-            and self._contact_since_s is not None
-        ):
-            if context.grasp_confirmed:
-                contact_age_s = max(0.0, now_s - self._contact_since_s)
-                if contact_age_s >= self.CONTACT_CONFIRM_TIME_S:
-                    return StageResult.succeeded(
-                        "task 1 Server confirmed stable bilateral target contact; "
-                        "holding before squeeze and lift",
-                        arm_command=self._held_arm_command,
-                    )
-                return StageResult.running(
-                    "task 1 bilateral contact detected; freezing command for "
-                    f"confirmation ({contact_age_s:.2f}/"
-                    f"{self.CONTACT_CONFIRM_TIME_S:.2f}s)",
-                    arm_command=self._held_arm_command,
-                )
-            self._contact_since_s = None
 
         if not self._contact.planned:
             try:
@@ -867,18 +836,6 @@ class Task1ContactExecutor(Task1PregraspExecutor):
                     f"task 1 contact-pose planning failed: {exc}",
                     arm_command=self._held_arm_command,
                 )
-
-        if (
-            not compliance_enabled
-            and self.REQUIRE_SERVER_CONTACT
-            and context.grasp_confirmed
-        ):
-            self._contact_since_s = now_s
-            return StageResult.running(
-                "task 1 Server detected bilateral target contact; "
-                "freezing the current open-gripper command",
-                arm_command=self._held_arm_command,
-            )
 
         try:
             command, pose_settled, detail = self._contact.update(
@@ -963,13 +920,9 @@ class Task1ContactExecutor(Task1PregraspExecutor):
 
         elapsed_s = max(0.0, now_s - self._stage_started_s)
         if elapsed_s >= self.CONTACT_TIMEOUT_S:
-            timeout_goal = (
-                "bilateral Server confirmation"
-                if self.REQUIRE_SERVER_CONTACT
-                else "the maximum bounded preload to settle"
-            )
             return StageResult.blocked(
-                f"task 1 contact approach timed out waiting for {timeout_goal} "
+                "task 1 contact approach timed out waiting for bilateral wrist "
+                "alignment or the maximum bounded preload to settle "
                 f"after {elapsed_s:.1f}s: {detail}",
                 arm_command=command,
             )
@@ -980,7 +933,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             f"half_width={self._contact.half_width:.3f}; "
             f"contact_search={self._contact_search_used_m * 1000.0:.0f}/"
             f"{self.CONTACT_SEARCH_MAX_M * 1000.0:.0f}mm; "
-            f"{settled_text}grasp_confirmed=false; {detail}",
+            f"{settled_text}{detail}",
             arm_command=command,
         )
 
@@ -1008,19 +961,6 @@ class Task1ContactExecutor(Task1PregraspExecutor):
 
         if bilateral_aligned:
             self._compliance_wait_since_s = None
-            if self.REQUIRE_SERVER_CONTACT:
-                if context.grasp_confirmed:
-                    return StageResult.succeeded(
-                        "task 1 Server contact and bilateral compliant wrist "
-                        f"alignment are confirmed; {diagnostic}",
-                        arm_command=command,
-                    )
-                return StageResult.running(
-                    "task 1 both wrists are aligned and locked; waiting for "
-                    f"Server bilateral contact confirmation; {diagnostic}",
-                    arm_command=command,
-                )
-
             if self._compliance_post_align_target_m is None:
                 self._compliance_post_align_target_m = min(
                     self.COMPLIANT_ABSOLUTE_MAX_M,
@@ -1278,7 +1218,6 @@ class Task1LiftExecutor(Task1ContactExecutor):
     """Apply the bounded preload, lift 15 cm, then hold before transport."""
 
     name = "task1_lift_only"
-    REQUIRE_SERVER_CONTACT = False
     ALLOW_SETTLED_MAX_SEARCH = True
     # The compliant phase now includes the visible 10 mm approach outside the
     # box surface.  Keep it bounded but leave enough time for a one-sided

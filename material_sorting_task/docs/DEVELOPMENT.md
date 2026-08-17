@@ -33,9 +33,12 @@ Server referee before retrying or advancing a scored task. The explicit
 `pregrasp_only` additionally moves both open arms to the calibrated non-contact
 pregrasp pose using the same long-lived Client and keeps the last commanded pose
 across the deliberate block. `contact_only` reuses the desktop-grasp calibrated
-contact IK and freezes on stable bilateral `/material/grasp_confirmed` feedback.
-If the nominal contact pose does not yet produce bilateral feedback, it reuses
-the standalone grasp's 1 mm steps with a hard 4 mm inward-search bound.
+contact IK and confirms contact exclusively from local bilateral wrist
+compliance followed by a bounded preload.  The official Server image does not
+publish `/material/grasp_confirmed`; waiting on that private topic would make
+the formal Client block forever.  If the nominal contact pose does not yet
+produce bilateral wrist alignment, the executor reuses the standalone grasp's
+1 mm steps with a hard 4 mm inward-search bound.
 The standalone desktop-grasp executor still has no formal result action/status.
 The experimental `task12_full` path performs task-1 transport/shelf place and
 task-2 shelf grasp/return-to-origin through the formal `TaskExecutor`,

@@ -74,7 +74,6 @@ class ExecutionContext:
     referee_gameinfo: Mapping[str, Any] = field(default_factory=dict)
     referee_taskinfo: str = ""
     score: int = 0
-    grasp_confirmed: bool = False
     unsafe_collision: bool = False
 
 

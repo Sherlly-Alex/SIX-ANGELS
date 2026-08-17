@@ -148,9 +148,6 @@ class FakeCompliantContactController(FakeContactController):
     def prepare_compliance(self, now_s, joint_states):
         return True, self.diagnostic_summary
 
-    def observe_server_contact(self, confirmed):
-        return None
-
     def retry_compliance(self):
         self.bilateral_aligned = False
 
@@ -285,7 +282,6 @@ def context(
     joints=None,
     *,
     unsafe_collision=False,
-    grasp_confirmed=False,
     target_orientation="yaw90",
 ):
     return ExecutionContext(
@@ -309,7 +305,6 @@ def context(
                 score=0.9,
             )
         },
-        grasp_confirmed=grasp_confirmed,
         unsafe_collision=unsafe_collision,
     )
 
@@ -721,80 +716,6 @@ class Task1ContactExecutorTests(unittest.TestCase):
         executor.enter_stage(TaskStage.GRASP, at_goal)
         return executor, contact_controller, at_goal
 
-    def test_freezes_on_stable_server_contact_and_blocks_before_lift(self) -> None:
-        executor, contact_controller, at_goal = self._reach_contact_stage()
-
-        approaching = executor.tick(TaskStage.GRASP, at_goal)
-        self.assertEqual(approaching.status, StageStatus.RUNNING)
-        self.assertEqual(contact_controller.plan_orientation, "yaw0")
-        self.assertEqual(contact_controller.plan_target[2], 0.834)
-        updates_before_contact = contact_controller.update_count
-
-        first_contact = executor.tick(
-            TaskStage.GRASP,
-            context(
-                0.10,
-                odometry(-0.18, 1.55, math.pi / 2.0),
-                grasp_confirmed=True,
-            ),
-        )
-        self.assertEqual(first_contact.status, StageStatus.RUNNING)
-        updates_at_contact = contact_controller.update_count
-        self.assertEqual(updates_at_contact, updates_before_contact)
-
-        confirming = executor.tick(
-            TaskStage.GRASP,
-            context(
-                0.25,
-                odometry(-0.18, 1.55, math.pi / 2.0),
-                grasp_confirmed=True,
-            ),
-        )
-        self.assertEqual(confirming.status, StageStatus.RUNNING)
-        self.assertEqual(contact_controller.update_count, updates_at_contact)
-
-        confirmed = executor.tick(
-            TaskStage.GRASP,
-            context(
-                0.41,
-                odometry(-0.18, 1.55, math.pi / 2.0),
-                grasp_confirmed=True,
-            ),
-        )
-        self.assertEqual(confirmed.status, StageStatus.SUCCEEDED)
-        self.assertEqual(confirmed.arm_command, ARM_COMMAND)
-
-        executor.enter_stage(TaskStage.LIFT, at_goal)
-        blocked = executor.tick(TaskStage.LIFT, at_goal)
-        self.assertEqual(blocked.status, StageStatus.BLOCKED)
-        self.assertIn("lift", blocked.message)
-        self.assertEqual(blocked.arm_command, ARM_COMMAND)
-
-    def test_dropped_contact_resumes_bounded_inward_motion(self) -> None:
-        executor, contact_controller, at_goal = self._reach_contact_stage()
-        executor.tick(TaskStage.GRASP, at_goal)
-        executor.tick(
-            TaskStage.GRASP,
-            context(
-                0.10,
-                odometry(-0.18, 1.55, math.pi / 2.0),
-                grasp_confirmed=True,
-            ),
-        )
-        updates_at_contact = contact_controller.update_count
-
-        resumed = executor.tick(
-            TaskStage.GRASP,
-            context(
-                0.20,
-                odometry(-0.18, 1.55, math.pi / 2.0),
-                grasp_confirmed=False,
-            ),
-        )
-
-        self.assertEqual(resumed.status, StageStatus.RUNNING)
-        self.assertGreater(contact_controller.update_count, updates_at_contact)
-
     def test_settled_pose_searches_inward_in_bounded_millimeter_steps(self) -> None:
         executor, contact_controller, at_goal = self._reach_contact_stage()
 
@@ -833,6 +754,12 @@ class Task1ContactExecutorTests(unittest.TestCase):
             context(now_s, odometry(-0.18, 1.55, math.pi / 2.0)),
         )
         self.assertEqual(len(contact_controller.tighten_offsets), 4)
+        completed = executor.tick(
+            TaskStage.GRASP,
+            context(now_s + 0.10, odometry(-0.18, 1.55, math.pi / 2.0)),
+        )
+        self.assertEqual(completed.status, StageStatus.SUCCEEDED)
+        self.assertIn("maximum bounded inward preload", completed.message)
 
     def test_unsafe_structure_collision_holds_contact_command(self) -> None:
         executor, _contact_controller, at_goal = self._reach_contact_stage()

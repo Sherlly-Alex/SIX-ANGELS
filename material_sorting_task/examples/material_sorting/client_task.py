@@ -20,7 +20,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float64MultiArray, Int32, String
+from std_msgs.msg import Float64MultiArray, Int32, String
 from vision_msgs.msg import Detection3DArray
 
 from competition_controller import (
@@ -86,8 +86,6 @@ class CompetitionClient(Node):
             deque[str | None],
         ] = {}
         self.target_observations: dict[str, TargetObservation] = {}
-        self.grasp_confirmed = False
-        self.unsafe_collision = False
         self._last_wait_log_ns = 0
         self._last_progress_log_ns = 0
         self._last_controller_serial = -1
@@ -293,18 +291,6 @@ class CompetitionClient(Node):
         )
         self.create_subscription(Int32, "/referee/score", self._score_cb, 5)
         self.create_subscription(
-            Bool,
-            "/material/grasp_confirmed",
-            self._grasp_confirmed_cb,
-            10,
-        )
-        self.create_subscription(
-            Bool,
-            "/material/unsafe_collision",
-            self._unsafe_collision_cb,
-            10,
-        )
-        self.create_subscription(
             Odometry, "/slamware_ros_sdk_server_node/odom", self._odom_cb, 10
         )
         self.create_subscription(JointState, "/joint_states", self._joints_cb, 10)
@@ -428,12 +414,6 @@ class CompetitionClient(Node):
 
     def _score_cb(self, msg: Int32) -> None:
         self.score = int(msg.data)
-
-    def _grasp_confirmed_cb(self, msg: Bool) -> None:
-        self.grasp_confirmed = bool(msg.data)
-
-    def _unsafe_collision_cb(self, msg: Bool) -> None:
-        self.unsafe_collision = bool(msg.data)
 
     def _odom_cb(self, msg: Odometry) -> None:
         self.latest_odometry = msg
@@ -805,8 +785,6 @@ class CompetitionClient(Node):
                 referee_gameinfo=self.referee_gameinfo,
                 referee_taskinfo=self.referee_taskinfo,
                 score=self.score,
-                grasp_confirmed=self.grasp_confirmed,
-                unsafe_collision=self.unsafe_collision,
             )
         )
 

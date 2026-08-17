@@ -558,9 +558,9 @@ class ContactGraspController(OpenPregraspController):
 
     # Contact with the box can stop the measured joints before they reach the
     # unconstrained IK solution.  This tolerance does not declare success; it
-    # only permits the hard-bounded inward search to advance.  The contact-only
-    # executor still uses Server bilateral contact as its sole success signal;
-    # lift-only may instead require the maximum bounded preload to settle.
+    # only permits the hard-bounded inward search to advance.  Completion uses
+    # local bilateral wrist compliance and a bounded preload; the official
+    # Server does not expose a grasp-confirmation ROS topic.
     ARM_POSITION_TOL = SQUEEZE_CONTACT_POS_TOL
 
     def __init__(self, kdl: MMK2Kdl | None = None) -> None:
@@ -578,7 +578,6 @@ class ContactGraspController(OpenPregraspController):
         self._baseline_ready = False
         self._compliance_available = False
         self._compliance_abandoned_reason: str | None = None
-        self._server_contact = False
 
     @property
     def half_width(self) -> float | None:
@@ -663,7 +662,6 @@ class ContactGraspController(OpenPregraspController):
         self._baseline_ready = False
         self._compliance_available = False
         self._compliance_abandoned_reason = None
-        self._server_contact = False
 
     def prepare_compliance(
         self,
@@ -718,9 +716,6 @@ class ContactGraspController(OpenPregraspController):
         self._compliance_available = True
         return True, self.diagnostic_summary
 
-    def observe_server_contact(self, confirmed: bool) -> None:
-        self._server_contact = bool(confirmed)
-
     def abandon_compliance(self, reason: str) -> None:
         """Return to the validated bounded position-only contact search."""
 
@@ -741,7 +736,6 @@ class ContactGraspController(OpenPregraspController):
 
         if not self.compliance_enabled:
             return
-        self._server_contact = False
         for wrist in (self._left_wrist, self._right_wrist):
             if wrist.aligned and wrist.locked_position is not None:
                 continue
@@ -949,12 +943,9 @@ class ContactGraspController(OpenPregraspController):
         # acceleration torque cannot masquerade as box contact.  Once the
         # debounce has started, preserve it across the next half-millimetre IK
         # step as long as the effort evidence remains present.
-        contact_evidence = self._server_contact or (
-            effort_evidence
-            and (
-                pose_settled
-                or wrist.contact_candidate_since_s is not None
-            )
+        contact_evidence = effort_evidence and (
+            pose_settled
+            or wrist.contact_candidate_since_s is not None
         )
         if not wrist.contact_seen:
             if contact_evidence:
@@ -986,7 +977,6 @@ class ContactGraspController(OpenPregraspController):
 
             angle_aligned = (
                 wrist.latest_angle_delta >= WRIST_CONTACT_MIN_ROTATION_RAD
-                or self._server_contact
             )
             # Effort is required to latch first contact above.  It is not
             # required to remain high while the free wrist rotates into full
