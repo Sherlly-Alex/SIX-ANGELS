@@ -34,6 +34,11 @@ GRASP_INITIAL_PRELOAD = 0.002
 # and the wrist can follow the surface before it is locked.
 COMPLIANT_ENTRY_CLEARANCE_M = 0.010
 COMPLIANT_ENTRY_TRAVEL_M = GRASP_INITIAL_PRELOAD + COMPLIANT_ENTRY_CLEARANCE_M
+# A unilateral wrist lock indicates that the estimated box centre is slightly
+# biased across the robot's lateral axis.  One bounded recentering step lets
+# the opposite hand close the residual gap while relieving the locked hand.
+COMPLIANT_LATERAL_RECENTER_STEP_M = 0.004
+COMPLIANT_LATERAL_RECENTER_MAX_M = 0.004
 BOX_HALF_EXTENTS_BY_ORIENTATION = {
     "yaw0": np.array([0.12, 0.08], dtype=float),
     "yaw90": np.array([0.08, 0.12], dtype=float),
@@ -351,6 +356,7 @@ class OpenPregraspController:
         *,
         center_backoff_x: float,
         half_width: float,
+        center_lateral_offset_m: float = 0.0,
         left_rotation: np.ndarray = LEFT_A_ROT,
         right_rotation: np.ndarray = RIGHT_A_ROT,
     ) -> ArmCommand:
@@ -358,6 +364,8 @@ class OpenPregraspController:
             raise PregraspInputError("target_world contains non-finite values")
         if not math.isfinite(float(center_backoff_x)):
             raise PregraspInputError("center_backoff_x is non-finite")
+        if not math.isfinite(float(center_lateral_offset_m)):
+            raise PregraspInputError("center_lateral_offset_m is non-finite")
         if not math.isfinite(float(half_width)) or float(half_width) <= 0.0:
             raise PregraspInputError("half_width must be finite and positive")
         left_rotation = np.asarray(left_rotation, dtype=float)
@@ -375,7 +383,7 @@ class OpenPregraspController:
         self._target_base = tuple(float(value) for value in box_center_base)
 
         arm_center_base = box_center_base + np.array(
-            [-float(center_backoff_x), 0.0, HAND_Z_OFFSET],
+            [-float(center_backoff_x), float(center_lateral_offset_m), HAND_Z_OFFSET],
             dtype=float,
         )
         left_target = arm_center_base + np.array(
@@ -579,6 +587,7 @@ class ContactGraspController(OpenPregraspController):
         self._compliance_available = False
         self._compliance_abandoned_reason: str | None = None
         self._server_contact = False
+        self._lateral_center_bias_m = 0.0
 
     @property
     def half_width(self) -> float | None:
@@ -650,7 +659,11 @@ class ContactGraspController(OpenPregraspController):
             return "compliance=legacy_no_effort"
         left = self._wrist_detail(self._left_wrist)
         right = self._wrist_detail(self._right_wrist)
-        return f"compliance=active; left[{left}]; right[{right}]"
+        return (
+            "compliance=active; "
+            f"center_bias_y={self._lateral_center_bias_m * 1000.0:+.1f}mm; "
+            f"left[{left}]; right[{right}]"
+        )
 
     def reset(self) -> None:
         super().reset()
@@ -664,6 +677,7 @@ class ContactGraspController(OpenPregraspController):
         self._compliance_available = False
         self._compliance_abandoned_reason = None
         self._server_contact = False
+        self._lateral_center_bias_m = 0.0
 
     def prepare_compliance(
         self,
@@ -742,6 +756,19 @@ class ContactGraspController(OpenPregraspController):
         if not self.compliance_enabled:
             return
         self._server_contact = False
+        left_aligned = self._left_wrist.aligned
+        right_aligned = self._right_wrist.aligned
+        if left_aligned != right_aligned:
+            # The left hand approaches from +Y and the right from -Y.  Shift
+            # toward the locked hand: it gives that hand clearance and moves
+            # the opposite hand inward toward the box centre.
+            direction = 1.0 if left_aligned else -1.0
+            self._lateral_center_bias_m = float(np.clip(
+                self._lateral_center_bias_m
+                + direction * COMPLIANT_LATERAL_RECENTER_STEP_M,
+                -COMPLIANT_LATERAL_RECENTER_MAX_M,
+                COMPLIANT_LATERAL_RECENTER_MAX_M,
+            ))
         for wrist in (self._left_wrist, self._right_wrist):
             if wrist.aligned and wrist.locked_position is not None:
                 continue
@@ -781,6 +808,7 @@ class ContactGraspController(OpenPregraspController):
             joint_states,
             center_backoff_x=GRASP_BACKOFF_X,
             half_width=self._half_width,
+            center_lateral_offset_m=self._lateral_center_bias_m,
             left_rotation=LEFT_CONTACT_ROT,
             right_rotation=RIGHT_CONTACT_ROT,
         )
@@ -855,6 +883,7 @@ class ContactGraspController(OpenPregraspController):
             joint_states,
             center_backoff_x=GRASP_BACKOFF_X,
             half_width=self._half_width,
+            center_lateral_offset_m=self._lateral_center_bias_m,
             left_rotation=LEFT_CONTACT_ROT,
             right_rotation=RIGHT_CONTACT_ROT,
         )
@@ -905,6 +934,7 @@ class ContactGraspController(OpenPregraspController):
             joint_states,
             center_backoff_x=GRASP_BACKOFF_X,
             half_width=self._half_width,
+            center_lateral_offset_m=self._lateral_center_bias_m,
             left_rotation=LEFT_CONTACT_ROT,
             right_rotation=RIGHT_CONTACT_ROT,
         )
