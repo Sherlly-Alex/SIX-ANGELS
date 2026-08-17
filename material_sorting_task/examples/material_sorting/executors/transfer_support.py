@@ -119,6 +119,8 @@ class TransferMotion:
         # None keeps the historical generic TRANSIT_CARRY behaviour.
         self._held_geometry: HeldObjectGeometry | None = None
         self._carried_checker = CarriedEnvelopeChecker()
+        self._held_path_clearance_m: float | None = None
+        self._held_min_clearance_m: float | None = None
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -155,6 +157,8 @@ class TransferMotion:
         self._lateral_yaw_tolerance_rad = self.LATERAL_YAW_TOLERANCE_RAD
         self._lateral_timeout_s = self.LATERAL_TIMEOUT_S
         self._held_geometry = None
+        self._held_path_clearance_m = None
+        self._held_min_clearance_m = None
 
     def begin_navigation(
         self,
@@ -184,6 +188,8 @@ class TransferMotion:
         self._goal = goal
         self._last_tick_s = None
         self._held_geometry = held_geometry
+        self._held_path_clearance_m = None
+        self._held_min_clearance_m = None
         if not self._navigation.set_goal(goal, pose[0], pose[1]):
             self._goal = None
             return False
@@ -202,6 +208,8 @@ class TransferMotion:
                 self._goal = None
                 self._held_geometry = None
                 return False
+            self._held_path_clearance_m = float(safety.clearance_m)
+            self._held_min_clearance_m = float(safety.clearance_m)
         return True
 
     def tick_navigation(
@@ -239,11 +247,26 @@ class TransferMotion:
                     (0.0, 0.0),
                     f"carried envelope guard stopped motion: {safety.detail}",
                 )
+            clearance = float(safety.clearance_m)
+            self._held_min_clearance_m = min(
+                clearance,
+                self._held_min_clearance_m
+                if self._held_min_clearance_m is not None
+                else clearance,
+            )
         detail = (
             f"goal=({self._goal.x:.2f}, {self._goal.y:.2f}, "
             f"{self._goal.yaw:.2f}); nav_status={status.value}; "
             f"{format_nav_telemetry(self._navigation.telemetry, phase='transfer')}"
         )
+        if self._held_geometry is not None:
+            detail += (
+                "; measured_carried_guard=active "
+                f"source={self._held_geometry.source or 'unknown'} "
+                f"half_width={self._held_geometry.half_width_m:.3f}m "
+                f"path_clearance={self._held_path_clearance_m:.3f}m "
+                f"minimum_clearance={self._held_min_clearance_m:.3f}m"
+            )
         if status is NavigationStatus.GOAL_REACHED:
             detail = f"{detail}; {goal_reached_event(self._goal)}"
         return status, (command.linear_x, command.angular_z), detail

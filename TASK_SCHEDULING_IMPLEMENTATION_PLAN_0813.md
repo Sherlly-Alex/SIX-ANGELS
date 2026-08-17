@@ -1531,3 +1531,24 @@ execution p95=41.41 ms、两类 miss rate 均 <0.2%，且无 stale/safety 事件
 下一轮必须使用全新的 Server/Client，关闭 fault-dir 和 measured-carry guard，以默认 5 s
 报告周期完成 160 分无故障基线。该门通过后，才允许只改变
 `MATERIAL_MEASURED_CARRY_GUARD=1` 做同 seed A/B 验证。
+
+### 18.8 实测搬运包络同种子 A/B 验收（当前批次）
+
+无故障官方 Server 基线 `v2_runtime_baseline_r1` 已通过：最终分数 160/160，
+无 BLOCKED、SAFE_HOLD、Executor error 或 unsafe collision；interval p95=59.95 ms、
+p99=120.98 ms、execution p95=41.41 ms，两类 deadline miss rate 均低于 0.2%。
+验收采用由 150 ms 底盘命令 lease 推导出的 p99 上限 125 ms，并在最新
+`scheduler_started` 到首个 `state=finished` 的活动 session 内计算，避免 FINISHED 后空闲日志稀释结果。
+
+下一轮只打开 `MATERIAL_MEASURED_CARRY_GUARD=1`，其余 Server 随机种子、Client 模式、
+调度策略和健康阈值必须与基线一致。为避免仅凭启动开关误判，`TransferMotion` 在实际启用实测包络时
+持续记录 `source`、实测半宽、整条规划路径净空和逐 tick 最小净空；
+`validate_remote_run.py --require-measured-carry` 强制要求：
+
+- 启动日志包含 `measured_carry_guard=True`；
+- Task 1 和 Task 3 均出现 `measured_carried_guard=active` 正向证据；
+- 两项运行中最小净空均不低于 `CarriedEnvelopeChecker` 的 0.02 m 硬阈值；
+- 没有 `carried envelope guard stopped motion`，仍取得 160 分并通过同一运行健康门。
+
+本批离线回归：`466 passed, 5 skipped, 1 warning`（仅排除本机缺少 OpenCV 的既有
+`test_empty_layer_verifier.py`）；workspace 语法检查和归档哈希在提交后重新生成。

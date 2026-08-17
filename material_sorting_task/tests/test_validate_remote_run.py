@@ -22,6 +22,11 @@ PASSING_SERVER = """
 task 3 complete
 all_tasks_done total 160 = task1 40 + task2 60 + task3 60
 """
+MEASURED_CARRY_CLIENT = PASSING_CLIENT + """
+client started; measured_carry_guard=True
+progress: measured_carried_guard=active source=task1 half_width=0.080m path_clearance=0.100m minimum_clearance=0.055m
+progress: measured_carried_guard=active source=task3 half_width=0.075m path_clearance=0.090m minimum_clearance=0.041m
+"""
 
 
 class ValidateRemoteRunTests(unittest.TestCase):
@@ -51,6 +56,41 @@ class ValidateRemoteRunTests(unittest.TestCase):
         self.assertIsNone(report["final_score"])
         self.assertIn("missing controller=finished task=3", report["failures"])
         self.assertIn("server missing all_tasks_done", report["failures"])
+
+    def test_accepts_required_measured_carry_evidence(self) -> None:
+        report = MODULE.validate_run(
+            MEASURED_CARRY_CLIENT,
+            PASSING_SERVER,
+            require_measured_carry=True,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["measured_carry"]["passed"])
+        self.assertEqual(
+            report["measured_carry"]["observed_sources"],
+            ["task1", "task3"],
+        )
+
+    def test_rejects_missing_or_unsafe_measured_carry_evidence(self) -> None:
+        client = PASSING_CLIENT + """
+client started; measured_carry_guard=True
+progress: measured_carried_guard=active source=task1 half_width=0.080m path_clearance=0.100m minimum_clearance=0.019m
+"""
+        report = MODULE.validate_run(
+            client,
+            PASSING_SERVER,
+            require_measured_carry=True,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["measured_carry"]["passed"])
+        self.assertIn(
+            "measured_carry: missing active guard telemetry for task3",
+            report["failures"],
+        )
+        self.assertTrue(
+            any("task1 minimum_clearance_m" in item for item in report["failures"])
+        )
 
     def test_accepts_full_score_with_steady_20hz_health_evidence(self) -> None:
         events = "\n".join(

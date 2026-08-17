@@ -23,6 +23,13 @@ FATAL_PATTERNS = {
     "executor_error": re.compile(r"executor error", re.IGNORECASE),
     "unsafe_collision": re.compile(r"unsafe collision", re.IGNORECASE),
 }
+MEASURED_CARRY_RE = re.compile(
+    r"measured_carried_guard=active\s+"
+    r"source=(task[123])\s+"
+    r"half_width=([0-9]+(?:\.[0-9]+)?)m\s+"
+    r"path_clearance=([0-9]+(?:\.[0-9]+)?)m\s+"
+    r"minimum_clearance=([0-9]+(?:\.[0-9]+)?)m"
+)
 
 
 def _read(path: Path) -> str:
@@ -39,6 +46,7 @@ def validate_run(
     max_interval_p99_ms: float = 125.0,
     max_execution_p95_ms: float = 50.0,
     max_deadline_miss_rate: float = 0.01,
+    require_measured_carry: bool = False,
 ) -> dict[str, object]:
     """Return a stable machine-readable acceptance report."""
 
@@ -95,6 +103,14 @@ def validate_run(
             for message in runtime_health["failures"]
         )
 
+    measured_carry = None
+    if require_measured_carry:
+        measured_carry = validate_measured_carry(client_text)
+        failures.extend(
+            f"measured_carry: {message}"
+            for message in measured_carry["failures"]
+        )
+
     return {
         "passed": not failures,
         "expected_score": expected_score,
@@ -105,6 +121,56 @@ def validate_run(
         "server_all_tasks_done": server_all_done,
         "fatal_counts": fatal_counts,
         "runtime_health": runtime_health,
+        "measured_carry": measured_carry,
+        "failures": failures,
+    }
+
+
+def validate_measured_carry(client_text: str) -> dict[str, object]:
+    """Require positive Task1/Task3 evidence from the opt-in carry guard."""
+
+    failures: list[str] = []
+    enabled = "measured_carry_guard=True" in client_text
+    if not enabled:
+        failures.append("startup flag measured_carry_guard=True is missing")
+
+    observations: dict[str, list[float]] = {}
+    for source, _half_width, _path_clearance, minimum_clearance in (
+        MEASURED_CARRY_RE.findall(client_text)
+    ):
+        observations.setdefault(source, []).append(float(minimum_clearance))
+
+    required_sources = {"task1", "task3"}
+    missing_sources = sorted(required_sources - observations.keys())
+    if missing_sources:
+        failures.append(
+            "missing active guard telemetry for " + ", ".join(missing_sources)
+        )
+
+    minimum_clearance_by_source = {
+        source: min(values) for source, values in sorted(observations.items())
+    }
+    minimum_allowed_m = 0.02
+    for source in sorted(required_sources & observations.keys()):
+        clearance = minimum_clearance_by_source[source]
+        if not math.isfinite(clearance) or clearance < minimum_allowed_m:
+            failures.append(
+                f"{source} minimum_clearance_m={clearance:.3f} below "
+                f"{minimum_allowed_m:.3f}"
+            )
+
+    guard_stops = client_text.count("carried envelope guard stopped motion")
+    if guard_stops:
+        failures.append(f"carried_envelope_guard_stops={guard_stops}")
+
+    return {
+        "passed": not failures,
+        "enabled": enabled,
+        "required_sources": sorted(required_sources),
+        "observed_sources": sorted(observations),
+        "minimum_clearance_m": minimum_clearance_by_source,
+        "minimum_allowed_m": minimum_allowed_m,
+        "guard_stop_count": guard_stops,
         "failures": failures,
     }
 
@@ -261,6 +327,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-interval-p99-ms", type=float, default=125.0)
     parser.add_argument("--max-execution-p95-ms", type=float, default=50.0)
     parser.add_argument("--max-deadline-miss-rate", type=float, default=0.01)
+    parser.add_argument(
+        "--require-measured-carry",
+        action="store_true",
+        help="require positive Task1/Task3 measured carry-guard telemetry",
+    )
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -276,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         max_interval_p99_ms=args.max_interval_p99_ms,
         max_execution_p95_ms=args.max_execution_p95_ms,
         max_deadline_miss_rate=args.max_deadline_miss_rate,
+        require_measured_carry=args.require_measured_carry,
     )
     payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:

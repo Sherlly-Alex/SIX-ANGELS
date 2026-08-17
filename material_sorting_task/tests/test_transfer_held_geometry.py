@@ -186,6 +186,11 @@ class TransferHeldGeometryTests(unittest.TestCase):
         self.assertIs(status, NavigationStatus.NAVIGATING)
         self.assertEqual(command, (0.10, 0.0))
         self.assertIn("NAV_TEL", detail)
+        self.assertIn("measured_carried_guard=active", detail)
+        self.assertIn("source=test", detail)
+        self.assertIn("half_width=0.080m", detail)
+        self.assertIn("path_clearance=", detail)
+        self.assertIn("minimum_clearance=", detail)
 
 
 if __name__ == "__main__":
