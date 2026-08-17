@@ -56,3 +56,15 @@ Recommended first matrix:
 
 If a seed fails, preserve the untouched artifacts and classify the first fatal
 state by task and stage before changing calibration constants.
+
+After copying all run directories under one artifact root, aggregate them with:
+
+```bash
+python3 scripts/validate_remote_matrix.py \
+  --root /path/to/artifact-root \
+  --seeds 20260817 20260818 20260819 20260820 20260821 \
+  --output /path/to/artifact-root/multiseed_acceptance.json
+```
+
+Release-candidate promotion requires `"passed": true`, `passed_seed_count: 5`
+and an empty `failed_seeds` list. Keep the generated JSON with the raw logs.
