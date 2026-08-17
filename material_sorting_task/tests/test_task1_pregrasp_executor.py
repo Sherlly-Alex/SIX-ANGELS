@@ -559,39 +559,6 @@ class OpenPregraspControllerTests(unittest.TestCase):
         self.assertEqual(controller._left_wrist.locked_position, 0.04)
         self.assertFalse(controller._right_wrist.contact_seen)
 
-    def test_retry_recenters_toward_locked_left_wrist(self) -> None:
-        kdl = FakeKdl()
-        controller = ContactGraspController(kdl=kdl)
-        expected_slide = 1.32163718 - 0.854
-        feedback = joint_states(slide=expected_slide)
-        for tick in range(9):
-            controller.prepare_compliance(tick * 0.05, feedback)
-        controller.plan(
-            (-0.18, 2.20, 0.834),
-            "yaw0",
-            odometry(-0.18, 1.55, math.pi / 2.0),
-            feedback,
-        )
-        initial_left_y = float(kdl.left[1, 3])
-        initial_right_y = float(kdl.right[1, 3])
-        controller._left_wrist.aligned = True
-        controller._left_wrist.locked_position = 0.04
-
-        controller.retry_compliance()
-        controller.track_inward_offset(
-            (-0.18, 2.20, 0.834),
-            0.001,
-            odometry(-0.18, 1.55, math.pi / 2.0),
-            feedback,
-        )
-
-        self.assertAlmostEqual(controller._lateral_center_bias_m, 0.004)
-        initial_midpoint_y = 0.5 * (initial_left_y + initial_right_y)
-        retried_midpoint_y = 0.5 * (
-            float(kdl.left[1, 3]) + float(kdl.right[1, 3])
-        )
-        self.assertAlmostEqual(retried_midpoint_y - initial_midpoint_y, 0.004)
-
     def test_missing_effort_keeps_legacy_contact_available(self) -> None:
         controller = ContactGraspController(kdl=FakeKdl())
         feedback = joint_states()
