@@ -1597,3 +1597,40 @@ Heuristic、推理 p95 不超过 25 ms，并固化模型/训练数据/配置三�
 当前仅完成代码与合成故障注入验证，没有生成或批准任何模型，也没有把策略切到
 `rl_guarded`。下一离线步骤应实现可复现的训练/盲测清单和 Heuristic 对照统计；新的精确
 observation 数据采集、真实 Shadow 多 seed 以及 measured-carry A/B 均按要求留在最终远程批次。
+
+### 18.11 成对盲测与 Heuristic 效果下界（当前离线批次）
+
+新增 `learning/benchmark.py` 与 `scripts/benchmark_scheduler_policy.py`，把 PR 11 的文字门槛
+变成可执行、可复现的离线判定：
+
+- Heuristic 对照从同一固定 observation 中读取 Multi-Critic utility，仅在 hard action mask
+  内做确定性 argmax；RL 和对照使用两个独立环境实例，但按相同 blind seed 成对 reset。
+- `SchedulingEnv` 将每步 elapsed time、path length 和 obstacle cost 作为只读评估指标返回，
+  不改变奖励和后端动作；恢复次数和安全违规继续由注入的训练/仿真 backend 明确报告。
+- 盲测 seed 不得与模型 metadata 中的 training seed 重叠；报告固定模型 SHA、逐 seed 完成/
+  成功/安全/mask/推理证据和成对指标。
+- 放行条件：所有 episode 完成、policy error=0、masked action=0、safety violation=0；RL 成功数
+  不低于 Heuristic；推理 p95 <=25 ms；elapsed/path/recoveries 至少一项相对改善达到默认 2%，
+  且成对 bootstrap 的 95% 改善下界严格大于 0。
+
+该门是训练环境中的效果下界，不包含 runtime 的动作保持/切换滞回，也不能替代 Shadow 与
+官方 Server。当前没有项目级仿真 backend 和批准模型，因此这里只完成评估器及确定性合成
+backend 故障注入；不得据此宣称 RL 已优于 Heuristic 或已获得 `rl_guarded` 放行。
+
+### 18.12 生产 EventLog 驱动的受约束回放预训练环境（当前离线批次）
+
+为避免 `train_maskable_ppo.py` 只有抽象 env factory、却没有可由项目数据驱动的具体环境，新增
+`learning/replay_env.py::ReplayBanditEnv`：
+
+- 回放数据新增固定宽度 `candidate_action_ids/candidate_utilities`；invalid/padded slot 的 utility
+  必须为 null，enabled slot 必须同时具有有限 utility 和动作 id。
+- 环境加载时再次核对 dataset schema、observation schema hash/形状/有限性、action mask、
+  selected slot 和每个候选槽位，不能绕过前置导出器手工注入非法样本。
+- 每个生产决策快照构成一个 contextual-bandit 状态；动作仍只能是 mask 内的有限候选槽位。
+  最佳有效 utility 奖励为 1，其余有效动作按 utility regret 扣减，masked/empty slot 固定 -100。
+- `build_replay_env` 通过 `MATERIAL_SCHEDULER_REPLAY_DATASET` 提供正式训练 CLI factory；训练时
+  必须把同一 dataset 传给 `--provenance`，由 §18.10 模型 metadata 固化字节哈希。
+
+该环境只预训练 Multi-Critic 候选排序，不包含机器人动力学、时序滞回、抓取/放置结果或裁判
+成功真值，因而不存在“用回放分数证明实机成功率”的替代关系。项目级随机化仿真 backend、
+Shadow 和官方 Server 仍分别执行 §18.11、§18.10 与最终远程门。

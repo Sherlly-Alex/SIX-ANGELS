@@ -25,7 +25,11 @@ def create_log(path: Path) -> None:
     event_log.emit({"event_type": "scheduler_started", "engine": "v2"})
     service = SchedulerDecisionService(event_log=event_log)
     service.decide(
-        (candidate("best", 2.0), candidate("blocked", 9.0, allowed=False)),
+        (
+            candidate("best", 2.0),
+            candidate("safe-low", 1.0),
+            candidate("blocked", 9.0, allowed=False),
+        ),
         now_s=1.0,
         world_state={
             "task_id": 1,
@@ -55,6 +59,13 @@ def test_replay_exports_only_validated_observation_records() -> None:
         assert summary.invalid_selections == 0
         assert records[0].selected_action_id == "best"
         assert records[0].selected_action_index == 0
+        assert records[0].candidate_action_ids[:3] == (
+            "best",
+            "safe-low",
+            "blocked",
+        )
+        assert records[0].candidate_utilities[0] > records[0].candidate_utilities[1]
+        assert records[0].candidate_utilities[2] is None
         assert records[0].source_file == "events.jsonl"
         assert len(records[0].source_sha256) == 64
         payload = dataset_path.read_text(encoding="utf-8")

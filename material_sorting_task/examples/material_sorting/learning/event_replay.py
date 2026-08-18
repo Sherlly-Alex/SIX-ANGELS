@@ -38,6 +38,8 @@ class ReplayRecord:
     max_candidates: int
     observation: tuple[float, ...]
     action_mask: tuple[bool, ...]
+    candidate_action_ids: tuple[str | None, ...]
+    candidate_utilities: tuple[float | None, ...]
     selected_action_index: int
     selected_action_id: str
     selection_source: str
@@ -231,6 +233,12 @@ def _build_record(
             max_candidates=maximum,
             observation=tuple(float(value) for value in values if value is not None),
             action_mask=tuple(action_mask),
+            candidate_action_ids=tuple(indices) + (None,) * (maximum - len(indices)),
+            candidate_utilities=tuple(
+                _finite_float(item.get("utility")) if item.get("valid") is True else None
+                for item in candidates
+            )
+            + (None,) * (maximum - len(candidates)),
             selected_action_index=selected_index,
             selected_action_id=selected_id,
             selection_source=str(selection_details.get("source", "unknown")),

@@ -186,6 +186,24 @@ python3 scripts/validate_rl_shadow.py shadow_run_1.jsonl shadow_run_2.jsonl \
 Shadow 验收要求 RL 实际接管次数为 0、所有建议均位于硬 action mask 内、只出现一个批准模型
 SHA256，且推理 P95 不超过配置的 25 ms 预算。
 
+通过回放门后，可在独立训练环境中把数据集作为受 mask 约束的 contextual-bandit 预训练环境。
+它学习候选排序，不模拟机器人动力学，也不能替代后续成对仿真和 Shadow：
+
+```bash
+export MATERIAL_SCHEDULER_REPLAY_DATASET=/data/scheduler_heuristic_baseline.jsonl
+export MATERIAL_SCHEDULER_REPLAY_EPISODE_LENGTH=256
+
+python3 -m learning.train_maskable_ppo \
+  --env-factory learning.replay_env:build_replay_env \
+  --output /models/scheduler_maskable_ppo.zip \
+  --timesteps 100000 \
+  --seed 20260818 \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET"
+```
+
+回放环境会再次校验 dataset/schema、固定 observation、action mask、候选槽位和 utility，非法
+动作获得硬惩罚；有效动作只按相对最优安全候选的 utility regret 获得排序奖励。
+
 ### 任务 1 底盘实动测试
 
 `nav_only` 会读取 `/material/detections` 中任务 1 目标颜色的稳定世界坐标，使用静态场景

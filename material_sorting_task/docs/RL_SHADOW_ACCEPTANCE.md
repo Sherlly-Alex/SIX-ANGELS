@@ -58,3 +58,29 @@ The gate fails when:
 Passing this offline gate permits evaluation to continue. It does not permit
 `rl_guarded` control. Simulation, multi-seed Shadow and final official-Server
 validation remain separate release gates.
+
+## Paired blind-seed benchmark
+
+The offline simulation factory must be deterministic under `reset(seed=...)`.
+Run the approved model and the observation-space deterministic utility baseline
+on separate environment instances with the same blind seeds:
+
+```bash
+python3 material_sorting_task/scripts/benchmark_scheduler_policy.py \
+  --env-factory project_training_env:build \
+  --model scheduler_maskable_ppo.zip \
+  --model-sha256 <approved-model-sha256> \
+  --seed-start 30000 \
+  --episodes 100 \
+  --max-inference-p95-ms 25 \
+  --minimum-relative-improvement 0.02 \
+  --output scheduler_blind_benchmark.json
+```
+
+The tool rejects overlap with the training seed stored in model metadata. It
+requires complete episodes, zero policy/mask/safety failures, no success-count
+regression, inference p95 within budget, and at least one paired metric
+(`elapsed_s`, `path_length_m`, `recoveries`) whose 95% bootstrap lower bound is
+positive and whose relative improvement reaches the configured threshold.
+This is an offline pre-release gate, not a substitute for runtime hysteresis,
+Shadow or official-Server acceptance.

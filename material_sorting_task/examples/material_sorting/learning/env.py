@@ -272,6 +272,9 @@ class SchedulingEnv(_EnvBase):
                 "action_mask": self.action_masks(),
                 "selected_action_index": int(action),
                 "reward_breakdown": breakdown,
+                "transition_elapsed_s": transition.elapsed_s,
+                "transition_path_length_m": transition.path_length_m,
+                "transition_obstacle_cost": transition.obstacle_cost,
             }
         )
         # ActionCatalog is snapshot-local; record the id before replacement.

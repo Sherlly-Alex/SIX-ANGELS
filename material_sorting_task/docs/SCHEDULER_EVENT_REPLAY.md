@@ -61,3 +61,30 @@ decisions are deliberately classified as legacy and `training_ready_decisions`
 is zero. This proves the trace pairing/audit path, but it is not permission to
 train. New local/remote runs must pass `--require-training-ready` before Phase
 RL-1 begins.
+
+## Replay pretraining environment
+
+`learning.replay_env.ReplayBanditEnv` revalidates every exported record and
+exposes its production observation and hard action mask through the interface
+required by MaskablePPO. It is a contextual-bandit ranking environment:
+
+- choosing the best valid candidate utility receives reward 1.0;
+- other valid candidates receive `1.0 - utility_regret`;
+- a masked or empty slot receives -100 and is reported invalid;
+- no motor command, referee mutation or Server-private state exists in the
+  environment.
+
+```bash
+export MATERIAL_SCHEDULER_REPLAY_DATASET=/data/scheduler_heuristic_baseline.jsonl
+export MATERIAL_SCHEDULER_REPLAY_EPISODE_LENGTH=256
+python3 -m learning.train_maskable_ppo \
+  --env-factory learning.replay_env:build_replay_env \
+  --output /models/scheduler_maskable_ppo.zip \
+  --timesteps 100000 \
+  --seed 20260818 \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET"
+```
+
+This stage pretrains candidate ranking only. Runtime hysteresis, recovery
+outcomes, task success and physical safety must still be evaluated by the
+paired simulation benchmark, RL Shadow and final official-Server gates.
