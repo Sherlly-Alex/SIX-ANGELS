@@ -98,8 +98,25 @@ def validate_model_package(
         declared_config_hash = metadata.get("training_config_sha256")
         if not isinstance(config, Mapping):
             failures.append("training_config is missing")
-        elif declared_config_hash != _canonical_sha256(config):
-            failures.append("training_config SHA256 mismatch")
+        else:
+            if declared_config_hash != _canonical_sha256(config):
+                failures.append("training_config SHA256 mismatch")
+            required_config = {
+                "seed",
+                "total_timesteps",
+                "learning_rate",
+                "n_steps",
+                "batch_size",
+                "max_candidates",
+                "environment_factory",
+                "code_revision",
+            }
+            if not required_config.issubset(config):
+                failures.append("training_config required fields are missing")
+            if not str(config.get("environment_factory", "")).strip():
+                failures.append("training environment factory is missing")
+            if not str(config.get("code_revision", "")).strip():
+                failures.append("training code revision is missing")
         try:
             maximum = int(config.get("max_candidates")) if isinstance(config, Mapping) else 0
         except (TypeError, ValueError):
@@ -113,6 +130,8 @@ def validate_model_package(
         if not isinstance(provenance, list):
             failures.append("provenance_files is missing")
             provenance = []
+        elif not provenance:
+            failures.append("provenance_files is empty")
         for index, item in enumerate(provenance):
             if (
                 not isinstance(item, Mapping)

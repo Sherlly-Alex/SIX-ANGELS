@@ -72,13 +72,18 @@ def train_maskable_ppo(
     n_steps: int = 256,
     batch_size: int = 64,
     verbose: int = 1,
-    provenance_files: Sequence[str | Path] = (),
+    provenance_files: Sequence[str | Path],
     environment_factory: str | None = None,
+    code_revision: str,
 ) -> TrainingResult:
     """Train against an injected env and persist the exact feature schema."""
 
     if total_timesteps <= 0:
         raise ValueError("total_timesteps must be positive")
+    if not str(code_revision).strip():
+        raise ValueError("code_revision must be non-empty")
+    if not provenance_files:
+        raise ValueError("at least one provenance file is required")
     if not callable(getattr(env, "action_masks", None)):
         raise TypeError("env must expose action_masks() for hard action masking")
     max_candidates = int(getattr(getattr(env, "action_space", None), "n", 0))
@@ -112,6 +117,7 @@ def train_maskable_ppo(
         "batch_size": int(batch_size),
         "max_candidates": max_candidates,
         "environment_factory": environment_factory,
+        "code_revision": str(code_revision).strip(),
     }
     provenance = []
     for raw_path in provenance_files:
@@ -169,9 +175,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timesteps", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--code-revision",
+        required=True,
+        help="immutable source revision used to build the training environment",
+    )
+    parser.add_argument(
         "--provenance",
         action="append",
-        default=[],
+        required=True,
         help="training dataset/config file to hash into model metadata",
     )
     args = parser.parse_args(argv)
@@ -183,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         provenance_files=args.provenance,
         environment_factory=args.env_factory,
+        code_revision=args.code_revision,
     )
     print(json.dumps({key: str(value) for key, value in result.__dict__.items()}))
     return 0

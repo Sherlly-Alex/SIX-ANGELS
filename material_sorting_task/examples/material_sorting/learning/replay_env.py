@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .event_replay import REPLAY_DATASET_SCHEMA_VERSION
+from .domain_randomization import DomainRandomizationConfig, DomainRandomizer
 from .observation import (
     CANDIDATE_FEATURE_NAMES,
     GLOBAL_FEATURE_NAMES,
@@ -124,6 +125,10 @@ class ReplayBanditEnv(_EnvBase):
         dataset: str | Path | Sequence[Mapping[str, Any]],
         *,
         episode_length: int = 256,
+        randomization_config: DomainRandomizationConfig | None = None,
+        best_reward: float = 1.0,
+        utility_regret_scale: float = 1.0,
+        invalid_action_reward: float = -100.0,
     ) -> None:
         if isinstance(dataset, (str, Path)):
             records = load_replay_dataset(dataset)
@@ -133,9 +138,27 @@ class ReplayBanditEnv(_EnvBase):
             raise ValueError("replay dataset is empty")
         if episode_length <= 0:
             raise ValueError("episode_length must be positive")
+        for name, value in (
+            ("best_reward", best_reward),
+            ("utility_regret_scale", utility_regret_scale),
+            ("invalid_action_reward", invalid_action_reward),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if utility_regret_scale < 0.0:
+            raise ValueError("utility_regret_scale must be non-negative")
         self.records = records
         self.max_candidates = int(records[0]["max_candidates"])
         self.episode_length = min(int(episode_length), len(records))
+        self.best_reward = float(best_reward)
+        self.utility_regret_scale = float(utility_regret_scale)
+        self.invalid_action_reward = float(invalid_action_reward)
+        self._randomizer = (
+            None
+            if randomization_config is None
+            else DomainRandomizer(randomization_config)
+        )
+        self._slot_rng = random.Random()
         observation_shape = tuple(np.asarray(records[0]["observation"]).shape)
         if _spaces is not None:
             self.action_space = _spaces.Discrete(self.max_candidates)
@@ -152,15 +175,87 @@ class ReplayBanditEnv(_EnvBase):
         self._cursor = 0
         self._current: Mapping[str, Any] | None = None
 
+    def _materialize(self, source: Mapping[str, Any]) -> dict[str, Any]:
+        record = dict(source)
+        record["observation"] = np.asarray(
+            source["observation"], dtype=np.float32
+        ).copy()
+        record["action_mask"] = np.asarray(
+            source["action_mask"], dtype=np.bool_
+        ).copy()
+        record["candidate_utilities"] = list(source["candidate_utilities"])
+        if self._randomizer is None:
+            return record
+
+        sample = self._randomizer.sample()
+        observation = record["observation"]
+        mask = record["action_mask"]
+        utilities = record["candidate_utilities"]
+        global_indices = {
+            name: index for index, name in enumerate(GLOBAL_FEATURE_NAMES)
+        }
+        observation[global_indices["robot_x_m"]] += sample.pose_dx_m
+        observation[global_indices["robot_y_m"]] += sample.pose_dy_m
+        observation[global_indices["robot_yaw_rad"]] += sample.yaw_delta_rad
+
+        width = len(CANDIDATE_FEATURE_NAMES)
+        base = len(GLOBAL_FEATURE_NAMES)
+        feature_indices = {
+            name: index for index, name in enumerate(CANDIDATE_FEATURE_NAMES)
+        }
+        manipulation_delta = abs(sample.depth_scale - 1.0) + abs(
+            sample.friction_scale - 1.0
+        )
+        uncertainty_delta = abs(sample.detection_delta) + (
+            0.25 if sample.detection_dropout else 0.0
+        )
+        dynamic_delta = 0.15 if sample.dynamic_obstacle_present else 0.0
+        for slot in np.flatnonzero(mask):
+            slot = int(slot)
+            offset = base + slot * width
+            utility = float(utilities[slot])
+            old_time = float(observation[offset + feature_indices["expected_time_s"]])
+            new_time = old_time / max(0.1, sample.speed_scale) + sample.message_latency_s
+            observation[offset + feature_indices["expected_time_s"]] = new_time
+            utility -= 0.20 * (new_time - old_time)
+            observation[
+                offset + feature_indices["perception_uncertainty"]
+            ] += uncertainty_delta
+            utility -= 2.0 * uncertainty_delta
+            observation[
+                offset + feature_indices["manipulation_difficulty"]
+            ] += manipulation_delta
+            utility -= 1.50 * manipulation_delta
+            observation[offset + feature_indices["dynamic_risk"]] += dynamic_delta
+            utility -= 1.50 * dynamic_delta
+            observation[offset + feature_indices["utility"]] = utility
+            utilities[slot] = utility
+
+        allowed = [int(index) for index in np.flatnonzero(mask)]
+        if sample.planner_failure and len(allowed) > 1:
+            failed_slot = self._slot_rng.choice(allowed)
+            mask[failed_slot] = False
+            utilities[failed_slot] = None
+            offset = base + failed_slot * width
+            observation[offset + feature_indices["valid"]] = 0.0
+            observation[offset + feature_indices["action_mask"]] = 0.0
+            observation[offset + feature_indices["utility"]] = 0.0
+        if not bool(np.any(mask)) or not bool(np.all(np.isfinite(observation))):
+            raise RuntimeError("domain randomization produced an invalid replay state")
+        return record
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         del options
         if _gym is not None:
             super().reset(seed=seed)
         rng = random.Random(seed)
+        if self._randomizer is not None:
+            self._randomizer.reset(seed)
+        self._slot_rng.seed(seed)
         self._order = list(range(len(self.records)))
         rng.shuffle(self._order)
         self._cursor = 0
-        self._current = self.records[self._order[0]]
+        self._current = self._materialize(self.records[self._order[0]])
         return np.asarray(self._current["observation"], dtype=np.float32).copy(), {
             "action_mask": self.action_masks(),
             "source_sha256": self._current.get("source_sha256"),
@@ -181,10 +276,14 @@ class ReplayBanditEnv(_EnvBase):
             and 0 <= int(action) < self.max_candidates
             and bool(mask[int(action)])
         )
-        heuristic_index = int(self._current["selected_action_index"])
         source_sha256 = self._current.get("source_sha256")
+        utilities = self._current["candidate_utilities"]
+        allowed_indices = [int(index) for index in np.flatnonzero(mask)]
+        heuristic_index = max(
+            allowed_indices,
+            key=lambda index: (float(utilities[index]), -index),
+        )
         if valid_action:
-            utilities = self._current["candidate_utilities"]
             chosen_utility = float(utilities[int(action)])
             best_utility = max(
                 float(value)
@@ -192,15 +291,17 @@ class ReplayBanditEnv(_EnvBase):
                 if allowed
             )
             utility_regret = max(0.0, best_utility - chosen_utility)
-            reward = 1.0 - utility_regret
+            reward = self.best_reward - self.utility_regret_scale * utility_regret
         else:
             utility_regret = math.inf
-            reward = -100.0
+            reward = self.invalid_action_reward
 
         self._cursor += 1
         terminated = self._cursor >= self.episode_length
         if not terminated:
-            self._current = self.records[self._order[self._cursor]]
+            self._current = self._materialize(
+                self.records[self._order[self._cursor]]
+            )
         observation = np.asarray(self._current["observation"], dtype=np.float32).copy()
         return observation, reward, terminated, False, {
             "invalid_action": not valid_action,
@@ -211,16 +312,63 @@ class ReplayBanditEnv(_EnvBase):
         }
 
 
+def load_replay_training_config(path: str | Path) -> dict[str, Any]:
+    """Load the versioned, provenance-hashed replay training configuration."""
+
+    source = Path(path)
+    value = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != (
+        "scheduler-replay-training-v1"
+    ):
+        raise ValueError("replay training config schema mismatch")
+    allowed = {
+        "schema_version",
+        "episode_length",
+        "randomize",
+        "domain_randomization",
+        "reward",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"unknown replay training config keys: {sorted(unknown)}")
+    if not isinstance(value.get("domain_randomization"), dict):
+        raise ValueError("domain_randomization must be an object")
+    if not isinstance(value.get("reward"), dict):
+        raise ValueError("reward must be an object")
+    if not isinstance(value.get("randomize"), bool):
+        raise ValueError("randomize must be boolean")
+    return value
+
+
 def build_replay_env() -> ReplayBanditEnv:
     """Factory for train_maskable_ppo's module:function CLI boundary."""
 
     path = os.environ.get("MATERIAL_SCHEDULER_REPLAY_DATASET", "").strip()
     if not path:
         raise RuntimeError("MATERIAL_SCHEDULER_REPLAY_DATASET is required")
-    episode_length = int(
-        os.environ.get("MATERIAL_SCHEDULER_REPLAY_EPISODE_LENGTH", "256")
+    config_path = os.environ.get("MATERIAL_SCHEDULER_REPLAY_CONFIG", "").strip()
+    if not config_path:
+        config_path = str(
+            Path(__file__).resolve().parent
+            / "configs"
+            / "replay_training_v1.json"
+        )
+    config = load_replay_training_config(config_path)
+    randomization = DomainRandomizationConfig(**config["domain_randomization"])
+    reward = config["reward"]
+    return ReplayBanditEnv(
+        path,
+        episode_length=int(config["episode_length"]),
+        randomization_config=(randomization if bool(config["randomize"]) else None),
+        best_reward=float(reward["best_reward"]),
+        utility_regret_scale=float(reward["utility_regret_scale"]),
+        invalid_action_reward=float(reward["invalid_action_reward"]),
     )
-    return ReplayBanditEnv(path, episode_length=episode_length)
 
 
-__all__ = ["ReplayBanditEnv", "build_replay_env", "load_replay_dataset"]
+__all__ = [
+    "ReplayBanditEnv",
+    "build_replay_env",
+    "load_replay_dataset",
+    "load_replay_training_config",
+]

@@ -41,6 +41,9 @@ class DomainRandomizationConfig:
                 or bounds[0] > bounds[1]
             ):
                 raise ValueError(f"{name} must be a finite ordered pair")
+            object.__setattr__(
+                self, name, (float(bounds[0]), float(bounds[1]))
+            )
         for name, probability in (
             ("detection_dropout_probability", self.detection_dropout_probability),
             ("planner_failure_probability", self.planner_failure_probability),

@@ -191,14 +191,16 @@ SHA256，且推理 P95 不超过配置的 25 ms 预算。
 
 ```bash
 export MATERIAL_SCHEDULER_REPLAY_DATASET=/data/scheduler_heuristic_baseline.jsonl
-export MATERIAL_SCHEDULER_REPLAY_EPISODE_LENGTH=256
+export MATERIAL_SCHEDULER_REPLAY_CONFIG=/workspace/baseline/examples/material_sorting/learning/configs/replay_training_v1.json
 
-python3 -m learning.train_maskable_ppo \
+python3 scripts/train_scheduler_policy.py \
   --env-factory learning.replay_env:build_replay_env \
   --output /models/scheduler_maskable_ppo.zip \
   --timesteps 100000 \
   --seed 20260818 \
-  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET"
+  --code-revision <git-commit> \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET" \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_CONFIG"
 ```
 
 回放环境会再次校验 dataset/schema、固定 observation、action mask、候选槽位和 utility，非法

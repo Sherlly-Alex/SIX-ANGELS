@@ -6,7 +6,12 @@ import tempfile
 import pytest
 
 from learning.event_replay import replay_event_logs, write_replay_dataset
-from learning.replay_env import ReplayBanditEnv, load_replay_dataset
+from learning.domain_randomization import DomainRandomizationConfig
+from learning.replay_env import (
+    ReplayBanditEnv,
+    load_replay_dataset,
+    load_replay_training_config,
+)
 from scheduler.candidate_generator import CandidateAction
 from scheduler.decision import SchedulerDecisionService
 from scheduler.events import EventLog, JsonlEventSink
@@ -90,3 +95,45 @@ def test_replay_loader_rejects_tampered_dataset() -> None:
 
         with pytest.raises(ValueError, match="enabled slot lacks action/utility"):
             load_replay_dataset(path)
+
+
+def test_randomized_replay_is_seeded_and_keeps_a_safe_slot() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        config = DomainRandomizationConfig(
+            pose_noise_std_m=0.02,
+            planner_failure_probability=1.0,
+            detection_dropout_probability=1.0,
+            dynamic_obstacle_probability=1.0,
+        )
+        env = ReplayBanditEnv(
+            dataset_file(directory),
+            episode_length=1,
+            randomization_config=config,
+        )
+
+        first, _ = env.reset(seed=42)
+        first_mask = env.action_masks()
+        second, _ = env.reset(seed=42)
+        second_mask = env.action_masks()
+
+        assert (first == second).all()
+        assert (first_mask == second_mask).all()
+        assert first_mask.sum() == 1
+        assert first_mask.any()
+
+
+def test_packaged_training_config_is_versioned_and_valid() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "examples"
+        / "material_sorting"
+        / "learning"
+        / "configs"
+        / "replay_training_v1.json"
+    )
+
+    config = load_replay_training_config(path)
+
+    assert config["schema_version"] == "scheduler-replay-training-v1"
+    assert config["randomize"] is True
+    assert config["domain_randomization"]["planner_failure_probability"] > 0.0

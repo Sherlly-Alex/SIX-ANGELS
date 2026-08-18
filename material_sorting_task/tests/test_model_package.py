@@ -30,6 +30,7 @@ def create_package(tmp_path: Path) -> tuple[Path, str, str]:
         "batch_size": 64,
         "max_candidates": 8,
         "environment_factory": "training_env:build",
+        "code_revision": "deadbeef",
     }
     metadata = {
         "metadata_schema_version": MODEL_METADATA_SCHEMA_VERSION,
@@ -117,6 +118,7 @@ def test_training_writes_model_config_and_provenance_hashes(
         total_timesteps=10,
         provenance_files=[dataset],
         environment_factory="training_env:build",
+        code_revision="deadbeef",
         verbose=0,
     )
 
@@ -124,6 +126,7 @@ def test_training_writes_model_config_and_provenance_hashes(
     assert metadata["model_sha256"] == result.model_sha256
     assert metadata["training_config_sha256"] == result.training_config_sha256
     assert metadata["training_config"]["environment_factory"] == "training_env:build"
+    assert metadata["training_config"]["code_revision"] == "deadbeef"
     assert metadata["provenance_files"][0]["sha256"] == hashlib.sha256(
         dataset.read_bytes()
     ).hexdigest()

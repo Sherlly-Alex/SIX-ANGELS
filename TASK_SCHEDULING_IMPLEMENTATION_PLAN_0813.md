@@ -1629,7 +1629,10 @@ backend 故障注入；不得据此宣称 RL 已优于 Heuristic 或已获得 `r
 - 每个生产决策快照构成一个 contextual-bandit 状态；动作仍只能是 mask 内的有限候选槽位。
   最佳有效 utility 奖励为 1，其余有效动作按 utility regret 扣减，masked/empty slot 固定 -100。
 - `build_replay_env` 通过 `MATERIAL_SCHEDULER_REPLAY_DATASET` 提供正式训练 CLI factory；训练时
-  必须把同一 dataset 传给 `--provenance`，由 §18.10 模型 metadata 固化字节哈希。
+  必须把同一 dataset 与版本化 `configs/replay_training_v1.json` 都传给 `--provenance`，并用
+  `--code-revision` 固定源代码版本，由 §18.10 模型 metadata 固化完整字节哈希链。配置明确覆盖
+  pose/yaw、检测误差/丢失、深度/速度/摩擦、消息延迟、规划失败和动态障碍的有界随机化；
+  同一 reset seed 的样本顺序、扰动和失效槽位完全可复现。
 
 该环境只预训练 Multi-Critic 候选排序，不包含机器人动力学、时序滞回、抓取/放置结果或裁判
 成功真值，因而不存在“用回放分数证明实机成功率”的替代关系。项目级随机化仿真 backend、

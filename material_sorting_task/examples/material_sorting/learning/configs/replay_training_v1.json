@@ -1,0 +1,22 @@
+{
+  "schema_version": "scheduler-replay-training-v1",
+  "episode_length": 256,
+  "randomize": true,
+  "domain_randomization": {
+    "pose_noise_std_m": 0.015,
+    "yaw_noise_std_rad": 0.02,
+    "detection_noise_std": 0.04,
+    "depth_scale_range": [0.98, 1.02],
+    "speed_scale_range": [0.9, 1.05],
+    "friction_scale_range": [0.85, 1.15],
+    "message_latency_s_range": [0.0, 0.12],
+    "detection_dropout_probability": 0.03,
+    "planner_failure_probability": 0.02,
+    "dynamic_obstacle_probability": 0.1
+  },
+  "reward": {
+    "best_reward": 1.0,
+    "utility_regret_scale": 1.0,
+    "invalid_action_reward": -100.0
+  }
+}

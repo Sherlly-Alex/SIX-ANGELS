@@ -76,13 +76,15 @@ required by MaskablePPO. It is a contextual-bandit ranking environment:
 
 ```bash
 export MATERIAL_SCHEDULER_REPLAY_DATASET=/data/scheduler_heuristic_baseline.jsonl
-export MATERIAL_SCHEDULER_REPLAY_EPISODE_LENGTH=256
-python3 -m learning.train_maskable_ppo \
+export MATERIAL_SCHEDULER_REPLAY_CONFIG=/workspace/baseline/examples/material_sorting/learning/configs/replay_training_v1.json
+python3 material_sorting_task/scripts/train_scheduler_policy.py \
   --env-factory learning.replay_env:build_replay_env \
   --output /models/scheduler_maskable_ppo.zip \
   --timesteps 100000 \
   --seed 20260818 \
-  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET"
+  --code-revision <git-commit> \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_DATASET" \
+  --provenance "$MATERIAL_SCHEDULER_REPLAY_CONFIG"
 ```
 
 This stage pretrains candidate ranking only. Runtime hysteresis, recovery
