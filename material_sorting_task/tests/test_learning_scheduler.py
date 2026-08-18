@@ -12,10 +12,12 @@ TASK_DIR = Path(__file__).resolve().parents[1] / "examples" / "material_sorting"
 sys.path.insert(0, str(TASK_DIR))
 
 from learning.action_mask import InvalidActionMask, build_action_mask
+from learning.action_space import coerce_discrete_action
 from learning.domain_randomization import DomainRandomizer
 from learning.env import SchedulingEnv, SchedulingSnapshot, SchedulingTransition
 from learning.observation import ObservationBuilder
 from learning.reward import RewardEvent, SchedulingReward
+from learning.evaluate_policy import evaluate_policy
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,26 @@ def test_domain_randomization_is_seed_reproducible() -> None:
     second = DomainRandomizer(seed=42)
     assert first.sample() == second.sample()
     assert first.sample() == second.sample()
+
+
+def test_all_offline_gates_reject_boolean_and_fractional_actions() -> None:
+    for value in (True, np.bool_(False), 1.5, np.asarray([0.25])):
+        with pytest.raises(ValueError):
+            coerce_discrete_action(value)
+    assert coerce_discrete_action(np.asarray([1])) == 1
+
+    class FractionalPolicy:
+        def predict(self, observation, *, action_masks, deterministic=True):
+            del observation, action_masks, deterministic
+            return 0.5
+
+    summary = evaluate_policy(
+        SchedulingEnv(FakeBackend(), max_candidates=4),
+        FractionalPolicy(),
+        episodes=2,
+    )
+    assert summary.policy_errors == 2
+    assert summary.completed_episodes == 0
 
 
 def test_training_module_import_does_not_import_sb3() -> None:

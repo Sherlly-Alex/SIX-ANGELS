@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 import random
 from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
 
 
 DEFAULT_MAX_CANDIDATES = 12
@@ -58,6 +61,33 @@ def candidate_action_type(candidate: Any) -> str:
     if isinstance(value, Enum):
         value = value.value
     return str(value)
+
+
+def coerce_discrete_action(value: Any) -> int:
+    """Return one exact integer action; never truncate floats or booleans."""
+
+    if hasattr(value, "action_index"):
+        value = value.action_index
+    elif isinstance(value, tuple):
+        if not value:
+            raise ValueError("policy returned an empty tuple")
+        value = value[0]
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError("policy returned a non-scalar action")
+    scalar_value = array.reshape(-1)[0]
+    if isinstance(scalar_value, (bool, np.bool_)):
+        raise ValueError("policy returned a boolean action")
+    try:
+        scalar = float(scalar_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("policy returned a non-numeric action") from exc
+    if not math.isfinite(scalar):
+        raise ValueError("policy returned a non-finite action")
+    index = int(scalar)
+    if scalar != float(index):
+        raise ValueError("policy returned a non-integral action")
+    return index
 
 
 @dataclass(frozen=True)
@@ -168,4 +198,5 @@ __all__ = [
     "MacroActionKind",
     "candidate_action_id",
     "candidate_action_type",
+    "coerce_discrete_action",
 ]

@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import math
 from pathlib import Path
 import time
 from typing import Any, Callable, Sequence
@@ -19,6 +18,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from learning.action_mask import validate_action_mask
+from learning.action_space import coerce_discrete_action
 
 
 class RLPolicyError(RuntimeError):
@@ -178,21 +178,10 @@ class RLPolicy:
         except Exception as exc:
             raise RLPolicyError(f"policy inference failed: {exc}") from exc
         inference_ms = (time.perf_counter() - started) * 1000.0
-        action_value = raw[0] if isinstance(raw, tuple) else raw
-        array = np.asarray(action_value)
-        if array.size != 1:
-            raise InvalidPolicyOutput(
-                f"policy must return one discrete action, got shape {array.shape}"
-            )
         try:
-            scalar = float(array.reshape(-1)[0])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise InvalidPolicyOutput("policy action is not numeric") from exc
-        if not math.isfinite(scalar):
-            raise InvalidPolicyOutput("policy action is NaN or infinite")
-        action_index = int(scalar)
-        if scalar != float(action_index):
-            raise InvalidPolicyOutput(f"policy action {scalar!r} is not an integer index")
+            action_index = coerce_discrete_action(raw)
+        except ValueError as exc:
+            raise InvalidPolicyOutput(str(exc)) from exc
         if not 0 <= action_index < mask.size:
             raise InvalidPolicyOutput(
                 f"policy action {action_index} is outside [0, {mask.size})"

@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .action_space import coerce_discrete_action
 from .observation import CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES
 
 
@@ -95,17 +96,6 @@ class ObservationHeuristicPolicy:
         )
 
 
-def _action_index(raw: Any) -> int:
-    value = getattr(raw, "action_index", raw[0] if isinstance(raw, tuple) else raw)
-    array = np.asarray(value)
-    if array.size != 1:
-        raise ValueError("policy returned a non-scalar action")
-    scalar = float(array.reshape(-1)[0])
-    if not math.isfinite(scalar) or scalar != float(int(scalar)):
-        raise ValueError("policy returned a non-integral action")
-    return int(scalar)
-
-
 def _run_policy(
     env: Any,
     policy: Any,
@@ -141,7 +131,7 @@ def _run_policy(
                 inference_ms = max(wall_ms, float(reported_ms))
                 if not math.isfinite(inference_ms) or inference_ms < 0.0:
                     raise ValueError("policy inference time is invalid")
-                action = _action_index(prediction)
+                action = coerce_discrete_action(prediction)
             except Exception:
                 policy_errors += 1
                 break

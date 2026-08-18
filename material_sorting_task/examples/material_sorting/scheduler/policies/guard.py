@@ -57,7 +57,7 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 def _action_index(value: Any) -> tuple[int | None, str | None]:
     if isinstance(value, PolicyPrediction):
-        return value.action_index, None
+        value = value.action_index
     if isinstance(value, tuple):
         value = value[0]
     if hasattr(value, "action_index"):
@@ -66,7 +66,10 @@ def _action_index(value: Any) -> tuple[int | None, str | None]:
     if array.size != 1:
         return None, "non_scalar_action"
     try:
-        scalar = float(array.reshape(-1)[0])
+        scalar_value = array.reshape(-1)[0]
+        if isinstance(scalar_value, (bool, np.bool_)):
+            return None, "boolean_action"
+        scalar = float(scalar_value)
     except (TypeError, ValueError, OverflowError):
         return None, "non_numeric_action"
     if not math.isfinite(scalar):

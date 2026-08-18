@@ -1297,8 +1297,8 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
   `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
   助手，客户端不再包含 task==2/task==3 分支。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（501 passed，5 skipped，1 warning；
-  本机缺少 OpenCV 的既有视觉测试按约定排除）。
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（503 passed，5 skipped，1 warning；
+  本机缺少 OpenCV 的既有视觉测试按约定排除）；正式非 ROS unittest 入口 323 tests OK。
 - [x] 官方 4090 标定与满分基线通过后，正式调度默认值切换为 `v2 + heuristic`；
   `MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令现场回退。携物实测包络仍由独立 feature gate
   控制，不因默认引擎切换而自动启用。
@@ -1713,3 +1713,19 @@ Task 1/2/3 成对 seed。新增 `learning/simulation_backend.py`：
 
 该 backend 补齐了本地 PR 11 的项目级执行入口，但当前训练环境未安装 Gymnasium/SB3/
 sb3-contrib，且新 `scheduler-event-v2` 生产样本尚未收集，因此本批次不生成、不批准模型。
+
+### 18.16 离散策略输出的统一严格边界（当前离线批次）
+
+完成性审计发现 `RLPolicy`/PolicyGuard/盲测会拒绝非整数动作，但旧 `evaluate_policy` 使用
+`int(...)`，可能把 `1.9` 截断为合法槽位；Python/NumPy bool 也可能被解释为 0/1。现由
+`learning.action_space.coerce_discrete_action` 统一所有离线和正式边界：
+
+- 只接受恰好一个、有限、非 bool、数学上严格为整数的输出；空 tuple、多元素、NaN/Inf、字符串、
+  小数和 bool 全部拒绝，不做截断或隐式转换。
+- `evaluate_policy`、成对 blind benchmark 和正式 `RLPolicy` 共用同一解析器；PolicyGuard 保留
+  细分回退 reason，并新增 `boolean_action`。
+- 正式运行仍由 action mask、范围和安全下界执行后续三道检查；解析失败只触发 Heuristic
+  fallback，不会派发候选。
+
+测试覆盖 Python/NumPy bool、小数和合法单元素整数，并证明离线 evaluator 将畸形策略计入
+policy error、不会把 episode 标为完成。

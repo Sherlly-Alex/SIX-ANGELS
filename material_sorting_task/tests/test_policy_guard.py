@@ -6,13 +6,14 @@ from pathlib import Path
 import time
 
 import numpy as np
+import pytest
 
 
 TASK_DIR = Path(__file__).resolve().parents[1] / "examples" / "material_sorting"
 sys.path.insert(0, str(TASK_DIR))
 
 from scheduler.policies.guard import PolicyGuard, PolicyGuardConfig
-from scheduler.policies.rl import RLPolicy
+from scheduler.policies.rl import InvalidPolicyOutput, RLPolicy
 
 
 @dataclass(frozen=True)
@@ -96,8 +97,30 @@ def test_masked_and_nan_actions_fall_back() -> None:
         )
         assert nan.used_fallback
         assert nan.reason == "non_finite_action"
+
+        boolean = guard.accept_or_fallback(
+            True,
+            _candidates()[0],
+            candidates=_candidates(),
+            action_mask=(True, True, False),
+        )
+        assert boolean.used_fallback
+        assert boolean.reason == "boolean_action"
     finally:
         guard.close()
+
+
+def test_runtime_policy_rejects_boolean_and_fractional_actions() -> None:
+    observation = np.zeros(2, dtype=np.float32)
+    mask = (True, True, False)
+    with pytest.raises(InvalidPolicyOutput, match="boolean action"):
+        RLPolicy(model=FakeMaskableModel(True)).predict(
+            observation, action_masks=mask
+        )
+    with pytest.raises(InvalidPolicyOutput, match="non-integral action"):
+        RLPolicy(model=FakeMaskableModel(1.5)).predict(
+            observation, action_masks=mask
+        )
 
 
 def test_invalid_mask_falls_back_without_running_model() -> None:

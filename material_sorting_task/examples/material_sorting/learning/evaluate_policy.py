@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from learning.action_space import coerce_discrete_action
 from scheduler.policies.rl import RLPolicy
 
 
@@ -55,13 +56,7 @@ def evaluate_policy(
                 prediction = policy.predict(
                     observation, action_masks=mask, deterministic=True
                 )
-                action = int(
-                    getattr(
-                        prediction,
-                        "action_index",
-                        prediction[0] if isinstance(prediction, tuple) else prediction,
-                    )
-                )
+                action = coerce_discrete_action(prediction)
             except Exception:
                 policy_errors += 1
                 break
