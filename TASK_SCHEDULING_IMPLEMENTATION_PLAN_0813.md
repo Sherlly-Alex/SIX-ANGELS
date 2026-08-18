@@ -1297,8 +1297,9 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
   助手，客户端不再包含 task==2/task==3 分支。
 - [x] 全量纯 Python 单元与已实现故障注入回归通过（489 passed，5 skipped，1 warning；
   本机缺少 OpenCV 的既有视觉测试按约定排除）。
-- [ ] 正式实动仍默认 `legacy`；携物包络、阶段恢复与新增站位 hook 需在官方 4090 镜像上
-  标定后方可与 `v2 + dry_run / nav_only / task123_full` 的实机放行合并。
+- [x] 官方 4090 标定与满分基线通过后，正式调度默认值切换为 `v2 + heuristic`；
+  `MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令现场回退。携物实测包络仍由独立 feature gate
+  控制，不因默认引擎切换而自动启用。
 - [x] ROS/Server 联调、仿真时序和实机故障注入回归通过：官方 Server 基线 160 分且
   `controller_blocked/controller_safe_hold/executor_error/unsafe_collision` 均为 0；短时 odom、
   joint_states 断流均观测到 stale/recovered，终止性 joint_states 断流进入 terminal，专项验收通过。

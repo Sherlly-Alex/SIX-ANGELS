@@ -143,7 +143,7 @@ class CompetitionClient(Node):
             os.environ.get("MATERIAL_EXECUTION_MODE", "stub").strip().lower()
         )
         self.scheduler_mode = (
-            os.environ.get("MATERIAL_SCHEDULER_ENGINE", "legacy").strip().lower()
+            os.environ.get("MATERIAL_SCHEDULER_ENGINE", "v2").strip().lower()
         )
         self.scheduler_policy = (
             os.environ.get("MATERIAL_SCHEDULER_POLICY", "heuristic").strip().lower()

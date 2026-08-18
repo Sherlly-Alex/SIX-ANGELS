@@ -90,7 +90,12 @@ dry-run 只验证任务 1 -> 任务 2 -> 任务 3 的内部调度、日志和进
 调度入口支持三种可回退模式：
 
 ```bash
-# 正式默认：原控制器
+# 正式默认：V2 + 确定性启发式（可省略这两个变量）
+MATERIAL_SCHEDULER_ENGINE=v2 \
+MATERIAL_SCHEDULER_POLICY=heuristic \
+bash scripts/run_client.sh
+
+# 单命令回退：原控制器和已验证物理路径
 MATERIAL_SCHEDULER_ENGINE=legacy bash scripts/run_client.sh
 
 # 原控制器执行，V2 只校验状态轨迹，不重复 tick 运动执行器
@@ -112,8 +117,9 @@ bash scripts/run_client.sh
 走廊（横向 ≤0.15 m / 纵向 ≤0.10 m）、分层栅格无碰撞、站位净空 ≥0.22 m 和
 `NavigationController` 实际重规划四道校验；与已标定名义站位不一致的可选候选记录为
 `audit_only` 并继续名义轨迹，非法输入、碰撞/净空和实际重规划失败仍 fail-closed 停车；`legacy`/`shadow`
-和未接入 hook 的模式不受影响。因此正式实动仍应保持 `legacy`，先以 `shadow`、
-`v2 + dry_run` 收集轨迹，再在 `v2 + nav_only` 上逐段标定候选站位切换：
+和未接入 hook 的模式不受影响。V2 已完成 `shadow`、dry-run、nav-only、逐段操作和官方 Server
+160 分完整链路验收，因此启动脚本默认使用 `v2 + heuristic`；如现场输入、候选或时序出现
+回归，可显式设置 `MATERIAL_SCHEDULER_ENGINE=legacy` 单命令退回原控制器：
 
 ```bash
 MATERIAL_EXECUTION_MODE=nav_only \
