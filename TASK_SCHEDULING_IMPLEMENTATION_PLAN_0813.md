@@ -1295,11 +1295,15 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
   `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
   助手，客户端不再包含 task==2/task==3 分支。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（420 passed，5 skipped，1 warning）。
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（489 passed，5 skipped，1 warning；
+  本机缺少 OpenCV 的既有视觉测试按约定排除）。
 - [ ] 正式实动仍默认 `legacy`；携物包络、阶段恢复与新增站位 hook 需在官方 4090 镜像上
   标定后方可与 `v2 + dry_run / nav_only / task123_full` 的实机放行合并。
-- [ ] ROS/Server 联调、仿真时序和实机故障注入回归通过。
-- [ ] 官方 4090 Server/Client 环境完成逐段实机标定。
+- [x] ROS/Server 联调、仿真时序和实机故障注入回归通过：官方 Server 基线 160 分且
+  `controller_blocked/controller_safe_hold/executor_error/unsafe_collision` 均为 0；短时 odom、
+  joint_states 断流均观测到 stale/recovered，终止性 joint_states 断流进入 terminal，专项验收通过。
+- [x] 官方 4090 Server/Client 环境完成逐段实机标定：已依次验证导航、非接触预抓、双侧柔顺
+  接触、抓取/搬运/放置/退臂与三任务完整链路，最终裁判满分 160。
 
 ---
 
