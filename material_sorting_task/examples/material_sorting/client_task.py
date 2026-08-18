@@ -193,7 +193,11 @@ class CompetitionClient(Node):
                 event_log.emit(
                     "scheduler_started",
                     "scheduler event log initialized",
-                    details={"engine": self.scheduler_mode},
+                    details={
+                        "engine": self.scheduler_mode,
+                        "policy_mode": self.scheduler_policy,
+                        "execution_mode": self.execution_mode,
+                    },
                 )
             except (OSError, TypeError, ValueError) as exc:
                 self.get_logger().error(

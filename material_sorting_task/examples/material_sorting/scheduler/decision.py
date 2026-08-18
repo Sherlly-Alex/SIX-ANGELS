@@ -63,6 +63,9 @@ class DecisionOutcome:
     costmap_version: int | None
     policy_suggestion: CandidateEvaluation | None = None
     switched: bool = False
+    policy_decision_reason: str | None = None
+    policy_inference_ms: float | None = None
+    policy_model_sha256: str | None = None
 
     @property
     def action_id(self) -> str | None:
@@ -158,7 +161,15 @@ class SchedulerDecisionService:
             self._emit_selection(now, outcome)
             return outcome
 
-        preferred, source, reason, suggestion = self._policy_preference(
+        (
+            preferred,
+            source,
+            reason,
+            suggestion,
+            policy_reason,
+            policy_inference_ms,
+            policy_model_sha256,
+        ) = self._policy_preference(
             evaluations,
             mask,
             heuristic_best,
@@ -195,6 +206,9 @@ class SchedulerDecisionService:
             costmap_version=version,
             policy_suggestion=suggestion,
             switched=switched,
+            policy_decision_reason=policy_reason,
+            policy_inference_ms=policy_inference_ms,
+            policy_model_sha256=policy_model_sha256,
         )
         self._emit_selection(now, outcome)
         return outcome
@@ -210,9 +224,20 @@ class SchedulerDecisionService:
         str,
         str,
         CandidateEvaluation | None,
+        str | None,
+        float | None,
+        str | None,
     ]:
         if self.config.policy_mode == "heuristic":
-            return heuristic_best, "heuristic", "deterministic_best", None
+            return (
+                heuristic_best,
+                "heuristic",
+                "deterministic_best",
+                None,
+                None,
+                None,
+                None,
+            )
 
         try:
             from learning.observation import ObservationBuilder
@@ -240,14 +265,28 @@ class SchedulerDecisionService:
                     "heuristic",
                     f"rl_shadow:{decision.reason}",
                     suggestion,
+                    decision.reason,
+                    decision.inference_ms,
+                    decision.model_sha256,
                 )
             selected = suggestion if suggestion is not None else heuristic_best
-            return selected, decision.source, decision.reason, suggestion
+            return (
+                selected,
+                decision.source,
+                decision.reason,
+                suggestion,
+                decision.reason,
+                decision.inference_ms,
+                decision.model_sha256,
+            )
         except Exception as exc:
             return (
                 heuristic_best,
                 "heuristic",
                 f"rl_fallback:{type(exc).__name__}",
+                None,
+                f"policy_exception:{type(exc).__name__}",
+                None,
                 None,
             )
 
@@ -366,6 +405,9 @@ class SchedulerDecisionService:
                     if outcome.policy_suggestion is None
                     else outcome.policy_suggestion.action_id
                 ),
+                "policy_decision_reason": outcome.policy_decision_reason,
+                "policy_inference_ms": outcome.policy_inference_ms,
+                "policy_model_sha256": outcome.policy_model_sha256,
             },
         )
 

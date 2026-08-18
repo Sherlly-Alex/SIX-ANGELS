@@ -17,6 +17,8 @@ REQUIRED = (
     TASK / "runtime_health.py",
     TASK / "task_orchestration.py",
     TASK / "learning" / "event_replay.py",
+    TASK / "learning" / "model_package.py",
+    TASK / "learning" / "shadow_gate.py",
     TASK / "executors" / "__init__.py",
     TASK / "executors" / "base.py",
     TASK / "executors" / "dry_run.py",
@@ -42,6 +44,8 @@ REQUIRED = (
     ROOT / "scripts" / "run_client.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
     ROOT / "scripts" / "replay_scheduler_events.py",
+    ROOT / "scripts" / "validate_rl_shadow.py",
+    ROOT / "scripts" / "validate_scheduler_model.py",
     ROOT / "scripts" / "validate_runtime_health_run.py",
 )
 

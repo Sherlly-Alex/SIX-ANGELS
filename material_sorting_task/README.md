@@ -167,6 +167,25 @@ python3 scripts/replay_scheduler_events.py run1.jsonl run2.jsonl \
 只有 `passed=true` 且 `training_ready_decisions` 达到门限的数据集才允许进入离线训练。
 导出记录不包含 Server 布局真值、裁判私有状态或语义审计字段。
 
+训练产物必须携带模型、训练配置、observation schema 和输入数据的哈希链，并在 Shadow 前
+分别通过模型包与 Shadow 门：
+
+```bash
+python3 scripts/validate_scheduler_model.py \
+  --model scheduler_maskable_ppo.zip \
+  --expected-model-sha256 <approved-model-sha256> \
+  --expected-provenance-sha256 <approved-dataset-sha256>
+
+python3 scripts/validate_rl_shadow.py shadow_run_1.jsonl shadow_run_2.jsonl \
+  --min-suggestions 1000 \
+  --max-inference-p95-ms 25 \
+  --max-fallback-rate 0.01 \
+  --expected-model-sha256 <approved-model-sha256>
+```
+
+Shadow 验收要求 RL 实际接管次数为 0、所有建议均位于硬 action mask 内、只出现一个批准模型
+SHA256，且推理 P95 不超过配置的 25 ms 预算。
+
 ### 任务 1 底盘实动测试
 
 `nav_only` 会读取 `/material/detections` 中任务 1 目标颜色的稳定世界坐标，使用静态场景

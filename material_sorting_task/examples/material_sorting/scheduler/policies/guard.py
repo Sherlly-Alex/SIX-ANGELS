@@ -42,6 +42,7 @@ class GuardDecision:
     reason: str
     inference_ms: float = 0.0
     rl_action_index: int | None = None
+    model_sha256: str | None = None
 
     @property
     def used_fallback(self) -> bool:
@@ -144,6 +145,7 @@ class PolicyGuard:
         *,
         inference_ms: float = 0.0,
         rl_action_index: int | None = None,
+        model_sha256: str | None = None,
     ) -> GuardDecision:
         index = self._find_heuristic_index(candidates, heuristic_best, mask)
         selected = candidates[index] if index is not None else heuristic_best
@@ -154,6 +156,7 @@ class PolicyGuard:
             reason=reason,
             inference_ms=float(inference_ms),
             rl_action_index=rl_action_index,
+            model_sha256=model_sha256,
         )
 
     def _safety_value(self, candidate: Any) -> float | None:
@@ -207,6 +210,9 @@ class PolicyGuard:
                 inference_ms=inference_ms,
             )
         assert index is not None
+        model_sha256 = _field(rl_action, "model_sha256", None)
+        if model_sha256 is not None:
+            model_sha256 = str(model_sha256)
         if not 0 <= index < len(candidates):
             return self._fallback(
                 "action_out_of_range",
@@ -215,6 +221,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=inference_ms,
                 rl_action_index=index,
+                model_sha256=model_sha256,
             )
         if not bool(mask[index]):
             return self._fallback(
@@ -224,6 +231,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=inference_ms,
                 rl_action_index=index,
+                model_sha256=model_sha256,
             )
         candidate = candidates[index]
         if not candidate_is_selectable(candidate):
@@ -234,6 +242,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=inference_ms,
                 rl_action_index=index,
+                model_sha256=model_sha256,
             )
         if safety_lower_bounds is not None:
             try:
@@ -253,6 +262,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=inference_ms,
                 rl_action_index=index,
+                model_sha256=model_sha256,
             )
         if safety_value is not None and (
             not math.isfinite(safety_value)
@@ -265,6 +275,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=inference_ms,
                 rl_action_index=index,
+                model_sha256=model_sha256,
             )
         return GuardDecision(
             selected=candidate,
@@ -273,6 +284,7 @@ class PolicyGuard:
             reason="accepted",
             inference_ms=float(inference_ms),
             rl_action_index=index,
+            model_sha256=model_sha256,
         )
 
     def select(

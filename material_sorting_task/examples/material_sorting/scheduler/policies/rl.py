@@ -83,7 +83,7 @@ class RLPolicy:
     def model_sha256(self) -> str | None:
         return self._model_sha256
 
-    def _check_metadata(self) -> None:
+    def _check_metadata(self, actual_model_sha256: str) -> None:
         if self.model_path is None or self.expected_schema_hash is None:
             return
         metadata_path = Path(f"{self.model_path}.metadata.json")
@@ -103,6 +103,14 @@ class RLPolicy:
                 "policy feature schema mismatch: "
                 f"expected {self.expected_schema_hash}, got {actual!r}"
             )
+        if metadata.get("metadata_schema_version") != "scheduler-model-metadata-v1":
+            raise ModelUnavailableError("policy metadata schema is not approved")
+        if metadata.get("algorithm") != "MaskablePPO":
+            raise ModelUnavailableError("policy metadata algorithm is not MaskablePPO")
+        if metadata.get("model_sha256") != actual_model_sha256:
+            raise ModelUnavailableError(
+                "policy model hash disagrees with its metadata"
+            )
 
     def load(self) -> bool:
         """Load an explicitly configured model; never downloads model weights."""
@@ -119,7 +127,7 @@ class RLPolicy:
                     "policy model hash mismatch: "
                     f"expected {self.expected_sha256}, got {actual_hash}"
                 )
-            self._check_metadata()
+            self._check_metadata(actual_hash)
             if self._loader is not None:
                 model = self._loader(str(self.model_path))
             else:

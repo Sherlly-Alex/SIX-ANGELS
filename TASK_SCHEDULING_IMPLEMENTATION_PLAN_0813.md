@@ -1575,3 +1575,25 @@ observation，因此旧日志只能用于审计，不能直接训练。
 下一离线步骤是补齐 RL Shadow 专用回放门：验证建议始终位于 action mask 内、实际选择仍为
 Heuristic、推理 p95 不超过 25 ms，并固化模型/训练数据/配置三类哈希。收集新的精确 observation
 样本和官方 Server A/B 仍统一留到最后的远程阶段。
+
+### 18.10 RL Shadow 遥测、模型供应链与离线验收门（当前离线批次）
+
+在不训练模型、不改变正式控制权的前提下，PR 10 的审计基础设施已补齐：
+
+- `scheduler_started` 明确记录 engine、policy mode 和 execution mode，防止把 Heuristic 或
+  `rl_guarded` 日志误报为 Shadow。
+- `DecisionOutcome/action_selected` 新增独立的 policy suggestion、guard reason、实际推理耗时和
+  已加载模型 SHA256；即使主选择原因被动作保持/切换滞回覆盖，策略侧证据仍不会丢失。
+- `PolicyGuard` 将 `RLPolicy` 返回的实际模型 SHA256 一直传递到接受/回退结果；`rl_shadow`
+  仍强制返回 Heuristic 偏好，绝不因建议改变 Executor 命令。
+- 新增 `learning/shadow_gate.py` 与 `scripts/validate_rl_shadow.py`：先复用训练数据回放门，再要求
+  Shadow 建议全部位于有效 action mask、实际 RL takeover=0、推理 p95 <=25 ms、fallback rate
+  不超过配置门限，且全程只有一个批准模型哈希。
+- `train_maskable_ppo.py` 的 sidecar 升级为 `scheduler-model-metadata-v1`，固化模型字节、固定
+  observation schema、规范化训练配置和声明的训练数据/配置文件哈希。新增
+  `validate_scheduler_model.py` 独立复核整条完整性链；正式 `RLPolicy` 加载时也会再次检查模型
+  字节与 metadata、算法及 schema 的一致性。
+
+当前仅完成代码与合成故障注入验证，没有生成或批准任何模型，也没有把策略切到
+`rl_guarded`。下一离线步骤应实现可复现的训练/盲测清单和 Heuristic 对照统计；新的精确
+observation 数据采集、真实 Shadow 多 seed 以及 measured-carry A/B 均按要求留在最终远程批次。
