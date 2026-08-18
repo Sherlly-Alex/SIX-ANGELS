@@ -1,0 +1,29 @@
+{
+  "schema_version": "scheduler-project-sim-v1",
+  "max_candidates": 6,
+  "minimum_clearance_m": 0.22,
+  "remaining_time_s": 300.0,
+  "stages": [
+    {"task_id": 1, "step_id": "navigate_to_pick", "payload_code": 0, "base_path_length_m": 1.20},
+    {"task_id": 1, "step_id": "transport", "payload_code": 2, "base_path_length_m": 1.75},
+    {"task_id": 1, "step_id": "return_to_end", "payload_code": 0, "base_path_length_m": 1.35},
+    {"task_id": 2, "step_id": "navigate_to_pick", "payload_code": 0, "base_path_length_m": 1.55},
+    {"task_id": 2, "step_id": "transport", "payload_code": 2, "base_path_length_m": 1.40},
+    {"task_id": 2, "step_id": "return_to_end", "payload_code": 0, "base_path_length_m": 1.10},
+    {"task_id": 3, "step_id": "navigate_to_pick", "payload_code": 0, "base_path_length_m": 1.30},
+    {"task_id": 3, "step_id": "transport", "payload_code": 2, "base_path_length_m": 1.65},
+    {"task_id": 3, "step_id": "return_to_end", "payload_code": 0, "base_path_length_m": 1.25}
+  ],
+  "domain_randomization": {
+    "pose_noise_std_m": 0.015,
+    "yaw_noise_std_rad": 0.02,
+    "detection_noise_std": 0.04,
+    "depth_scale_range": [0.98, 1.02],
+    "speed_scale_range": [0.90, 1.05],
+    "friction_scale_range": [0.85, 1.15],
+    "message_latency_s_range": [0.0, 0.12],
+    "detection_dropout_probability": 0.03,
+    "planner_failure_probability": 0.02,
+    "dynamic_obstacle_probability": 0.10
+  }
+}

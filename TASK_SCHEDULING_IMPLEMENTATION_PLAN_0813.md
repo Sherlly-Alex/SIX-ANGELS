@@ -1297,7 +1297,7 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
   `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
   助手，客户端不再包含 task==2/task==3 分支。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（494 passed，5 skipped，1 warning；
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（501 passed，5 skipped，1 warning；
   本机缺少 OpenCV 的既有视觉测试按约定排除）。
 - [x] 官方 4090 标定与满分基线通过后，正式调度默认值切换为 `v2 + heuristic`；
   `MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令现场回退。携物实测包络仍由独立 feature gate
@@ -1691,3 +1691,25 @@ JSONL 仍依赖整数 task/attempt 和相邻 sequence。现补齐：
   跨 step 污染拒绝，以及旧日志兼容审计。工作区检查也把 scheduler 核心四文件加入必需清单。
 
 该改动只增强可追溯性和训练数据资格，不参与候选评分、动作选择或机器人命令。
+
+### 18.15 项目级调度仿真 Backend（当前离线批次）
+
+PR 11 的盲测器此前只有单元测试内的单步玩具 backend，无法用项目动作与随机化配置执行完整
+Task 1/2/3 成对 seed。新增 `learning/simulation_backend.py`：
+
+- 使用生产 `CandidateAction`、`PathMetrics`、hard constraint、`evaluate_candidate` 和
+  `SchedulingEnv`，覆盖三任务 pick/transport/return 共九个宏决策；策略仍只能选择有限候选，
+  不产生底盘或关节命令。
+- 每个 Stage 生成 center/left/right/replan 固定槽位。规划失败、动态障碍、净空不足直接进入
+  action mask；backend 对绕过环境直接派发 masked candidate 再次拒绝。replan 消耗时间和恢复
+  预算、保持在原 Stage，最多两次后被 mask，不能靠“零路径恢复动作”虚假完成任务。
+- `project_simulation_v1.json` 固化拓扑、最小净空、候选宽度和 pose/yaw、RGB-D scale、检测
+  噪声/丢失、速度/摩擦、消息延迟、规划失败、动态障碍随机化。未知字段和 schema 不匹配
+  fail-closed；同 seed 在两个独立环境中 observation、mask、转移、成功抽样完全一致。
+- 转移输出 elapsed/path/obstacle/recovery/safety 指标和 exactly-once RewardEvent，可直接接入
+  `benchmark_scheduler_policy.py` 的 Heuristic-vs-RL 成对 bootstrap 门。
+- `docs/PROJECT_SIMULATION_BENCHMARK.md` 给出训练和盲测命令，并明确仿真模型只允许推进到
+  `rl_shadow`；不能替代新生产 EventLog、机械臂接触动力学或官方 Server。
+
+该 backend 补齐了本地 PR 11 的项目级执行入口，但当前训练环境未安装 Gymnasium/SB3/
+sb3-contrib，且新 `scheduler-event-v2` 生产样本尚未收集，因此本批次不生成、不批准模型。
