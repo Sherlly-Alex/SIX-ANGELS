@@ -6,6 +6,7 @@ import json
 import math
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -15,12 +16,16 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 from .models import FailureCode
 
 
+EVENT_SCHEMA_VERSION = "scheduler-event-v2"
+
+
 class EventType(Enum):
     SCHEDULER_STARTED = "scheduler_started"
     SCHEDULER_TRANSITION = "scheduler_transition"
     REFEREE_CHANGED = "referee_changed"
     REFEREE_DESYNC = "referee_desync"
     STEP_ENTERED = "step_entered"
+    STEP_REENTERED = "step_reentered"
     STEP_SUCCEEDED = "step_succeeded"
     STEP_FAILED = "step_failed"
     RECOVERY_STARTED = "recovery_started"
@@ -63,6 +68,13 @@ class SchedulerEvent:
     step_id: str | None = None
     action_id: str | None = None
     failure_code: FailureCode | None = None
+    event_schema_version: str = EVENT_SCHEMA_VERSION
+    event_id: str | None = None
+    session_id: str | None = None
+    task_run_id: str | None = None
+    attempt_run_id: str | None = None
+    step_run_id: str | None = None
+    decision_id: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
     sequence: int = 0
 
@@ -74,6 +86,23 @@ class SchedulerEvent:
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
         if self.sequence < 0:
             raise ValueError("event sequence cannot be negative")
+        if self.event_schema_version != EVENT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported event schema {self.event_schema_version!r}"
+            )
+        for name in (
+            "event_id",
+            "session_id",
+            "task_run_id",
+            "attempt_run_id",
+            "step_run_id",
+            "decision_id",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"{name} must be a non-empty string when set")
 
     @property
     def type(self) -> str:
@@ -84,6 +113,13 @@ class SchedulerEvent:
             "timestamp_s": self.timestamp_s,
             "sequence": self.sequence,
             "event_type": self.type,
+            "event_schema_version": self.event_schema_version,
+            "event_id": self.event_id,
+            "session_id": self.session_id,
+            "task_run_id": self.task_run_id,
+            "attempt_run_id": self.attempt_run_id,
+            "step_run_id": self.step_run_id,
+            "decision_id": self.decision_id,
             "message": self.message,
             "task_id": self.task_id,
             "attempt": self.attempt,
@@ -102,6 +138,15 @@ class SchedulerEvent:
             timestamp_s=float(value["timestamp_s"]),
             sequence=int(value.get("sequence", 0)),
             event_type=str(value.get("event_type", value.get("type", "unknown"))),
+            event_schema_version=str(
+                value.get("event_schema_version", EVENT_SCHEMA_VERSION)
+            ),
+            event_id=value.get("event_id"),
+            session_id=value.get("session_id"),
+            task_run_id=value.get("task_run_id"),
+            attempt_run_id=value.get("attempt_run_id"),
+            step_run_id=value.get("step_run_id"),
+            decision_id=value.get("decision_id"),
             message=str(value.get("message", "")),
             task_id=value.get("task_id"),
             attempt=value.get("attempt"),
@@ -182,11 +227,16 @@ class EventLog:
         sinks: Iterable[EventSink] = (),
         *,
         clock: Callable[[], float] = time.time,
+        session_id: str | None = None,
     ) -> None:
         self._sinks = list(sinks)
         self._clock = clock
         self._sequence = 0
         self._lock = threading.RLock()
+        resolved_session_id = uuid.uuid4().hex if session_id is None else session_id
+        if not isinstance(resolved_session_id, str) or not resolved_session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        self.session_id = resolved_session_id.strip()
 
     def add_sink(self, sink: EventSink) -> None:
         with self._lock:
@@ -201,6 +251,8 @@ class EventLog:
         with self._lock:
             self._sequence += 1
             if isinstance(event, SchedulerEvent):
+                if event.session_id not in {None, self.session_id}:
+                    raise ValueError("event session_id does not match EventLog session")
                 record = replace(event, sequence=self._sequence)
             elif isinstance(event, Mapping):
                 # Compatibility with the v2 facade's pre-structured
@@ -215,6 +267,10 @@ class EventLog:
                     task_id=payload.pop("task_id", None),
                     attempt=payload.pop("attempt", None),
                     step_id=payload.pop("step_id", payload.pop("stage", None)),
+                    task_run_id=payload.pop("task_run_id", None),
+                    attempt_run_id=payload.pop("attempt_run_id", None),
+                    step_run_id=payload.pop("step_run_id", None),
+                    decision_id=payload.pop("decision_id", None),
                     sequence=self._sequence,
                     details=payload,
                 )
@@ -226,6 +282,14 @@ class EventLog:
                     sequence=self._sequence,
                     **fields,
                 )
+            if record.session_id not in {None, self.session_id}:
+                raise ValueError("event session_id does not match EventLog session")
+            record = replace(
+                record,
+                sequence=self._sequence,
+                session_id=self.session_id,
+                event_id=f"{self.session_id}:event:{self._sequence}",
+            )
             for sink in tuple(self._sinks):
                 sink.write(record)
             return record
@@ -245,6 +309,7 @@ JSONLEventSink = JsonlEventSink
 
 __all__ = [
     "EventLog",
+    "EVENT_SCHEMA_VERSION",
     "EventSink",
     "EventType",
     "InMemoryEventSink",

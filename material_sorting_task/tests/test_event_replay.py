@@ -38,6 +38,14 @@ def create_log(path: Path) -> None:
             # Must be ignored by ObservationBuilder and replay export.
             "server_private_layout": "do-not-export",
         },
+        event_fields={
+            "task_id": 1,
+            "attempt": 1,
+            "step_id": "navigate_to_pick",
+            "task_run_id": "task-run-1",
+            "attempt_run_id": "attempt-run-1",
+            "step_run_id": "step-run-1",
+        },
     )
     service.close()
 
@@ -69,7 +77,13 @@ def test_replay_exports_only_validated_observation_records() -> None:
         assert records[0].source_file == "events.jsonl"
         assert len(records[0].source_sha256) == 64
         payload = dataset_path.read_text(encoding="utf-8")
-        assert "scheduler-replay-v1" in payload
+        assert "scheduler-replay-v2" in payload
+        assert records[0].session_id
+        assert records[0].task_run_id == "task-run-1"
+        assert records[0].attempt_run_id == "attempt-run-1"
+        assert records[0].step_run_id == "step-run-1"
+        assert records[0].decision_id
+        assert records[0].evaluation_event_id != records[0].selection_event_id
         assert "server_private_layout" not in payload
 
 
@@ -137,3 +151,75 @@ def test_legacy_log_is_auditable_but_not_training_ready() -> None:
         assert records == ()
         assert not gated.passed
         assert "training_ready_decisions=0 below 1" in gated.failures
+
+
+def test_replay_pairs_interleaved_v2_decisions_by_decision_id() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "interleaved.jsonl"
+        log = EventLog([JsonlEventSink(path)], clock=lambda: 0.0)
+        log.emit({"event_type": "scheduler_started", "engine": "v2"})
+        service = SchedulerDecisionService(event_log=log)
+        for index in (1, 2):
+            service.decide(
+                (candidate(f"choice-{index}", float(index)),),
+                now_s=float(index),
+                world_state={"task_id": 1},
+                event_fields={
+                    "task_id": 1,
+                    "attempt": 1,
+                    "step_id": "navigate_to_pick",
+                    "task_run_id": "task-run",
+                    "attempt_run_id": "attempt-run",
+                    "step_run_id": f"step-run-{index}",
+                },
+            )
+        service.close()
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        start = [event for event in events if event["event_type"] == "scheduler_started"]
+        candidates = [
+            event for event in events if event["event_type"] == "candidates_evaluated"
+        ]
+        selections = [
+            event for event in events if event["event_type"] == "action_selected"
+        ]
+        path.write_text(
+            "\n".join(json.dumps(event) for event in start + candidates + selections)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        summary, records = replay_event_logs(
+            [path], min_decisions=2, require_training_ready=True
+        )
+
+        assert summary.passed
+        assert summary.paired_decisions == 2
+        assert len(records) == 2
+        assert {record.decision_id for record in records} == {
+            event["decision_id"] for event in candidates
+        }
+
+
+def test_replay_rejects_cross_step_decision_correlation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        original = Path(directory) / "events.jsonl"
+        corrupted = Path(directory) / "corrupted.jsonl"
+        create_log(original)
+        events = [json.loads(line) for line in original.read_text().splitlines()]
+        selection = next(
+            event for event in events if event["event_type"] == "action_selected"
+        )
+        selection["step_run_id"] = "different-step-run"
+        corrupted.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+
+        summary, records = replay_event_logs(
+            [corrupted], min_decisions=1, require_training_ready=True
+        )
+
+        assert not summary.passed
+        assert summary.invalid_selections == 1
+        assert records == ()
+        assert any("correlation mismatch for step_run_id" in item for item in summary.failures)

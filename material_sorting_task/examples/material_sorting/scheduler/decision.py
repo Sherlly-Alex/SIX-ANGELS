@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import uuid
 from typing import Any, Mapping, Sequence
 
 from navigation.costmap import WorldCostmap, WorldCostmapSnapshot
@@ -107,6 +108,7 @@ class SchedulerDecisionService:
         held_center_base: tuple[float, float, float] | None = None,
         held_half_width_m: float | None = None,
         force_switch: bool = False,
+        event_fields: Mapping[str, Any] | None = None,
     ) -> DecisionOutcome:
         now = float(now_s)
         if not math.isfinite(now):
@@ -146,7 +148,16 @@ class SchedulerDecisionService:
             self.config.max_candidates - len(evaluations)
         )
         version = None if snapshot is None else int(snapshot.version)
-        self._emit_candidates(now, evaluations, mask, version, world_state)
+        decision_id = uuid.uuid4().hex
+        self._emit_candidates(
+            now,
+            evaluations,
+            mask,
+            version,
+            world_state,
+            decision_id=decision_id,
+            event_fields=event_fields,
+        )
 
         if heuristic_best is None:
             self._reset_selection()
@@ -158,7 +169,12 @@ class SchedulerDecisionService:
                 reason="no_safe_candidate",
                 costmap_version=version,
             )
-            self._emit_selection(now, outcome)
+            self._emit_selection(
+                now,
+                outcome,
+                decision_id=decision_id,
+                event_fields=event_fields,
+            )
             return outcome
 
         (
@@ -210,7 +226,12 @@ class SchedulerDecisionService:
             policy_inference_ms=policy_inference_ms,
             policy_model_sha256=policy_model_sha256,
         )
-        self._emit_selection(now, outcome)
+        self._emit_selection(
+            now,
+            outcome,
+            decision_id=decision_id,
+            event_fields=event_fields,
+        )
         return outcome
 
     def _policy_preference(
@@ -347,6 +368,9 @@ class SchedulerDecisionService:
         action_mask: tuple[bool, ...],
         costmap_version: int | None,
         world_state: Mapping[str, Any] | Any,
+        *,
+        decision_id: str,
+        event_fields: Mapping[str, Any] | None,
     ) -> None:
         details = {
             "costmap_version": costmap_version,
@@ -388,12 +412,27 @@ class SchedulerDecisionService:
             # make this sample ineligible for training but never changes the
             # deterministic action selected below.
             details["observation_error"] = type(exc).__name__
-        self._emit("candidates_evaluated", now_s, details=details)
+        self._emit(
+            "candidates_evaluated",
+            now_s,
+            decision_id=decision_id,
+            event_fields=event_fields,
+            details=details,
+        )
 
-    def _emit_selection(self, now_s: float, outcome: DecisionOutcome) -> None:
+    def _emit_selection(
+        self,
+        now_s: float,
+        outcome: DecisionOutcome,
+        *,
+        decision_id: str,
+        event_fields: Mapping[str, Any] | None,
+    ) -> None:
         self._emit(
             "action_selected",
             now_s,
+            decision_id=decision_id,
+            event_fields=event_fields,
             action_id=outcome.action_id,
             message=outcome.reason,
             details={
@@ -411,11 +450,24 @@ class SchedulerDecisionService:
             },
         )
 
-    def _emit(self, event: str, now_s: float, **fields: Any) -> None:
+    def _emit(
+        self,
+        event: str,
+        now_s: float,
+        *,
+        event_fields: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
         if self._event_log is None:
             return
         try:
-            self._event_log.emit(event, timestamp_s=now_s, **fields)
+            scope = dict(event_fields or {})
+            overlap = set(scope).intersection(fields)
+            if overlap:
+                raise ValueError(
+                    f"duplicate event fields: {sorted(overlap)}"
+                )
+            self._event_log.emit(event, timestamp_s=now_s, **scope, **fields)
         except Exception:
             # Audit failures cannot alter the selected safe action.
             pass

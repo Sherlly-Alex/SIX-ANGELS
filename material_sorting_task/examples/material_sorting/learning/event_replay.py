@@ -22,7 +22,7 @@ from .observation import (
 )
 
 
-REPLAY_DATASET_SCHEMA_VERSION = "scheduler-replay-v1"
+REPLAY_DATASET_SCHEMA_VERSION = "scheduler-replay-v2"
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,13 @@ class ReplayRecord:
     source_file: str
     source_sha256: str
     session_index: int
+    session_id: str
+    task_run_id: str
+    attempt_run_id: str
+    step_run_id: str
+    decision_id: str
+    evaluation_event_id: str
+    selection_event_id: str
     evaluation_sequence: int
     selection_sequence: int
     timestamp_s: float
@@ -177,6 +184,43 @@ def _build_record(
         )
     ):
         return None, None, regret, False
+    correlation_names = (
+        "session_id",
+        "task_run_id",
+        "attempt_run_id",
+        "step_run_id",
+        "decision_id",
+    )
+    candidate_correlation_values = [
+        candidate_event.get(name) for name in correlation_names
+    ]
+    selection_correlation_values = [
+        selection_event.get(name) for name in correlation_names
+    ]
+    if not any(candidate_correlation_values) and not any(selection_correlation_values):
+        # Logs produced before scheduler-event-v2 remain audit-only.
+        return None, None, regret, False
+    correlation: dict[str, str] = {}
+    for name in correlation_names:
+        candidate_value = candidate_event.get(name)
+        selection_value = selection_event.get(name)
+        if (
+            not isinstance(candidate_value, str)
+            or not candidate_value.strip()
+            or selection_value != candidate_value
+        ):
+            return None, f"correlation mismatch for {name}", regret, False
+        correlation[name] = candidate_value
+    evaluation_event_id = candidate_event.get("event_id")
+    selection_event_id = selection_event.get("event_id")
+    if (
+        not isinstance(evaluation_event_id, str)
+        or not evaluation_event_id.strip()
+        or not isinstance(selection_event_id, str)
+        or not selection_event_id.strip()
+        or evaluation_event_id == selection_event_id
+    ):
+        return None, "event_id correlation is missing or duplicated", regret, False
     try:
         maximum = int(max_candidates)
     except (TypeError, ValueError):
@@ -225,6 +269,13 @@ def _build_record(
             source_file=source_file,
             source_sha256=source_sha256,
             session_index=session_index,
+            session_id=correlation["session_id"],
+            task_run_id=correlation["task_run_id"],
+            attempt_run_id=correlation["attempt_run_id"],
+            step_run_id=correlation["step_run_id"],
+            decision_id=correlation["decision_id"],
+            evaluation_event_id=evaluation_event_id,
+            selection_event_id=selection_event_id,
             evaluation_sequence=int(candidate_event.get("sequence", 0)),
             selection_sequence=int(selection_event.get("sequence", 0)),
             timestamp_s=timestamp,
@@ -280,6 +331,7 @@ def replay_event_logs(
     for raw_path in paths:
         path = Path(raw_path)
         pending: Mapping[str, Any] | None = None
+        correlated_pending: dict[str, Mapping[str, Any]] = {}
         session_index = 0
         try:
             raw_text = path.read_text(encoding="utf-8", errors="replace")
@@ -304,27 +356,54 @@ def replay_event_logs(
                 if pending is not None:
                     counters["unpaired_candidate_events"] += 1
                     pending = None
+                if correlated_pending:
+                    counters["unpaired_candidate_events"] += len(
+                        correlated_pending
+                    )
+                    correlated_pending.clear()
                 session_index += 1
                 counters["sessions"] += 1
             elif event_type == "candidates_evaluated":
                 counters["candidate_events"] += 1
-                if pending is not None:
-                    counters["unpaired_candidate_events"] += 1
-                pending = event
+                decision_id = event.get("decision_id")
+                if decision_id is not None:
+                    if not isinstance(decision_id, str) or not decision_id.strip():
+                        counters["invalid_selections"] += 1
+                        failures.append(
+                            f"{path}:{line_number}: candidate decision_id is invalid"
+                        )
+                        continue
+                    if decision_id in correlated_pending:
+                        counters["unpaired_candidate_events"] += 1
+                    correlated_pending[decision_id] = event
+                else:
+                    if pending is not None:
+                        counters["unpaired_candidate_events"] += 1
+                    pending = event
             elif event_type == "action_selected":
                 counters["selection_events"] += 1
-                if pending is None:
+                decision_id = event.get("decision_id")
+                if decision_id is not None:
+                    if not isinstance(decision_id, str) or not decision_id.strip():
+                        counters["invalid_selections"] += 1
+                        failures.append(
+                            f"{path}:{line_number}: selection decision_id is invalid"
+                        )
+                        continue
+                    candidate = correlated_pending.pop(decision_id, None)
+                else:
+                    candidate, pending = pending, None
+                if candidate is None:
                     counters["unpaired_selection_events"] += 1
                     continue
                 counters["paired_decisions"] += 1
                 record, error, regret, no_safe = _build_record(
-                    pending,
+                    candidate,
                     event,
                     source_file=path.name,
                     source_sha256=source_sha256,
                     session_index=max(1, session_index),
                 )
-                pending = None
                 if error is not None:
                     counters["invalid_selections"] += 1
                     failures.append(f"{path}:{line_number}: {error}")
@@ -343,6 +422,7 @@ def replay_event_logs(
                     records.append(record)
         if pending is not None:
             counters["unpaired_candidate_events"] += 1
+        counters["unpaired_candidate_events"] += len(correlated_pending)
 
     if counters["paired_decisions"] < min_decisions:
         failures.append(

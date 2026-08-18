@@ -61,6 +61,14 @@ def create_shadow_log(path: Path) -> None:
             ),
             now_s=now,
             world_state={"task_id": 1, "attempt": 1},
+            event_fields={
+                "task_id": 1,
+                "attempt": 1,
+                "step_id": "navigate_to_pick",
+                "task_run_id": "task-run-1",
+                "attempt_run_id": "attempt-run-1",
+                "step_run_id": "step-run-1",
+            },
         )
     service.close()
 

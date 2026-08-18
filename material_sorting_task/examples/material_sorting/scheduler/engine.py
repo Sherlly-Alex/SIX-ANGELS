@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 import threading
+import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 from executors.base import (
@@ -174,6 +175,9 @@ class SchedulerEngine:
         self._last_consistent_referee_update: RefereeUpdate | None = None
         self._referee_desync_count = 0
         self._terminal_referee_pending = False
+        self._task_run_id: str | None = None
+        self._attempt_run_id: str | None = None
+        self._step_run_id: str | None = None
 
     @property
     def task_id(self) -> int | None:
@@ -232,6 +236,9 @@ class SchedulerEngine:
         self._last_consistent_referee_update = None
         self._referee_desync_count = 0
         self._terminal_referee_pending = False
+        self._task_run_id = None
+        self._attempt_run_id = None
+        self._step_run_id = None
         self.last_decision = None
         self.last_candidate_application = None
         self._last_decision_submit_s = None
@@ -305,6 +312,7 @@ class SchedulerEngine:
             ):
                 return self.snapshot()
             self._sync_start_from_referee(context)
+            self._start_task_run()
             self._transition(
                 self._states.STARTING_TASK,
                 f"starting task {self.task_id} attempt {self.attempt}",
@@ -312,6 +320,10 @@ class SchedulerEngine:
             return self.snapshot()
 
         if self.state is self._states.STARTING_TASK:
+            if self._task_run_id is None:
+                self._start_task_run()
+            elif self._attempt_run_id is None:
+                self._start_attempt_run()
             executor = self._executor()
             try:
                 executor.reset()
@@ -352,6 +364,7 @@ class SchedulerEngine:
             return self.snapshot()
 
         if self._active_action is None:
+            self._start_step_run()
             action = LegacyStageAction(executor=executor, stage=spec.stage)
             if spec.recovery_policy and not spec.irreversible:
                 # Structured retryable failures are consumed by a bounded
@@ -473,6 +486,19 @@ class SchedulerEngine:
                     context,
                     message=result.message,
                     details=dict(result.metadata),
+                )
+            recovery_completed = result.metadata.get("recovery_completed")
+            if recovery_completed:
+                previous_step_run_id = self._step_run_id
+                self._start_step_run()
+                self._emit_structured_event(
+                    "step_reentered",
+                    context,
+                    message=result.message,
+                    details={
+                        **dict(result.metadata),
+                        "previous_step_run_id": previous_step_run_id,
+                    },
                 )
             if result.message:
                 self._message = result.message
@@ -652,12 +678,15 @@ class SchedulerEngine:
             raise RuntimeError("scheduler decision service is not configured")
         return self.decision_service.decide(candidates, **kwargs)
 
-    def _decision_key(self) -> tuple[int | None, int, int, str | None]:
+    def _decision_key(
+        self,
+    ) -> tuple[int | None, int, int, str | None, str | None]:
         return (
             self.task_id,
             self.attempt,
             self.stage_index,
             None if self.stage is None else self.stage.value,
+            self._step_run_id,
         )
 
     def _compute_stage_decision(self, key, context, spec):
@@ -702,6 +731,7 @@ class SchedulerEngine:
                 footprint_mode=batch.footprint_mode,
                 held_center_base=held_center_base,
                 held_half_width_m=held_half_width_m,
+                event_fields=self._event_scope_fields(),
             )
         return key, outcome
 
@@ -1017,6 +1047,7 @@ class SchedulerEngine:
             return
         if self.attempt < self.max_attempts:
             self.attempt += 1
+            self._start_attempt_run()
             self._transition(
                 self._states.STARTING_TASK,
                 f"dry-run retry task {self.task_id} attempt {self.attempt}: {message}",
@@ -1040,6 +1071,7 @@ class SchedulerEngine:
             self.stage_index = 0
             self._active_action = None
             self._stage_started_s = None
+            self._start_task_run()
             self._transition(
                 self._states.STARTING_TASK,
                 f"referee advanced to task {self.task_id}; starting attempt {self.attempt}",
@@ -1052,6 +1084,7 @@ class SchedulerEngine:
                 self.stage_index = 0
                 self._active_action = None
                 self._stage_started_s = None
+                self._start_attempt_run()
                 self._transition(
                     self._states.STARTING_TASK,
                     f"referee settled attempt; retrying task {self.task_id} "
@@ -1072,6 +1105,7 @@ class SchedulerEngine:
         if self.task_index >= len(self.instructions):
             self._finish(message)
         else:
+            self._start_task_run()
             self._transition(
                 self._states.STARTING_TASK,
                 f"{message}; advancing to task {self.task_id}",
@@ -1085,6 +1119,29 @@ class SchedulerEngine:
             self.task_index = ordinal - 1
         completed = self._referee_attempts_completed(context)
         self.attempt = min(self.max_attempts, max(1, completed + 1))
+
+    def _start_task_run(self) -> None:
+        """Create globally unique execution scopes for one task activation."""
+
+        self._task_run_id = uuid.uuid4().hex
+        self._start_attempt_run()
+
+    def _start_attempt_run(self) -> None:
+        self._attempt_run_id = uuid.uuid4().hex
+        self._step_run_id = None
+
+    def _start_step_run(self) -> None:
+        self._step_run_id = uuid.uuid4().hex
+
+    def _event_scope_fields(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "step_id": None if self.stage is None else self.stage.value,
+            "task_run_id": self._task_run_id,
+            "attempt_run_id": self._attempt_run_id,
+            "step_run_id": self._step_run_id,
+        }
 
     def _may_finish_active_action_then_cleanup(self) -> bool:
         plan = self._plan()
@@ -1344,6 +1401,9 @@ class SchedulerEngine:
             "attempt": self.attempt,
             "stage": None if self.stage is None else self.stage.value,
             "message": message,
+            "task_run_id": self._task_run_id,
+            "attempt_run_id": self._attempt_run_id,
+            "step_run_id": self._step_run_id,
         }
         try:
             emit = getattr(self._event_sink, "emit", None)
@@ -1371,9 +1431,7 @@ class SchedulerEngine:
                     event_type,
                     message,
                     timestamp_s=float(context.now_s),
-                    task_id=self.task_id,
-                    attempt=self.attempt,
-                    step_id=None if self.stage is None else self.stage.value,
+                    **self._event_scope_fields(),
                     details=dict(details or {}),
                 )
         except Exception:

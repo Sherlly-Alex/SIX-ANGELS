@@ -22,7 +22,8 @@
 下一实施批次，不会移动该回退标签。
 已落地：
 
-- `legacy / shadow / v2` 三模式 facade；默认仍为 `legacy`，非法值自动回退。
+- `legacy / shadow / v2` 三模式 facade；官方满分与运行健康门通过后，正式默认已切换为
+  `v2 + heuristic`，`MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令回退。
 - 三个独立 TaskPlan 实例（当前仍复用同一十阶段拓扑）；Task 3 终局清理由
   `TerminalPolicy` 表达，不再由 V2 写死任务号。
 - `SchedulerEngine` 非阻塞执行、裁判同步、结构化事件、资源原子租约、命令校验、底盘
@@ -51,7 +52,8 @@
 当前明确保留的上线闸门：
 
 - 代价地图/RL 已实时计算和记录“哪个有限宏动作效用最高”；Task 1/2/3 的可重规划站位
-  hook 已在代码层开放，但不改写抓取/放置轨迹，且尚未获得实机放行。
+  hook 已在代码层开放，`v2 + heuristic + task123_full` 已获官方满分链路放行，但抓取/放置
+  低层轨迹仍不由策略改写。
 - `v2 + heuristic + task123_full` 已通过官方 Server 连续三任务 160/160 和多种子验收；
   `legacy` 仍保留为一键回退路径，新增 feature gate 仍需逐项独立放行。
 - `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；无批准模型时始终回退
@@ -63,8 +65,8 @@
   Executor 失败码迁移已覆盖 Task 1 以及 Task 2/3 的首批“不可逆动作前”导航/目标观测站点；
   其他未结构化 BLOCKED 仍保持 legacy fail-closed 语义，不能宣称全部失败均可自动恢复。
 - odometry/joint state 已在 §18.4 接入统一 `INPUT_STALE` watchdog：短暂断流立即零底盘并
-  保持最后有效手臂命令，2.0 s 有界宽限内允许恢复，超时进入 SAFE_HOLD；远程断流注入仍需
-  在官方 Server 上确认 ROS 时序和默认 0.75 s 年龄门限。
+  保持最后有效手臂命令，2.0 s 有界宽限内允许恢复，超时进入 SAFE_HOLD；官方 Server
+  断流注入已观测两类 stale/recovered 和 joint_states terminal，专项验收通过。
 
 ### 必须坚持的架构结论
 
@@ -1295,7 +1297,7 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
   `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
   助手，客户端不再包含 task==2/task==3 分支。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（489 passed，5 skipped，1 warning；
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（494 passed，5 skipped，1 warning；
   本机缺少 OpenCV 的既有视觉测试按约定排除）。
 - [x] 官方 4090 标定与满分基线通过后，正式调度默认值切换为 `v2 + heuristic`；
   `MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令现场回退。携物实测包络仍由独立 feature gate
@@ -1412,8 +1414,9 @@ costmap；将现有 Executor 的失败结果结构化映射到 `FailureCode`，�
 - ROS-free 助手 `apply_detection_epoch_decisions`（`executors/base.py`）保证非法策略
   动作只记日志、绝不清理生产检测历史。
 
-本批次回归：pytest `420 passed, 5 skipped, 1 warning`；正式 unittest `269 tests OK`；
-`scripts/check_workspace.py` 通过。默认执行路径仍是 `legacy + task123_full`；
+该历史批次当时回归：pytest `420 passed, 5 skipped, 1 warning`；正式 unittest `269 tests OK`；
+`scripts/check_workspace.py` 通过。后续官方满分与健康门通过后，默认执行路径已提升为
+`v2 + heuristic`；
 `shadow / v2 + dry_run / v2 + nav_only` 的实机放行顺序不变，全部新闭包的官方镜像
 标定（携物路径净空遥测、阶段恢复计时、新站位切换净空/周期延迟）统一排在最后。
 
@@ -1574,7 +1577,7 @@ observation，因此旧日志只能用于审计，不能直接训练。
   日志失败仅使样本不可训练，不改变 Heuristic 选择和 Executor 命令。
 - 新增 `learning/event_replay.py` 和 `scripts/replay_scheduler_events.py`，严格配对每个
   `candidates_evaluated -> action_selected`，核对候选唯一性、selected action、硬 mask、
-  observation 形状/有限性和 schema 哈希，并只导出通过校验的 `scheduler-replay-v1` JSONL。
+  observation 形状/有限性和 schema 哈希，并只导出通过校验的 `scheduler-replay-v2` JSONL。
 - 未携带精确 observation 的旧日志明确计入 `legacy_decisions`；即使选择轨迹完全合法，
   `--require-training-ready` 也会拒绝它，禁止用全零或反推特征伪造训练样本。
 - 四份已拉回的官方 V2 Heuristic JSONL 已完成真实回放：4 sessions、3703 paired decisions、
@@ -1582,9 +1585,8 @@ observation，因此旧日志只能用于审计，不能直接训练。
   739 次无安全候选。平均滞回 regret=0.01967、最大=0.36777。2964 次有选择的决策均属于
   旧 schema，故 training-ready=0；该结论只放行审计器，不放行训练。
 
-下一离线步骤是补齐 RL Shadow 专用回放门：验证建议始终位于 action mask 内、实际选择仍为
-Heuristic、推理 p95 不超过 25 ms，并固化模型/训练数据/配置三类哈希。收集新的精确 observation
-样本和官方 Server A/B 仍统一留到最后的远程阶段。
+后续 §18.10–§18.12 已补齐 RL Shadow、模型供应链、成对盲测和受约束回放环境。新的精确
+observation 样本和官方 Server A/B 仍统一留到最后的远程阶段。
 
 ### 18.10 RL Shadow 遥测、模型供应链与离线验收门（当前离线批次）
 
@@ -1668,3 +1670,24 @@ Shadow 和官方 Server 仍分别执行 §18.11、§18.10 与最终远程门。
 
 该批次只完成可观察性，不把柔顺控制拆成可由策略任意选择的低层动作。后续 RL 仍只能选择经过
 hard mask 的宏动作；接触闭环、释放条件和安全阈值继续由确定性执行器独占。
+
+### 18.14 EventLog 全链路运行标识与异步决策关联（当前离线批次）
+
+完成性审计发现 PR 1 中“session/task/attempt/step/step-run 唯一 ID”此前只写在计划里，生产
+JSONL 仍依赖整数 task/attempt 和相邻 sequence。现补齐：
+
+- `EventLog` 为每次进程会话生成稳定 `session_id`，为每条记录生成唯一 `event_id`，并明确
+  写入 `scheduler-event-v2`；序列化/反序列化保留全部关联字段，跨 session 注入直接拒绝。
+- `SchedulerEngine` 在任务激活、裁判 attempt、Stage 首次进入和有预算恢复重进时分别轮换
+  `task_run_id/attempt_run_id/step_run_id`。普通 tick 保持同一 ID，跨任务和恢复重进不会复用。
+- 后台 `SchedulerDecisionService` 为每次候选评估创建唯一 `decision_id`；候选与选择事件携带
+  提交时捕获的运行作用域，即使线程结果晚于 Stage 切换，日志仍归属于原决策。
+- 异步结果匹配 key 纳入 `step_run_id`；恢复重进后，旧 step-run 尚未完成的候选结果只会被
+  丢弃，不可能应用到同名 Stage 的新一次执行。
+- 回放数据升级为 `scheduler-replay-v2`，按 `decision_id` 配对而不是依赖文件相邻；完整校验
+  session/task/attempt/step/decision 作用域及两个不同 event ID。旧日志保持可审计但不可训练，
+  交叉 step、损坏 ID、重复/缺失关联均 fail-closed。
+- 测试覆盖事件 round-trip、跨 session 拒绝、三任务/十 Stage ID 生命周期、异步交错决策配对、
+  跨 step 污染拒绝，以及旧日志兼容审计。工作区检查也把 scheduler 核心四文件加入必需清单。
+
+该改动只增强可追溯性和训练数据资格，不参与候选评分、动作选择或机器人命令。

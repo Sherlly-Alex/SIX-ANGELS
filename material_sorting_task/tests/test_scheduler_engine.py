@@ -9,6 +9,7 @@ from executors import build_task_executors
 from executors.base import ExecutionContext, StageResult, TASK_STAGE_SEQUENCE
 from scheduler.plans import TerminalPolicy, build_executor_task_plans
 from scheduler.models import Resource
+from scheduler.events import EventLog, MemoryEventSink
 
 
 TASKS = [
@@ -59,6 +60,41 @@ def run_until(controller, state, *, task_ordinal=None, limit=500):
 
 
 class SchedulerEngineTests(unittest.TestCase):
+    def test_v2_assigns_unique_task_attempt_and_step_run_scopes(self) -> None:
+        sink = MemoryEventSink()
+        controller = CompetitionController(
+            build_task_executors("dry_run", dry_run_ticks_per_stage=1),
+            referee_driven=False,
+            scheduler_mode="v2",
+            event_sink=EventLog([sink], session_id="scope-session"),
+        )
+        controller.configure(TASKS)
+        controller.set_inputs_ready(True)
+
+        run_until(controller, ControllerState.FINISHED)
+
+        scoped = [event for event in sink.events if event.task_run_id]
+        task_runs = {
+            task_id: {event.task_run_id for event in scoped if event.task_id == task_id}
+            for task_id in (1, 2, 3)
+        }
+        self.assertTrue(all(len(values) == 1 for values in task_runs.values()))
+        self.assertEqual(len(set.union(*task_runs.values())), 3)
+        for task_id in (1, 2, 3):
+            attempt_runs = {
+                event.attempt_run_id
+                for event in scoped
+                if event.task_id == task_id and event.attempt_run_id
+            }
+            self.assertEqual(len(attempt_runs), 1)
+        step_runs = {
+            event.step_run_id
+            for event in scoped
+            if event.task_id == 1 and event.step_run_id
+        }
+        self.assertEqual(len(step_runs), len(TASK_STAGE_SEQUENCE))
+        self.assertTrue(all(event.session_id == "scope-session" for event in scoped))
+
     def test_v2_dry_run_executes_all_versioned_plans(self) -> None:
         executors = build_task_executors("dry_run", dry_run_ticks_per_stage=1)
         controller = CompetitionController(

@@ -12,11 +12,17 @@ by the production allow-list at decision time.
   referee score internals and semantic-audit fields cannot enter the export.
 - A selected action must exist in the same candidate snapshot and be enabled
   by its hard action mask.
+- Every production event carries `scheduler-event-v2`, a session-scoped unique
+  `event_id`, and the active `task_run_id/attempt_run_id/step_run_id`. Candidate
+  evaluation and action selection additionally share one `decision_id`.
+- Replay pairs v2 decisions by `decision_id`, not file adjacency. Interleaved
+  asynchronous decisions are valid; cross-session or cross-step pairs are
+  rejected.
 - The observation schema version, SHA256, shape and finiteness are checked for
   every record.
-- Logs produced before the observation payload was introduced remain useful
-  for trace auditing, but are counted as `legacy_decisions` and never exported
-  as training records.
+- Logs produced before the observation payload or complete v2 correlation
+  chain was introduced remain useful for trace auditing, but are counted as
+  `legacy_decisions` and never exported as training records.
 
 ## Audit existing logs
 
@@ -42,6 +48,11 @@ The command exits non-zero for malformed JSON, unpaired evaluation/selection
 events, a selected masked action, schema mismatch, non-finite observation or an
 insufficient number of decisions. Dataset output is a deterministic JSONL
 projection of validated fields only.
+
+The exported `scheduler-replay-v2` record preserves source SHA256 plus
+`session_id`, task/attempt/step run IDs, `decision_id`, and both source event
+IDs. This makes every training row traceable to exactly one production
+decision without exposing Server-private state.
 
 ## Current evidence (2026-08-18)
 
