@@ -56,7 +56,8 @@
   低层轨迹仍不由策略改写。
 - `v2 + heuristic + task123_full` 已通过官方 Server 连续三任务 160/160 和多种子验收；
   `legacy` 仍保留为一键回退路径，新增 feature gate 仍需逐项独立放行。
-- `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；无批准模型时始终回退
+- `rl_guarded` 是可用的受约束运行时路径，不等于已经获得实机放行；缺少通过模型包、盲测与
+  Shadow 三门绑定生成且哈希获批的 `scheduler-policy-approval-v1` 时始终回退
   `HeuristicPolicy`，且项目不下载任何权重。
 - transport 已能把实测物体中心/半宽送入 carried-envelope 与候选 costmap，但默认关闭；
   只有 `v2 + MATERIAL_MEASURED_CARRY_GUARD=1` 才启用，legacy/shadow 始终保持原验证路径。
@@ -1337,13 +1338,14 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
    模型缺失/推理超时/NaN/masked（`test_policy_guard.py`）、底盘 lease 失效
    （`test_scheduler_resources.py`）与结构化失败注入（`test_scheduler_stage_recovery.py`）
    均已落地；detection 陈旧有明确门限，odometry/joint state 的统一消息年龄 watchdog 已在
-   §18.4 落地并完成纯 Python 断流/恢复/宽限耗尽测试。官方 ROS 断流注入仍是远程验收项。
+   §18.4 落地并完成纯 Python 断流/恢复/宽限耗尽测试；该历史待办随后已在 §18.7 完成官方
+   ROS 断流注入验收。
 7. 只在足量 Heuristic EventLog 经过离线回放后训练 MaskablePPO；先 `rl_shadow`，通过回放和
    仿真统计门槛后再讨论 `rl_guarded` 实机许可。
 
-另外两项代码闭环应排在扩大 Executor hook 之前：把实际 held-object 几何传给 transport
+以下是本节制定时的原始排序约束：把实际 held-object 几何传给 transport
 costmap；将现有 Executor 的失败结果结构化映射到 `FailureCode`，再由 `RecoverableStep`
-执行有预算的恢复。当前这两部分只有基础设施和单测，不属于已上线能力。
+执行有预算的恢复。两项后来均已按顺序完成并接入 V2，现状以 §18.1、§18.5 和 §17 清单为准。
 
 ### 18.1 本工作区已完成的两项代码闭环（离线内核，实机标定待办）
 
@@ -1444,9 +1446,10 @@ workspace check:        29 required files present; Python syntax valid
 git diff --check:       passed（仅 Windows LF/CRLF 提示，无 whitespace error）
 ```
 
-因此，远程机前已经没有已知的纯 Python 阻断项；仍未完成且必须留在远程机验证的只有：
-ROS/Server 主题与裁判时序、20 Hz 周期延迟、真实 costmap/尺寸标定、携物净空、关节 effort、
-odom/joint 真实 ROS 断流、候选切换轨迹，以及各可选 feature gate 的分阶段实动放行。
+这是 §18.3 当时的远程待办清单。后续已经完成 ROS/Server 裁判链路、160 分、20 Hz 健康门、
+关节 effort 标定和 odom/joint 断流验收；当前仍保留到最终远程批次的是最新版代码五 seed
+逐 seed 健康复核、measured-carry 同 seed A/B、新 `scheduler-event-v2` 数据资格，以及各可选
+feature gate 的独立放行，统一按 §18.18 文档执行。
 
 这个顺序的核心是：内核已经能计算候选回报，剩余风险集中在“选择结果如何改变真实运动”。
 因此每个 Executor 必须显式 opt-in，不能通过调度器反射修改私有 `_goal` 或绕过现有导航、
@@ -1524,7 +1527,7 @@ IK、柔顺抓取和柔顺放置控制器。
 周期数据不能与断流安全结论混为一谈：故障/高频 2 s 日志运行中，早期不足 400 样本的窗口
 曾出现 interval p99=115.62 ms；完整窗口最忙时 interval p95 约 60.43 ms、p99 约 84.91 ms、
 execution p95 约 46.74 ms，累计存在少量 deadline miss。因此断流功能已经放行，但正常比赛
-20 Hz 性能仍需一轮无故障 160 分证据。
+20 Hz 性能在本节记录时仍缺无故障 160 分证据；该证据随后已取得并记录在下文。
 
 `validate_remote_run.py --events` 已新增无故障性能门：只评估完整 400 样本滚动窗口；禁止任何
 `input_stale/safety_stop`；要求 interval p95 <= 65 ms、p99 <= 125 ms、execution p95 <=
@@ -1541,9 +1544,9 @@ execution p95=41.41 ms、两类 miss rate 均 <0.2%，且无 stale/safety 事件
 选择最后一个 `scheduler_started`，并在该 session 首个 `state=finished` transition 截断。
 完成后的日志既不能降低 miss rate，旧运行也不能抬高/降低当前结果。
 
-下一轮必须使用全新的 Server/Client，关闭 fault-dir 和 measured-carry guard，以默认 5 s
-报告周期完成 160 分无故障基线。该门通过后，才允许只改变
-`MATERIAL_MEASURED_CARRY_GUARD=1` 做同 seed A/B 验证。
+该历史下一轮已使用全新的 Server/Client、关闭 fault-dir 和 measured-carry guard，以默认
+5 s 报告周期完成 160 分无故障基线。当前只剩只改变
+`MATERIAL_MEASURED_CARRY_GUARD=1` 的同 seed A/B，见 §18.8 与 §18.18。
 
 ### 18.8 实测搬运包络同种子 A/B 验收（当前批次）
 
@@ -1606,9 +1609,9 @@ observation 样本和官方 Server A/B 仍统一留到最后的远程阶段。
   `validate_scheduler_model.py` 独立复核整条完整性链；正式 `RLPolicy` 加载时也会再次检查模型
   字节与 metadata、算法及 schema 的一致性。
 
-当前仅完成代码与合成故障注入验证，没有生成或批准任何模型，也没有把策略切到
-`rl_guarded`。下一离线步骤应实现可复现的训练/盲测清单和 Heuristic 对照统计；新的精确
-observation 数据采集、真实 Shadow 多 seed 以及 measured-carry A/B 均按要求留在最终远程批次。
+本节完成时仅有代码与合成故障注入，没有生成或批准任何模型，也没有把策略切到
+`rl_guarded`。后续 §18.11、§18.15、§18.17 已补齐可复现盲测、项目仿真和显式批准联锁；新的
+精确 observation 数据采集、真实 Shadow 多 seed 以及 measured-carry A/B 仍留在最终远程批次。
 
 ### 18.11 成对盲测与 Heuristic 效果下界（当前离线批次）
 
@@ -1626,8 +1629,8 @@ observation 数据采集、真实 Shadow 多 seed 以及 measured-carry A/B 均�
   且成对 bootstrap 的 95% 改善下界严格大于 0。
 
 该门是训练环境中的效果下界，不包含 runtime 的动作保持/切换滞回，也不能替代 Shadow 与
-官方 Server。当前没有项目级仿真 backend 和批准模型，因此这里只完成评估器及确定性合成
-backend 故障注入；不得据此宣称 RL 已优于 Heuristic 或已获得 `rl_guarded` 放行。
+官方 Server。本节提交时尚无项目级仿真 backend；后续 §18.15 已补齐该入口，但仍没有批准
+模型，因此不得据此宣称 RL 已优于 Heuristic 或已获得 `rl_guarded` 放行。
 
 ### 18.12 生产 EventLog 驱动的受约束回放预训练环境（当前离线批次）
 
