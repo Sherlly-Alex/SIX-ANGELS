@@ -83,8 +83,14 @@ After copying all run directories under one artifact root, aggregate them with:
 python3 scripts/validate_remote_matrix.py \
   --root /path/to/artifact-root \
   --seeds 20260817 20260818 20260819 20260820 20260821 \
+  --require-events \
+  --max-interval-p99-ms 125 \
   --output /path/to/artifact-root/multiseed_acceptance.json
 ```
 
 Release-candidate promotion requires `"passed": true`, `passed_seed_count: 5`
-and an empty `failed_seeds` list. Keep the generated JSON with the raw logs.
+and an empty `failed_seeds` list. `--require-events` is mandatory for a new
+release candidate: every seed must include `scheduler_<run-name>.jsonl` and
+independently pass the full-window runtime-health gate. Omitting the flag is
+retained only for score-only validation of older archives. Keep the generated
+JSON with the raw logs.

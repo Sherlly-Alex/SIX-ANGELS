@@ -1752,3 +1752,24 @@ Client 启动边界强制证明三道门属于同一模型。现补齐最后一�
 `material_sorting_task/docs/GUARDED_POLICY_PROMOTION.md`。离线全仓回归（排除本机缺少 OpenCV 的
 既有视觉导入项）为 `507 passed, 5 skipped, 1 warning`；正式非 ROS unittest 入口仍为
 `323 tests OK`，workspace 必需文件与 Python 语法检查通过。
+
+### 18.18 多 seed 运行健康门与最终远程验收编排（当前离线批次）
+
+最终命令审计发现旧 `validate_remote_matrix.py` 只读取 Client/Server 分数日志，即使某个 seed 的
+Scheduler EventLog 出现 stale、安全停车或完整窗口周期超限，矩阵仍可能显示五 seed 通过。现补齐：
+
+- 矩阵验证器新增 `--require-events`；启用后每个 `v2_multiseed_<seed>` 必须同时存在
+  `scheduler_v2_multiseed_<seed>.jsonl`，并逐 seed 复用单轮验证器的完整 400 样本窗口、
+  p95/p99、执行耗时和累计 deadline-miss 门。缺日志或任一 seed 健康失败均进入
+  `failed_seeds`，不能被其他 seed 平均掩盖。
+- 新增可选 `--require-measured-carry` 及同一组健康阈值参数；旧归档不加
+  `--require-events` 时仍可只核对分数，避免破坏历史证据，但新的 release candidate 明确必须加。
+- `docs/FINAL_SCHEDULER_REMOTE_ACCEPTANCE.md` 固定最终顺序和命名：最新代码 Heuristic 无故障
+  基线 → 同 seed measured-carry A/B → 五 seed 且逐 seed 健康门 → 新 `scheduler-event-v2`
+  回放/训练数据资格；RL 模型、Shadow、approval 和 guarded canary 保持条件式后续，不阻塞
+  当前 Heuristic 调度封板。
+
+以上工作只增强离线验收工具和最终操作编排，不改变任何候选、运动命令或计分逻辑。远程执行仍按
+用户要求统一放在全部本地代码与审计结束之后。本批完成后全仓离线回归为
+`511 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为 `327 tests OK`，53 项工作区
+必需文件与 Python 语法检查通过。

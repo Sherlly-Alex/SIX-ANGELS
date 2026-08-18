@@ -62,6 +62,7 @@ REQUIRED = (
     ROOT / "scripts" / "validate_runtime_health_run.py",
     ROOT / "docs" / "PROJECT_SIMULATION_BENCHMARK.md",
     ROOT / "docs" / "GUARDED_POLICY_PROMOTION.md",
+    ROOT / "docs" / "FINAL_SCHEDULER_REMOTE_ACCEPTANCE.md",
 )
 
 
