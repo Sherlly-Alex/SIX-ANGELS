@@ -84,6 +84,9 @@ python3 scripts/validate_remote_matrix.py \
   --root /path/to/artifact-root \
   --seeds 20260817 20260818 20260819 20260820 20260821 \
   --require-events \
+  --require-candidate-application \
+  --min-applied-candidates-per-seed 1 \
+  --min-noncenter-applied-total 1 \
   --max-interval-p99-ms 125 \
   --output /path/to/artifact-root/multiseed_acceptance.json
 ```
@@ -94,3 +97,10 @@ release candidate: every seed must include `scheduler_<run-name>.jsonl` and
 independently pass the full-window runtime-health gate. Omitting the flag is
 retained only for score-only validation of older archives. Keep the generated
 JSON with the raw logs.
+
+New scheduler release candidates must also require candidate application. Each
+seed needs at least one executor-confirmed `application_status=applied`, and
+the complete matrix needs at least one applied candidate whose lateral offset
+is non-zero. This proves that the scheduler did more than audit the calibrated
+centre stand. `audit_only`, `too_late`, malformed or post-FINISHED records do
+not satisfy the gate.

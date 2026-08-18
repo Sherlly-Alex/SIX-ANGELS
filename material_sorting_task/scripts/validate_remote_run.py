@@ -47,6 +47,9 @@ def validate_run(
     max_execution_p95_ms: float = 50.0,
     max_deadline_miss_rate: float = 0.01,
     require_measured_carry: bool = False,
+    require_candidate_application: bool = False,
+    min_applied_candidates: int = 1,
+    min_noncenter_applied: int = 0,
 ) -> dict[str, object]:
     """Return a stable machine-readable acceptance report."""
 
@@ -111,6 +114,24 @@ def validate_run(
             for message in measured_carry["failures"]
         )
 
+    candidate_applications = None
+    if require_candidate_application:
+        if scheduler_events_text is None:
+            candidate_applications = {
+                "passed": False,
+                "failures": ["scheduler EventLog is required"],
+            }
+        else:
+            candidate_applications = validate_candidate_applications(
+                scheduler_events_text,
+                min_applied_candidates=min_applied_candidates,
+                min_noncenter_applied=min_noncenter_applied,
+            )
+        failures.extend(
+            f"candidate_applications: {message}"
+            for message in candidate_applications["failures"]
+        )
+
     return {
         "passed": not failures,
         "expected_score": expected_score,
@@ -122,6 +143,121 @@ def validate_run(
         "fatal_counts": fatal_counts,
         "runtime_health": runtime_health,
         "measured_carry": measured_carry,
+        "candidate_applications": candidate_applications,
+        "failures": failures,
+    }
+
+
+def validate_candidate_applications(
+    events_text: str,
+    *,
+    min_applied_candidates: int = 1,
+    min_noncenter_applied: int = 0,
+) -> dict[str, object]:
+    """Prove that ranked candidates reached opt-in executors in one session."""
+
+    if min_applied_candidates < 0 or min_noncenter_applied < 0:
+        raise ValueError("candidate application minimums must be non-negative")
+    events: list[dict[str, object]] = []
+    malformed = 0
+    for raw in events_text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        events.append(event)
+    starts = [
+        index
+        for index, event in enumerate(events)
+        if str(event.get("event_type", "")) == "scheduler_started"
+    ]
+    failures: list[str] = []
+    if not starts:
+        failures.append("missing scheduler_started session boundary")
+        session = events
+    else:
+        session = events[starts[-1] :]
+    terminal_index = None
+    for index, event in enumerate(session):
+        details = event.get("details")
+        if (
+            str(event.get("event_type", "")) == "scheduler_transition"
+            and isinstance(details, dict)
+            and str(details.get("state", "")) == "finished"
+        ):
+            terminal_index = index
+            break
+    if terminal_index is None:
+        failures.append("missing scheduler finished event boundary")
+        evaluated = session
+    else:
+        evaluated = session[: terminal_index + 1]
+
+    statuses: dict[str, int] = {}
+    applied = 0
+    noncenter_applied = 0
+    invalid_records = 0
+    applied_actions: set[str] = set()
+    for event in evaluated:
+        if str(event.get("event_type", "")) != "candidate_application":
+            continue
+        details = event.get("details")
+        if not isinstance(details, dict):
+            invalid_records += 1
+            continue
+        status = str(details.get("application_status", ""))
+        action_id = details.get("action_id")
+        if status not in {"applied", "audit_only", "too_late"} or not isinstance(
+            action_id, str
+        ) or not action_id.strip():
+            invalid_records += 1
+            continue
+        statuses[status] = statuses.get(status, 0) + 1
+        if status != "applied":
+            continue
+        try:
+            offset = float(details.get("lateral_offset_m"))
+        except (TypeError, ValueError, OverflowError):
+            invalid_records += 1
+            continue
+        if not math.isfinite(offset):
+            invalid_records += 1
+            continue
+        applied += 1
+        applied_actions.add(action_id)
+        if abs(offset) > 1.0e-6:
+            noncenter_applied += 1
+    if malformed:
+        failures.append(f"malformed_event_lines={malformed}")
+    if invalid_records:
+        failures.append(f"invalid_candidate_application_records={invalid_records}")
+    if applied < min_applied_candidates:
+        failures.append(
+            f"applied_count={applied} below {min_applied_candidates}"
+        )
+    if noncenter_applied < min_noncenter_applied:
+        failures.append(
+            f"noncenter_applied_count={noncenter_applied} below "
+            f"{min_noncenter_applied}"
+        )
+    return {
+        "passed": not failures,
+        "event_count": sum(statuses.values()),
+        "status_counts": dict(sorted(statuses.items())),
+        "applied_count": applied,
+        "noncenter_applied_count": noncenter_applied,
+        "unique_applied_action_count": len(applied_actions),
+        "terminal_event_found": terminal_index is not None,
+        "limits": {
+            "min_applied_candidates": min_applied_candidates,
+            "min_noncenter_applied": min_noncenter_applied,
+        },
         "failures": failures,
     }
 
@@ -332,6 +468,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="require positive Task1/Task3 measured carry-guard telemetry",
     )
+    parser.add_argument(
+        "--require-candidate-application",
+        action="store_true",
+        help="require ranked candidates to be applied by opt-in executors",
+    )
+    parser.add_argument("--min-applied-candidates", type=int, default=1)
+    parser.add_argument("--min-noncenter-applied", type=int, default=0)
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -348,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
         max_execution_p95_ms=args.max_execution_p95_ms,
         max_deadline_miss_rate=args.max_deadline_miss_rate,
         require_measured_carry=args.require_measured_carry,
+        require_candidate_application=args.require_candidate_application,
+        min_applied_candidates=args.min_applied_candidates,
+        min_noncenter_applied=args.min_noncenter_applied,
     )
     payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:

@@ -18,6 +18,9 @@ def validate_matrix(
     expected_score: int = 160,
     require_events: bool = False,
     require_measured_carry: bool = False,
+    require_candidate_application: bool = False,
+    min_applied_candidates_per_seed: int = 1,
+    min_noncenter_applied_total: int = 0,
     max_interval_p95_ms: float = 65.0,
     max_interval_p99_ms: float = 125.0,
     max_execution_p95_ms: float = 50.0,
@@ -26,6 +29,12 @@ def validate_matrix(
     seed_values = [int(seed) for seed in seeds]
     if not seed_values or len(set(seed_values)) != len(seed_values):
         raise ValueError("seeds must be non-empty and unique")
+    if min_applied_candidates_per_seed < 0 or min_noncenter_applied_total < 0:
+        raise ValueError("candidate application minimums must be non-negative")
+    if require_candidate_application and not require_events:
+        raise ValueError("candidate application validation requires EventLogs")
+    if min_noncenter_applied_total and not require_candidate_application:
+        raise ValueError("noncenter application minimum requires candidate validation")
     results: dict[str, object] = {}
     failures: list[str] = []
     for seed in seed_values:
@@ -58,15 +67,42 @@ def validate_matrix(
                 max_execution_p95_ms=max_execution_p95_ms,
                 max_deadline_miss_rate=max_deadline_miss_rate,
                 require_measured_carry=require_measured_carry,
+                require_candidate_application=require_candidate_application,
+                min_applied_candidates=min_applied_candidates_per_seed,
             )
         results[str(seed)] = report
         if not report["passed"]:
             failures.append(str(seed))
+    applied_total = 0
+    noncenter_applied_total = 0
+    if require_candidate_application:
+        for report in results.values():
+            applications = report.get("candidate_applications")
+            if not isinstance(applications, dict):
+                continue
+            applied_total += int(applications.get("applied_count", 0))
+            noncenter_applied_total += int(
+                applications.get("noncenter_applied_count", 0)
+            )
+    matrix_failures: list[str] = []
+    if noncenter_applied_total < min_noncenter_applied_total:
+        matrix_failures.append(
+            f"noncenter_applied_total={noncenter_applied_total} below "
+            f"{min_noncenter_applied_total}"
+        )
     return {
-        "passed": not failures and len(results) == len(seed_values),
+        "passed": (
+            not failures
+            and not matrix_failures
+            and len(results) == len(seed_values)
+        ),
         "expected_score_per_seed": expected_score,
         "require_events": bool(require_events),
         "require_measured_carry": bool(require_measured_carry),
+        "require_candidate_application": bool(require_candidate_application),
+        "candidate_applied_total": applied_total,
+        "candidate_noncenter_applied_total": noncenter_applied_total,
+        "matrix_failures": matrix_failures,
         "seed_count": len(seed_values),
         "passed_seed_count": len(seed_values) - len(failures),
         "failed_seeds": failures,
@@ -81,6 +117,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-score", default=160, type=int)
     parser.add_argument("--require-events", action="store_true")
     parser.add_argument("--require-measured-carry", action="store_true")
+    parser.add_argument("--require-candidate-application", action="store_true")
+    parser.add_argument("--min-applied-candidates-per-seed", type=int, default=1)
+    parser.add_argument("--min-noncenter-applied-total", type=int, default=0)
     parser.add_argument("--max-interval-p95-ms", type=float, default=65.0)
     parser.add_argument("--max-interval-p99-ms", type=float, default=125.0)
     parser.add_argument("--max-execution-p95-ms", type=float, default=50.0)
@@ -97,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         expected_score=args.expected_score,
         require_events=args.require_events,
         require_measured_carry=args.require_measured_carry,
+        require_candidate_application=args.require_candidate_application,
+        min_applied_candidates_per_seed=args.min_applied_candidates_per_seed,
+        min_noncenter_applied_total=args.min_noncenter_applied_total,
         max_interval_p95_ms=args.max_interval_p95_ms,
         max_interval_p99_ms=args.max_interval_p99_ms,
         max_execution_p95_ms=args.max_execution_p95_ms,

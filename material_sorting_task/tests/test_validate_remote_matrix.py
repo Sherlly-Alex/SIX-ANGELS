@@ -54,6 +54,25 @@ EVENTS = "\n".join(
 )
 
 
+def events_with_candidate(offset: float) -> str:
+    lines = EVENTS.splitlines()
+    application = json.dumps(
+        {
+            "event_type": "candidate_application",
+            "details": {
+                "application_status": "applied",
+                "action_id": (
+                    "task1:navigate_to_pick:stand:center"
+                    if offset == 0.0
+                    else "task1:navigate_to_pick:stand:left"
+                ),
+                "lateral_offset_m": offset,
+            },
+        }
+    )
+    return "\n".join((*lines[:-1], application, lines[-1]))
+
+
 def write_run(
     root: Path,
     seed: int,
@@ -149,3 +168,43 @@ class ValidateRemoteMatrixTests(unittest.TestCase):
                 MODULE.validate_matrix(root, [])
             with self.assertRaisesRegex(ValueError, "non-empty and unique"):
                 MODULE.validate_matrix(root, [1, 1])
+
+    def test_candidate_matrix_requires_application_per_seed_and_noncenter_total(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_run(root, 1, events=events_with_candidate(0.0))
+            write_run(root, 2, events=events_with_candidate(0.08))
+
+            report = MODULE.validate_matrix(
+                root,
+                [1, 2],
+                require_events=True,
+                require_candidate_application=True,
+                min_noncenter_applied_total=1,
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["candidate_applied_total"], 2)
+        self.assertEqual(report["candidate_noncenter_applied_total"], 1)
+
+    def test_candidate_matrix_rejects_no_actual_stand_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_run(root, 1, events=events_with_candidate(0.0))
+
+            report = MODULE.validate_matrix(
+                root,
+                [1],
+                require_events=True,
+                require_candidate_application=True,
+                min_noncenter_applied_total=1,
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_seeds"], [])
+        self.assertEqual(
+            report["matrix_failures"],
+            ["noncenter_applied_total=0 below 1"],
+        )

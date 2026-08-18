@@ -1776,3 +1776,23 @@ Scheduler EventLog 出现 stale、安全停车或完整窗口周期超限，矩�
 用户要求统一放在全部本地代码与审计结束之后。本批完成后全仓离线回归为
 `511 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为 `327 tests OK`，53 项工作区
 必需文件与 Python 语法检查通过。
+
+### 18.19 候选真实应用的远程证据门（当前离线批次）
+
+最终完成性反查确认当前 `CandidateGenerator` 的 left/right 偏移已经是 ±0.08 m，位于执行器
+±0.15 m 横向硬走廊内；Task 1 pick、Task 1/3 transport、Task 1/2/3 return 以及 Task 2 pick
+均存在返回 `application_status=applied` 的真实重规划入口。但此前满分/矩阵验证器只检查分数和
+运行健康，即使所有 offer 都是 `audit_only/too_late`，仍可能误报“调度改造已验收”。现补齐：
+
+- `validate_remote_run.py --require-candidate-application` 只读取最后一个
+  `scheduler_started` 到首个 FINISHED 的活动 session，校验事件状态、动作 ID 和有限横向偏移；
+  默认要求至少一条 `applied`，`unreported`、未知状态、畸形或 FINISHED 后记录均不计入。
+- `validate_remote_matrix.py --require-candidate-application` 强制每个 seed 至少一次应用；
+  `--min-noncenter-applied-total 1` 进一步要求完整矩阵至少真正应用一次 left/right，而不是只重复
+  名义 center。逐 seed 失败与矩阵级“没有真实切换”分别报告，不能相互掩盖。
+- 最终远程文档已经把两个参数加入单轮、measured-carry 和五 seed 命令。因而最终证据将同时证明
+  160 分、安全/周期门和“调度输出确实改变过一个安全站位”，不再以候选计算日志替代执行证据。
+
+这一门只审计既有应用事件，不改变候选偏移、评分、重规划或机器人命令。
+本批完成后全仓离线回归为 `516 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
+`332 tests OK`，53 项工作区必需文件与 Python 语法检查通过。

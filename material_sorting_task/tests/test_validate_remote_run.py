@@ -29,6 +29,17 @@ progress: measured_carried_guard=active source=task3 half_width=0.075m path_clea
 """
 
 
+def candidate_event(status: str, action: str, offset: object) -> dict[str, object]:
+    return {
+        "event_type": "candidate_application",
+        "details": {
+            "application_status": status,
+            "action_id": action,
+            "lateral_offset_m": offset,
+        },
+    }
+
+
 class ValidateRemoteRunTests(unittest.TestCase):
     def test_accepts_complete_full_score_run(self) -> None:
         report = MODULE.validate_run(PASSING_CLIENT, PASSING_SERVER)
@@ -224,4 +235,77 @@ progress: measured_carried_guard=active source=task1 half_width=0.080m path_clea
         self.assertAlmostEqual(
             report["runtime_health"]["execution_deadline_miss_rate"],
             0.005,
+        )
+
+    def test_candidate_gate_accepts_applied_noncenter_action(self) -> None:
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                candidate_event("audit_only", "old:center", 0.0),
+                candidate_event("applied", "task1:pick:stand:left", 0.08),
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+            )
+        )
+
+        report = MODULE.validate_candidate_applications(
+            events,
+            min_applied_candidates=1,
+            min_noncenter_applied=1,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["applied_count"], 1)
+        self.assertEqual(report["noncenter_applied_count"], 1)
+
+    def test_candidate_gate_uses_latest_finished_session(self) -> None:
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                candidate_event("applied", "old:left", 0.08),
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+                {"event_type": "scheduler_started", "details": {}},
+                candidate_event("audit_only", "new:center", 0.0),
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+                candidate_event("applied", "idle:right", -0.08),
+            )
+        )
+
+        report = MODULE.validate_candidate_applications(events)
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["applied_count"], 0)
+        self.assertIn("applied_count=0 below 1", report["failures"])
+
+    def test_candidate_gate_rejects_invalid_application_record(self) -> None:
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                candidate_event("unreported", "task1:pick:stand:left", 0.08),
+                candidate_event("applied", "task1:pick:stand:right", "nan"),
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+            )
+        )
+
+        report = MODULE.validate_candidate_applications(events)
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["applied_count"], 0)
+        self.assertIn(
+            "invalid_candidate_application_records=2",
+            report["failures"],
         )
