@@ -16,6 +16,7 @@ REQUIRED = (
     TASK / "instruction_parser.py",
     TASK / "runtime_health.py",
     TASK / "task_orchestration.py",
+    TASK / "learning" / "event_replay.py",
     TASK / "executors" / "__init__.py",
     TASK / "executors" / "base.py",
     TASK / "executors" / "dry_run.py",
@@ -40,6 +41,7 @@ REQUIRED = (
     TASK / "shelf" / "placement_feedback.py",
     ROOT / "scripts" / "run_client.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
+    ROOT / "scripts" / "replay_scheduler_events.py",
     ROOT / "scripts" / "validate_runtime_health_run.py",
 )
 

@@ -1,0 +1,63 @@
+# Scheduler EventLog replay gate
+
+This gate closes Phase RL-0 before any MaskablePPO training. It audits the
+deterministic scheduler trace and exports only observations that were encoded
+by the production allow-list at decision time.
+
+## Safety boundary
+
+- The dataset contains the fixed observation vector, action mask and selected
+  finite macro-action slot. It does not contain motor commands.
+- `ObservationBuilder` ignores unknown keys. Server-private layout truth,
+  referee score internals and semantic-audit fields cannot enter the export.
+- A selected action must exist in the same candidate snapshot and be enabled
+  by its hard action mask.
+- The observation schema version, SHA256, shape and finiteness are checked for
+  every record.
+- Logs produced before the observation payload was introduced remain useful
+  for trace auditing, but are counted as `legacy_decisions` and never exported
+  as training records.
+
+## Audit existing logs
+
+```bash
+python3 material_sorting_task/scripts/replay_scheduler_events.py \
+  run_a/scheduler.jsonl run_b/scheduler.jsonl \
+  --min-decisions 1000 \
+  --output scheduler_replay_audit.json
+```
+
+## Export a training-ready heuristic baseline
+
+```bash
+python3 material_sorting_task/scripts/replay_scheduler_events.py \
+  run_a/scheduler.jsonl run_b/scheduler.jsonl \
+  --min-decisions 1000 \
+  --require-training-ready \
+  --dataset scheduler_heuristic_baseline.jsonl \
+  --output scheduler_replay_training_gate.json
+```
+
+The command exits non-zero for malformed JSON, unpaired evaluation/selection
+events, a selected masked action, schema mismatch, non-finite observation or an
+insufficient number of decisions. Dataset output is a deterministic JSONL
+projection of validated fields only.
+
+## Current evidence (2026-08-18)
+
+Four previously captured official-Server V2 heuristic logs were replayed:
+
+- sessions: 4
+- paired decisions: 3703
+- invalid or unpaired selections: 0
+- heuristic selections: 2297
+- hysteresis selections: 667
+- no-safe-candidate decisions: 739
+- mean heuristic regret caused by bounded hysteresis: 0.01967
+- maximum heuristic regret: 0.36777
+
+The historical logs predate exact observation recording, so all 2964 selected
+decisions are deliberately classified as legacy and `training_ready_decisions`
+is zero. This proves the trace pairing/audit path, but it is not permission to
+train. New local/remote runs must pass `--require-training-ready` before Phase
+RL-1 begins.

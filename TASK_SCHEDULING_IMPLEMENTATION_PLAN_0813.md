@@ -1552,3 +1552,26 @@ p99=120.98 ms、execution p95=41.41 ms，两类 deadline miss rate 均低于 0.2
 
 本批离线回归：`466 passed, 5 skipped, 1 warning`（仅排除本机缺少 OpenCV 的既有
 `test_empty_layer_verifier.py`）；workspace 语法检查和归档哈希在提交后重新生成。
+
+### 18.9 Phase RL-0 EventLog 回放与训练数据门（当前离线批次）
+
+远程验收按当前安排统一后置，先补齐不依赖 ROS/官方 Server 的 PR 9 数据闭环。此前
+EventLog 已记录候选 Critic、硬过滤结果和最终选择，但不能精确重建策略实际看到的固定维度
+observation，因此旧日志只能用于审计，不能直接训练。
+
+- `SchedulerDecisionService` 在每次 `candidates_evaluated` 中新增由 `ObservationBuilder`
+  生成的白名单 observation、action mask、schema version/hash 和 `max_candidates`；编码或
+  日志失败仅使样本不可训练，不改变 Heuristic 选择和 Executor 命令。
+- 新增 `learning/event_replay.py` 和 `scripts/replay_scheduler_events.py`，严格配对每个
+  `candidates_evaluated -> action_selected`，核对候选唯一性、selected action、硬 mask、
+  observation 形状/有限性和 schema 哈希，并只导出通过校验的 `scheduler-replay-v1` JSONL。
+- 未携带精确 observation 的旧日志明确计入 `legacy_decisions`；即使选择轨迹完全合法，
+  `--require-training-ready` 也会拒绝它，禁止用全零或反推特征伪造训练样本。
+- 四份已拉回的官方 V2 Heuristic JSONL 已完成真实回放：4 sessions、3703 paired decisions、
+  0 malformed、0 invalid、0 unpaired；其中 2297 次直接 Heuristic 选择、667 次有界滞回选择、
+  739 次无安全候选。平均滞回 regret=0.01967、最大=0.36777。2964 次有选择的决策均属于
+  旧 schema，故 training-ready=0；该结论只放行审计器，不放行训练。
+
+下一离线步骤是补齐 RL Shadow 专用回放门：验证建议始终位于 action mask 内、实际选择仍为
+Heuristic、推理 p95 不超过 25 ms，并固化模型/训练数据/配置三类哈希。收集新的精确 observation
+样本和官方 Server A/B 仍统一留到最后的远程阶段。

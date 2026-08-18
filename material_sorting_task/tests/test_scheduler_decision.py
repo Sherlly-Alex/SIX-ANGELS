@@ -152,6 +152,11 @@ class SchedulerDecisionTests(unittest.TestCase):
             [event.type for event in sink.events],
             ["candidates_evaluated", "action_selected"],
         )
+        candidate_details = sink.events[0].details
+        self.assertEqual(candidate_details["observation_schema_version"], "scheduler-observation-v1")
+        self.assertEqual(len(candidate_details["action_mask"]), 8)
+        self.assertEqual(candidate_details["action_mask"][:2], [True, False])
+        self.assertEqual(len(candidate_details["observation"]), 138)
         self.assertEqual(sink.events[-1].action_id, "safe")
         service.close()
 

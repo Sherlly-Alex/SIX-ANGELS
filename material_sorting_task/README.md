@@ -152,6 +152,21 @@ bash scripts/run_client.sh
 正式比赛。项目不会自动下载模型，Gymnasium、Stable-Baselines3 和 sb3-contrib 也不会进入
 默认正式 Client 依赖。
 
+每次候选评估还会记录经过严格白名单编码的 observation、action mask、schema 版本和哈希。
+训练前必须先回放 EventLog；旧版日志仍可用于选择一致性审计，但由于缺少精确 observation，
+不会被静默转换成训练样本：
+
+```bash
+python3 scripts/replay_scheduler_events.py run1.jsonl run2.jsonl \
+  --min-decisions 1000 \
+  --require-training-ready \
+  --dataset scheduler_heuristic_baseline.jsonl \
+  --output scheduler_replay_report.json
+```
+
+只有 `passed=true` 且 `training_ready_decisions` 达到门限的数据集才允许进入离线训练。
+导出记录不包含 Server 布局真值、裁判私有状态或语义审计字段。
+
 ### 任务 1 底盘实动测试
 
 `nav_only` 会读取 `/material/detections` 中任务 1 目标颜色的稳定世界坐标，使用静态场景

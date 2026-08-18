@@ -143,7 +143,7 @@ class SchedulerDecisionService:
             self.config.max_candidates - len(evaluations)
         )
         version = None if snapshot is None else int(snapshot.version)
-        self._emit_candidates(now, evaluations, version)
+        self._emit_candidates(now, evaluations, mask, version, world_state)
 
         if heuristic_best is None:
             self._reset_selection()
@@ -305,7 +305,9 @@ class SchedulerDecisionService:
         self,
         now_s: float,
         evaluations: tuple[CandidateEvaluation, ...],
+        action_mask: tuple[bool, ...],
         costmap_version: int | None,
+        world_state: Mapping[str, Any] | Any,
     ) -> None:
         details = {
             "costmap_version": costmap_version,
@@ -320,6 +322,33 @@ class SchedulerDecisionService:
                 for item in evaluations
             ],
         }
+        # Persist the exact allow-listed vector seen by a future RL policy.
+        # ObservationBuilder ignores unknown world-state keys, so neither
+        # Server-private truth nor semantic-audit data can leak into replay.
+        try:
+            from learning.observation import (
+                OBSERVATION_SCHEMA_VERSION,
+                ObservationBuilder,
+            )
+
+            builder = ObservationBuilder(self.config.max_candidates)
+            observation = builder.build(
+                world_state or {}, evaluations, action_mask
+            )
+            details.update(
+                {
+                    "observation": observation.tolist(),
+                    "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
+                    "observation_schema_hash": builder.schema_hash,
+                    "max_candidates": self.config.max_candidates,
+                    "action_mask": list(action_mask),
+                }
+            )
+        except Exception as exc:
+            # Telemetry is audit-only. A serialization dependency failure may
+            # make this sample ineligible for training but never changes the
+            # deterministic action selected below.
+            details["observation_error"] = type(exc).__name__
         self._emit("candidates_evaluated", now_s, details=details)
 
     def _emit_selection(self, now_s: float, outcome: DecisionOutcome) -> None:
