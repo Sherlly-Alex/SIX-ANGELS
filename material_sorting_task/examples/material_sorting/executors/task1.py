@@ -789,6 +789,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_post_align_target_m: float | None = None
         self._compliance_retry_count = 0
         self._compliant_motion_last_s: float | None = None
+        self._grasp_bilateral_lock_reported = False
 
     def reset(self) -> None:
         super().reset()
@@ -802,6 +803,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_post_align_target_m = None
         self._compliance_retry_count = 0
         self._compliant_motion_last_s = None
+        self._grasp_bilateral_lock_reported = False
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -816,6 +818,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             self._compliance_post_align_target_m = None
             self._compliance_retry_count = 0
             self._compliant_motion_last_s = None
+            self._grasp_bilateral_lock_reported = False
 
     def tick(self, stage: TaskStage, context: ExecutionContext) -> StageResult:
         if stage is TaskStage.GRASP:
@@ -833,7 +836,7 @@ class Task1ContactExecutor(Task1PregraspExecutor):
             result = self._tick_contact(context)
             if result.status is StageStatus.SUCCEEDED:
                 self._capture_held_grasp_snapshot()
-            return result
+            return self._annotate_grasp_result(result)
 
         if stage is TaskStage.LIFT:
             if stage is not self.active_stage:
@@ -859,6 +862,39 @@ class Task1ContactExecutor(Task1PregraspExecutor):
         self._compliance_post_align_target_m = None
         self._compliance_retry_count = 0
         self._compliant_motion_last_s = None
+        self._grasp_bilateral_lock_reported = False
+
+    def _annotate_grasp_result(self, result: StageResult) -> StageResult:
+        if result.status is StageStatus.SUCCEEDED:
+            subphase = "settled"
+        elif not bool(getattr(self._contact, "planned", False)):
+            subphase = "baseline"
+        elif bool(getattr(self._contact, "bilateral_aligned", False)):
+            if not self._grasp_bilateral_lock_reported:
+                subphase = "bilateral_lock"
+                self._grasp_bilateral_lock_reported = True
+            else:
+                subphase = "preload"
+        elif bool(getattr(self._contact, "any_contact", False)):
+            subphase = "single_contact"
+        else:
+            subphase = "approach"
+        half_width = getattr(self._contact, "half_width", None)
+        try:
+            half_width_m = float(half_width)
+        except (TypeError, ValueError):
+            half_width_m = 0.0
+        return result.with_manipulation_subphase(
+            "grasp",
+            subphase,
+            bilateral_aligned=bool(
+                getattr(self._contact, "bilateral_aligned", False)
+            ),
+            any_contact=bool(getattr(self._contact, "any_contact", False)),
+            inward_offset_m=float(self._contact_search_used_m),
+            half_width_m=half_width_m,
+            retry_count=int(self._compliance_retry_count),
+        )
 
     def _capture_held_grasp_snapshot(self) -> None:
         """Persist successful grasp geometry across later controller resets."""

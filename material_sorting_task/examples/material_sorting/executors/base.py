@@ -10,7 +10,7 @@ executor and continue returning ``RUNNING``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
@@ -34,6 +34,60 @@ class TaskStage(Enum):
 
 
 TASK_STAGE_SEQUENCE: tuple[TaskStage, ...] = tuple(TaskStage)
+
+MANIPULATION_SUBPHASES = {
+    "grasp": frozenset(
+        {"baseline", "approach", "single_contact", "bilateral_lock", "preload", "settled"}
+    ),
+    "place": frozenset(
+        {"baseline", "descend", "contact_candidate", "contact_confirm", "release", "post_release_cleanup"}
+    ),
+}
+
+
+def annotate_placement_result(
+    result: "StageResult",
+    executor_phase: str,
+    lowering_controller: Any = None,
+    *,
+    cleanup: bool = False,
+) -> "StageResult":
+    """Map existing placement-controller phases to one stable audit schema."""
+
+    phase = str(executor_phase)
+    feedback_phase = str(getattr(lowering_controller, "phase", ""))
+    if cleanup:
+        subphase = "post_release_cleanup"
+    elif result.status is StageStatus.SUCCEEDED:
+        subphase = "release"
+    elif phase == "lower":
+        if feedback_phase == "baseline":
+            subphase = "baseline"
+        elif feedback_phase == "contact_confirm":
+            subphase = "contact_candidate"
+        elif feedback_phase in {
+            "contact_complete",
+            "geometry_complete",
+            "geometry_fallback",
+        }:
+            subphase = "contact_confirm"
+        else:
+            subphase = "descend"
+    elif phase in {"release_support_settle", "support_settle"}:
+        subphase = "contact_confirm"
+    elif phase == "release":
+        subphase = "release"
+    else:
+        subphase = "post_release_cleanup"
+    return result.with_manipulation_subphase(
+        "place",
+        subphase,
+        executor_phase=phase,
+        feedback_phase=feedback_phase,
+        effort_contact_candidate=bool(
+            getattr(lowering_controller, "contact_candidate", False)
+        ),
+    )
 
 
 class StageStatus(Enum):
@@ -108,6 +162,34 @@ class StageResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+    def with_manipulation_subphase(
+        self,
+        kind: str,
+        subphase: str,
+        **evidence: Any,
+    ) -> "StageResult":
+        """Attach a canonical, read-only manipulation observation."""
+
+        normalized_kind = str(kind).strip().casefold()
+        normalized_subphase = str(subphase).strip().casefold()
+        if normalized_subphase not in MANIPULATION_SUBPHASES.get(
+            normalized_kind, ()
+        ):
+            raise ValueError(
+                f"invalid {normalized_kind!r} manipulation subphase "
+                f"{normalized_subphase!r}"
+            )
+        metadata = dict(self.metadata)
+        metadata.update(
+            {
+                "manipulation_kind": normalized_kind,
+                "manipulation_subphase": normalized_subphase,
+            }
+        )
+        if evidence:
+            metadata["manipulation_evidence"] = MappingProxyType(dict(evidence))
+        return replace(self, metadata=metadata)
 
     @classmethod
     def running(

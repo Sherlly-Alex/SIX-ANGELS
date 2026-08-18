@@ -22,6 +22,7 @@ from executors.base import (
     StageResult,
     StageStatus,
     TaskStage,
+    annotate_placement_result,
 )
 from executors.task1 import Task1LiftExecutor
 from executors.scheduler_candidate import (
@@ -282,7 +283,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         if stage is TaskStage.ALIGN_FOR_PLACE:
             return self._tick_align_for_place(context)
         if stage is TaskStage.PLACE:
-            return self._tick_place(context)
+            result = self._tick_place(context)
+            return annotate_placement_result(
+                result, self._phase, self._place_lowering
+            )
         if stage is TaskStage.VERIFY_PLACE:
             elapsed = max(0.0, float(context.now_s) - self._stage_started_s)
             if elapsed >= 1.0:
@@ -295,7 +299,10 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 arm_command=self._held_arm_command,
             )
         if stage is TaskStage.RETURN_TO_END:
-            return self._tick_return_to_end(context)
+            result = self._tick_return_to_end(context)
+            return annotate_placement_result(
+                result, self._phase, self._place_lowering, cleanup=True
+            )
         return StageResult.blocked(
             f"task 2 integrated executor has no handler for {stage.value}",
             arm_command=self._held_arm_command,

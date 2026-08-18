@@ -16,6 +16,7 @@ import threading
 from typing import Any, Callable, Mapping, Sequence
 
 from executors.base import (
+    MANIPULATION_SUBPHASES,
     ArmCommand,
     ExecutionContext,
     StageResult,
@@ -160,6 +161,7 @@ class SchedulerEngine:
         self._active_action: LegacyStageAction | RecoverableStageAction | None = None
         self._active_owner: str | None = None
         self._stage_started_s: float | None = None
+        self._last_manipulation_subphase: tuple[str, str] | None = None
         self._controls_base = False
         self._base_linear_x = 0.0
         self._base_angular_z = 0.0
@@ -222,6 +224,7 @@ class SchedulerEngine:
         self._active_action = None
         self._release_active_resources()
         self._stage_started_s = None
+        self._last_manipulation_subphase = None
         self._release_arm_hold_lease()
         self._arm_command = None
         self.referee_gateway.reset()
@@ -390,6 +393,7 @@ class SchedulerEngine:
             self._active_action = action
             self._active_owner = owner
             self._stage_started_s = float(context.now_s)
+            self._last_manipulation_subphase = None
             self._controls_base = False
             self._bump_message(
                 f"task {self.task_id} attempt {self.attempt} stage={spec.stage.value}"
@@ -446,6 +450,8 @@ class SchedulerEngine:
                 f"{exc}"
             )
             return self.snapshot()
+
+        self._emit_manipulation_subphase(result, context)
 
         self._controls_base = bool(result.controls_base)
         if self._controls_base:
@@ -1117,6 +1123,33 @@ class SchedulerEngine:
             raise TypeError(
                 "StageResult failure_code must be a scheduler FailureCode value"
             )
+        kind = result.metadata.get("manipulation_kind")
+        subphase = result.metadata.get("manipulation_subphase")
+        if (kind is None) != (subphase is None):
+            raise ValueError(
+                "manipulation_kind and manipulation_subphase must appear together"
+            )
+        if kind is not None:
+            if not isinstance(kind, str) or not isinstance(subphase, str):
+                raise TypeError("manipulation phase metadata must be strings")
+            if subphase not in MANIPULATION_SUBPHASES.get(kind, ()):
+                raise ValueError(f"invalid manipulation subphase {kind}:{subphase}")
+            evidence = result.metadata.get("manipulation_evidence")
+            if evidence is not None and not isinstance(evidence, Mapping):
+                raise TypeError("manipulation_evidence must be a mapping")
+            if kind == "grasp" and spec.stage is not TaskStage.GRASP:
+                raise ValueError("grasp subphase is outside the grasp stage")
+            if kind == "place":
+                expected_stage = (
+                    TaskStage.RETURN_TO_END
+                    if subphase == "post_release_cleanup"
+                    else TaskStage.PLACE
+                )
+                if spec.stage is not expected_stage:
+                    raise ValueError(
+                        f"place subphase {subphase} is outside "
+                        f"the {expected_stage.value} stage"
+                    )
         if result.controls_arm and not self._arm_command_is_finite(result.arm_command):
             raise ValueError(
                 "ArmCommand must contain finite spine, 2 head, 6 left-arm, "
@@ -1169,6 +1202,34 @@ class SchedulerEngine:
                 frame.base_command,
                 float(context.now_s),
             )
+
+    def _emit_manipulation_subphase(
+        self,
+        result: StageResult,
+        context: ExecutionContext,
+    ) -> None:
+        kind = result.metadata.get("manipulation_kind")
+        subphase = result.metadata.get("manipulation_subphase")
+        if not isinstance(kind, str) or not isinstance(subphase, str):
+            return
+        current = (kind, subphase)
+        if current == self._last_manipulation_subphase:
+            return
+        self._last_manipulation_subphase = current
+        details: dict[str, Any] = {
+            "kind": kind,
+            "subphase": subphase,
+            "status": result.status.value,
+        }
+        evidence = result.metadata.get("manipulation_evidence")
+        if isinstance(evidence, Mapping):
+            details["evidence"] = dict(evidence)
+        self._emit_structured_event(
+            "manipulation_subphase",
+            context,
+            message=f"{kind} subphase={subphase}",
+            details=details,
+        )
 
     @staticmethod
     def _arm_command_is_finite(command: ArmCommand | None) -> bool:

@@ -10,7 +10,13 @@ from desktop_grasp.pregrasp_core import (
     PregraspPlanningError,
     SPINE_MIN,
 )
-from executors.base import ExecutionContext, PlaceholderTaskExecutor, StageResult, TaskStage
+from executors.base import (
+    ExecutionContext,
+    PlaceholderTaskExecutor,
+    StageResult,
+    TaskStage,
+    annotate_placement_result,
+)
 from executors.scheduler_candidate import CandidateApplicationStatus
 from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
 from executors.transfer_support import stand_from_held_center
@@ -277,9 +283,15 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         if stage is TaskStage.ALIGN_FOR_PLACE:
             return self._tick_task3_align_for_place(context)
         if stage is TaskStage.PLACE:
-            return self._tick_task3_place(context)
+            result = self._tick_task3_place(context)
+            return annotate_placement_result(
+                result, self._phase, self._task3_place_lowering
+            )
         if stage is TaskStage.RETURN_TO_END:
-            return self._tick_task3_return_to_end(context)
+            result = self._tick_task3_return_to_end(context)
+            return annotate_placement_result(
+                result, self._phase, self._task3_place_lowering, cleanup=True
+            )
         # The inherited release, verification and safe retreat sequence is
         # retained for verification and other stages.
         return super().tick(stage, context)

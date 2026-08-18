@@ -1262,10 +1262,15 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 
 - [x] Server JSON 仍是唯一执行语义真值。
 - [x] 裁判仍是 Task 和 attempt 推进权威。
-- [ ] 20 Hz 安全与命令循环未降低。
+- [x] 20 Hz 安全与命令循环未降低：官方 Server 满分基线的运行健康报告共 261 个采样，
+  interval p95=59.95 ms、p99=120.98 ms、deadline miss rate=0.057%，在远程验收门限
+  p95<=65 ms、p99<=125 ms、miss rate<=1% 下通过。
 - [x] 底盘命令租约失效后自动归零。
 - [x] 三任务有独立 TaskPlan 实例（当前共享兼容阶段拓扑）。
-- [ ] 抓取和放置柔顺子相位可观察。
+- [x] 抓取和放置柔顺子相位可观察：`StageResult` 使用固定枚举记录抓取
+  `baseline/approach/single_contact/bilateral_lock/preload/settled` 与放置
+  `baseline/descend/contact_candidate/contact_confirm/release/post_release_cleanup`；v2 引擎校验
+  子相位与当前 Stage 的对应关系，仅在状态转换时追加 `manipulation_subphase` 事件，证据字段只读。
 - [x] 物体释放后的不可逆边界被正确建模。
 - [x] Task 3 收尾不再依赖任务编号特判。
 - [x] 动态障碍具有 TTL 和置信度。
@@ -1637,3 +1642,24 @@ backend 故障注入；不得据此宣称 RL 已优于 Heuristic 或已获得 `r
 该环境只预训练 Multi-Critic 候选排序，不包含机器人动力学、时序滞回、抓取/放置结果或裁判
 成功真值，因而不存在“用回放分数证明实机成功率”的替代关系。项目级随机化仿真 backend、
 Shadow 和官方 Server 仍分别执行 §18.11、§18.10 与最终远程门。
+
+### 18.13 抓取/放置柔顺子相位遥测（当前离线批次）
+
+在不修改运动目标、速度、力阈值和阶段跳转条件的前提下，执行器现在把已有控制器内部状态映射为
+稳定、有限的调度观测：
+
+- Task 1 的接触抓取实现统一产生 `grasp` 子相位；Task 2/3 复用同一抓取链，因此三任务使用完全
+  相同的 `baseline -> approach -> single_contact -> bilateral_lock -> preload -> settled` 语义。
+  `bilateral_lock` 只报告首次双侧锁定，后续保持明确记为 `preload`。
+- Task 1/2/3 的放置控制器统一产生 `place` 子相位，将现有 lowering feedback 映射为 baseline、
+  descend、候选接触、确认接触和 release；Return-to-End 的退臂/清理单独记录为
+  `post_release_cleanup`，不与“物体已释放”混为一个状态。
+- `StageResult.with_manipulation_subphase()` 规范化并冻结证据，调度边界拒绝未知枚举、非 Mapping
+  证据、抓取标签出现在非 GRASP Stage、以及放置/清理标签出现在错误 Stage。错误遥测会
+  fail-closed，不能污染 EventLog 或训练数据。
+- `SchedulerEngine` 仅在 `(kind, subphase)` 发生变化时追加结构化
+  `manipulation_subphase` 事件；记录 task、attempt、step、结果状态及只读证据，避免 20 Hz 循环
+  重复日志。离线测试覆盖证据不可变、抓取 lock/preload 分界、放置映射、事件去重和错阶段拒绝。
+
+该批次只完成可观察性，不把柔顺控制拆成可由策略任意选择的低层动作。后续 RL 仍只能选择经过
+hard mask 的宏动作；接触闭环、释放条件和安全阈值继续由确定性执行器独占。
