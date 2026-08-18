@@ -23,6 +23,7 @@ REQUIRED = (
     TASK / "learning" / "event_replay.py",
     TASK / "learning" / "benchmark.py",
     TASK / "learning" / "model_package.py",
+    TASK / "learning" / "promotion.py",
     TASK / "learning" / "replay_env.py",
     TASK / "learning" / "configs" / "replay_training_v1.json",
     TASK / "learning" / "simulation_backend.py",
@@ -57,8 +58,10 @@ REQUIRED = (
     ROOT / "scripts" / "train_scheduler_policy.py",
     ROOT / "scripts" / "validate_rl_shadow.py",
     ROOT / "scripts" / "validate_scheduler_model.py",
+    ROOT / "scripts" / "approve_guarded_policy.py",
     ROOT / "scripts" / "validate_runtime_health_run.py",
     ROOT / "docs" / "PROJECT_SIMULATION_BENCHMARK.md",
+    ROOT / "docs" / "GUARDED_POLICY_PROMOTION.md",
 )
 
 

@@ -190,15 +190,6 @@ class CompetitionClient(Node):
                 from scheduler.events import EventLog, JsonlEventSink
 
                 event_log = EventLog([JsonlEventSink(event_log_path)])
-                event_log.emit(
-                    "scheduler_started",
-                    "scheduler event log initialized",
-                    details={
-                        "engine": self.scheduler_mode,
-                        "policy_mode": self.scheduler_policy,
-                        "execution_mode": self.execution_mode,
-                    },
-                )
             except (OSError, TypeError, ValueError) as exc:
                 self.get_logger().error(
                     f"scheduler event log disabled ({exc}); control is unaffected"
@@ -244,11 +235,33 @@ class CompetitionClient(Node):
                         "MATERIAL_SCHEDULER_MODEL_SHA256", ""
                     ).strip()
                     builder = ObservationBuilder(8)
-                    rl_policy = RLPolicy(
-                        model_path=model_path or None,
-                        expected_sha256=expected_hash or None,
-                        expected_schema_hash=builder.schema_hash,
-                    )
+                    if self.scheduler_policy == "rl_guarded":
+                        from learning.promotion import validate_guarded_approval
+
+                        approval = validate_guarded_approval(
+                            os.environ.get(
+                                "MATERIAL_RL_GUARDED_APPROVAL", ""
+                            ).strip(),
+                            expected_manifest_sha256=os.environ.get(
+                                "MATERIAL_RL_GUARDED_APPROVAL_SHA256", ""
+                            ).strip(),
+                            model_path=model_path,
+                            expected_model_sha256=expected_hash,
+                            expected_schema_hash=builder.schema_hash,
+                        )
+                        if not approval.passed:
+                            self.get_logger().error(
+                                "rl_guarded approval rejected: "
+                                + "; ".join(approval.failures)
+                                + "; falling back to heuristic"
+                            )
+                            self.scheduler_policy = "heuristic"
+                    if self.scheduler_policy != "heuristic":
+                        rl_policy = RLPolicy(
+                            model_path=model_path or None,
+                            expected_sha256=expected_hash or None,
+                            expected_schema_hash=builder.schema_hash,
+                        )
                 decision_service = SchedulerDecisionService(
                     config=DecisionConfig(
                         policy_mode=self.scheduler_policy,
@@ -295,6 +308,22 @@ class CompetitionClient(Node):
             self.get_logger().error(
                 f"invalid scheduler configuration ({exc}); falling back to legacy"
             )
+        if event_log is not None:
+            try:
+                event_log.emit(
+                    "scheduler_started",
+                    "scheduler event log initialized",
+                    details={
+                        "engine": self.scheduler_mode,
+                        "policy_mode": self.scheduler_policy,
+                        "execution_mode": self.execution_mode,
+                    },
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self.get_logger().error(
+                    f"scheduler start event could not be written ({exc}); "
+                    "control is unaffected"
+                )
         self.measured_carry_guard_enabled = bool(
             carry_guard_requested and self.scheduler_mode == "v2"
         )

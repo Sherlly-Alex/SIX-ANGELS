@@ -1729,3 +1729,26 @@ sb3-contrib，且新 `scheduler-event-v2` 生产样本尚未收集，因此本�
 
 测试覆盖 Python/NumPy bool、小数和合法单元素整数，并证明离线 evaluator 将畸形策略计入
 policy error、不会把 episode 标为完成。
+
+### 18.17 `rl_guarded` 显式放行清单（当前离线批次）
+
+完成性审计发现，模型包、成对盲测和 RL Shadow 虽各自已有严格验证器，但此前仅设置
+`MATERIAL_SCHEDULER_POLICY=rl_guarded`、模型路径和模型哈希就可能请求策略接管，没有在正式
+Client 启动边界强制证明三道门属于同一模型。现补齐最后一道 fail-closed 联锁：
+
+- `learning/promotion.py` 将完整模型包、至少 100 个盲测 seed 的通过报告、至少 1,000 条建议的
+  Shadow 通过报告绑定为 `scheduler-policy-approval-v1`；拒绝弱于 25 ms 推理、2% 成对改善、
+  2,000 次 bootstrap、1% fallback 的报告，也拒绝模型哈希不一致、RL takeover 或 mask 违规。
+- `scripts/approve_guarded_policy.py` 只对通过的证据生成确定性 JSON 清单并打印文件 SHA256；
+  清单本身不自动代表人工批准，部署者必须另行配置该 SHA256。
+- 正式 Client 的 `rl_guarded` 现在必须同时提供模型、模型 SHA256、清单和清单 SHA256；启动时
+  再次哈希模型与清单并核对当前 observation schema。任一缺失、篡改或 schema 漂移均在决策
+  服务创建前回退 Heuristic。`rl_shadow` 不要求清单，仍保持零接管。
+- `scheduler_started.policy_mode` 延后到策略初始化结束后记录，因此写入的是实际生效策略，
+  不再把初始化失败后的 Heuristic 回退误记成 `rl_guarded`。
+
+该批次只封闭未来的受约束启用入口，不生成模型、不改变当前 `v2 + heuristic` 默认路径，也不
+替代最终官方 Server guarded canary。完整操作见
+`material_sorting_task/docs/GUARDED_POLICY_PROMOTION.md`。离线全仓回归（排除本机缺少 OpenCV 的
+既有视觉导入项）为 `507 passed, 5 skipped, 1 warning`；正式非 ROS unittest 入口仍为
+`323 tests OK`，workspace 必需文件与 Python 语法检查通过。

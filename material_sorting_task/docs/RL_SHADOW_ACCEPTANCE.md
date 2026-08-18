@@ -84,3 +84,11 @@ regression, inference p95 within budget, and at least one paired metric
 positive and whose relative improvement reaches the configured threshold.
 This is an offline pre-release gate, not a substitute for runtime hysteresis,
 Shadow or official-Server acceptance.
+
+## Promotion to guarded control
+
+Passing the model, benchmark and Shadow gates separately still does not enable
+control. Bind their exact artifacts with `scripts/approve_guarded_policy.py`
+and configure the resulting manifest plus its independently approved SHA256 as
+described in `docs/GUARDED_POLICY_PROMOTION.md`. Without that manifest,
+`MATERIAL_SCHEDULER_POLICY=rl_guarded` fails closed to Heuristic.
