@@ -164,12 +164,21 @@ the same-seed feature gate; broader randomized evidence remains separate.
 
 ## 4. Five-seed Heuristic release matrix
 
-Repeat Run A with fresh containers for seeds `20260818` through `20260821`.
+Repeat Run A with fresh containers for all five seeds, including `20260817`;
+an older run from a previous commit is not release evidence.  Put the complete
+matrix below one new, release-specific root so historical same-name runs cannot
+be consumed accidentally.  For example:
+
+```bash
+export MATRIX_ROOT="$PROJECT/remote_artifacts/v2_matrix_release_candidate"
+mkdir -p "$MATRIX_ROOT"
+```
+
 For each seed `S`, use exactly:
 
 ```text
 RUN=v2_multiseed_S
-OUT=$PROJECT/remote_artifacts/v2_multiseed_S
+OUT=$MATRIX_ROOT/v2_multiseed_S
 MATERIAL_SEED=S
 Client log:    client_v2_multiseed_S.log
 Server log:    server_v2_multiseed_S.log
@@ -180,7 +189,7 @@ Then run:
 
 ```bash
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
-export ROOT="$PROJECT/remote_artifacts"
+export ROOT="$PROJECT/remote_artifacts/v2_matrix_release_candidate"
 
 python3 "$PROJECT/material_sorting_task/scripts/validate_remote_matrix.py" \
   --root "$ROOT" \
@@ -208,7 +217,7 @@ and export only fully paired records:
 
 ```bash
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
-export ROOT="$PROJECT/remote_artifacts"
+export ROOT="$PROJECT/remote_artifacts/v2_matrix_release_candidate"
 
 python3 "$PROJECT/material_sorting_task/scripts/replay_scheduler_events.py" \
   "$ROOT"/v2_multiseed_*/scheduler_v2_multiseed_*.jsonl \

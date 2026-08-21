@@ -1876,3 +1876,11 @@ R2 远程诊断进一步给出实际因果链：transport sidecar 在固定 0.70
 
 本批最终本地回归为 `526 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
 `342 tests OK`；下一轮同 seed R5 只需重新验证 measured-carry 官方 Server 闭环。
+
+R5 已在官方 Server 正式通过：160/160，fatal 计数全为 0；5 条 applied 均唯一，其中 4 条
+非中心，36 条 transport offer 按 measured 模式约束保持 audit-only。Task 1/Task 3 实测包络
+最小净空分别为 0.161 m 和 0.313 m，均显著高于 0.020 m 门限且无 guard stop。运行周期
+`p95=58.79 ms`、`p99=108.91 ms`、执行耗时 `p95=32.59 ms`，deadline miss rate 均低于
+0.002。至此同 seed Heuristic 基线、候选幂等和 measured-carry A/B 均已封板；下一项只剩
+§18.18 的五 seed Heuristic release matrix，所有 seed 必须使用当前 release candidate 并写入
+独立 matrix 根目录，不能混用旧代码的同名历史日志。
