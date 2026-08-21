@@ -155,3 +155,44 @@ def test_pipeline_fail_closed_without_sb3(monkeypatch: pytest.MonkeyPatch) -> No
         assert report["passed"] is False
         assert report["next_allowed_mode"] == "heuristic"
         assert report["rl_guarded_authorized"] is False
+
+
+def test_pipeline_uses_contextual_bandit_discount(monkeypatch: pytest.MonkeyPatch) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        dataset = _dataset(root / "source")
+        commands: list[list[str]] = []
+
+        def capture_step(command, *, env, output):
+            del env, output
+            if "split_replay_dataset.py" in command[1]:
+                split_replay_dataset(
+                    Path(command[command.index("--dataset") + 1]),
+                    Path(command[command.index("--output-dir") + 1]),
+                    seed=int(command[command.index("--seed") + 1]),
+                )
+                return
+            commands.append(command)
+            raise RuntimeError("stop after training command capture")
+
+        monkeypatch.setattr(rl1_pipeline, "_run", capture_step)
+        output = root / "run"
+        assert rl1_pipeline.main([
+            "--dataset", str(dataset), "--output-dir", str(output),
+            "--code-revision", "test",
+        ]) == 1
+        train_command = commands[0]
+        assert train_command[train_command.index("--gamma") + 1] == "0.0"
+        assert train_command[train_command.index("--gae-lambda") + 1] == "1.0"
+        assert train_command[train_command.index("--device") + 1] == "auto"
+
+
+def test_pipeline_rejects_invalid_contextual_bandit_parameters() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        dataset = _dataset(root / "source")
+        with pytest.raises(SystemExit, match="gamma"):
+            rl1_pipeline.main([
+                "--dataset", str(dataset), "--output-dir", str(root / "run"),
+                "--code-revision", "test", "--gamma", "1.1",
+            ])

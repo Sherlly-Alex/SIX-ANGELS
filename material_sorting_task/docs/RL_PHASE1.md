@@ -13,13 +13,21 @@ cd /workspace/SIX-ANGELS-v5/material_sorting_task
 python3 scripts/run_rl1_pipeline.py \
   --dataset /workspace/artifacts/scheduler_replay_v2.jsonl \
   --output-dir /workspace/artifacts/rl1_20260821 \
-  --timesteps 10000 --seed 20260821 --code-revision qzh
+  --timesteps 10000 --seed 20260821 \
+  --gamma 0 --gae-lambda 1 --device auto \
+  --code-revision qzh
 ```
 
 pipeline 按 `(source_sha256, session_index)` 整组做默认 `3/1/1` 划分，先
 校验 `load_replay_dataset`，再只用 `train.jsonl` 训练。它拒绝少于五个
 session、空集、重复 decision、输入篡改和非空输出目录；manifest 记录输入
 和输出 SHA256、记录数、schema 及 session 归属。
+
+每条 replay 记录都是独立的调度决策快照，不是同一条连续 MDP 轨迹。因此
+RL-1 显式使用 `gamma=0`，避免把相邻但无因果关系的记录做跨步信用分配；
+`gamma`、`gae_lambda` 和训练设备都会写入模型元数据。通用训练入口仍保留
+MaskablePPO 的常规默认值，只有 replay contextual-bandit pipeline 默认采用
+`gamma=0`。
 
 训练依赖（gymnasium、stable-baselines3、sb3-contrib、numpy）只允许安装
 在隔离训练容器，不得加入比赛镜像。pipeline 不下载网络资源；依赖缺失时
@@ -47,6 +55,14 @@ oracle 是每一步最高 candidate utility，不应描述为 RL 可以超过的
 运行中记录候选动作、应用状态、重复应用和 runtime health；多 seed、回放和
 官方 Server 验收保持通过后，另行评审 RL guarded promotion。任何异常、缺
 文件、模型 hash 不一致或门禁失败，都回退到 heuristic。
+
+2026-08-21 的第一轮 4090 隔离训练显示：10k steps 的 validation/test
+mean return 分别为 `240.218/241.908`，100k steps 反而降至
+`229.540/235.627`，均低于 selected-action baseline
+`250.330/250.036`；两轮 action mask、模型包和完整 episode 检查均通过。
+这说明失败不来自 GPU、模型封装或训练轮数不足，而来自原配置把独立 replay
+快照按 `gamma=0.99` 做了虚假的跨记录信用分配。修复后的首要验收实验使用
+`gamma=0`，仍执行同一 held-out 门禁，禁止通过放宽 baseline 容差来授权模型。
 
 ## 参考思想与取舍
 

@@ -36,10 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--timesteps", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--gamma", type=float, default=0.0,
+        help="discount factor; replay snapshots are independent contextual-bandit decisions",
+    )
+    parser.add_argument("--gae-lambda", type=float, default=1.0)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--code-revision", required=True)
     args = parser.parse_args(argv)
-    if args.timesteps <= 0 or not args.code_revision.strip():
-        raise SystemExit("timesteps must be positive and code revision must be non-empty")
+    if (
+        args.timesteps <= 0
+        or not 0.0 <= args.gamma <= 1.0
+        or not 0.0 <= args.gae_lambda <= 1.0
+        or not args.device.strip()
+        or not args.code_revision.strip()
+    ):
+        raise SystemExit(
+            "timesteps must be positive; gamma and gae-lambda must be within "
+            "[0, 1]; device and code revision must be non-empty"
+        )
     dataset = args.dataset.resolve()
     output = args.output_dir.resolve()
     if not dataset.is_file():
@@ -66,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         _run([sys.executable, str(ROOT / "scripts" / "train_scheduler_policy.py"),
               "--env-factory", "learning.replay_env:build_replay_env", "--output", str(model),
               "--timesteps", str(args.timesteps), "--seed", str(args.seed), "--code-revision", args.code_revision,
+              "--gamma", str(args.gamma), "--gae-lambda", str(args.gae_lambda), "--device", args.device,
               "--provenance", str(split_dir / "train.jsonl"), "--provenance", str(split_dir / "split_manifest.json")],
              env=train_env, output=logs / "train.log")
         _run([sys.executable, str(ROOT / "scripts" / "validate_scheduler_model.py"), "--model", str(model),
@@ -78,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"passed": bool(heldout.get("passed")), "failures": heldout.get("failures", []),
                    "pipeline": "rl-1", "dataset_sha256": _sha256(dataset), "code_revision": args.code_revision,
                    "seed": args.seed, "timesteps": args.timesteps,
+                   "gamma": args.gamma, "gae_lambda": args.gae_lambda,
+                   "device": args.device,
                    "next_allowed_mode": "rl_shadow" if heldout.get("passed") else "heuristic",
                    "rl_guarded_authorized": False,
                    "split_manifest_sha256": _sha256(split_dir / "split_manifest.json"),

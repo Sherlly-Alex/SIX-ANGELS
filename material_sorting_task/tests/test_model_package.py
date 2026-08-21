@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from learning.model_package import validate_model_package
 from learning.observation import OBSERVATION_SCHEMA_VERSION, observation_schema_hash
 from learning.train_maskable_ppo import MODEL_METADATA_SCHEMA_VERSION
@@ -95,9 +97,12 @@ def test_training_writes_model_config_and_provenance_hashes(
     dataset = tmp_path / "dataset.jsonl"
     dataset.write_text('{"sample":1}\n', encoding="utf-8")
 
+    constructor_kwargs = {}
+
     class FakeModel:
         def __init__(self, policy, env, **kwargs):
-            del policy, env, kwargs
+            del policy, env
+            constructor_kwargs.update(kwargs)
 
         def learn(self, **kwargs):
             del kwargs
@@ -119,6 +124,9 @@ def test_training_writes_model_config_and_provenance_hashes(
         provenance_files=[dataset],
         environment_factory="training_env:build",
         code_revision="deadbeef",
+        gamma=0.0,
+        gae_lambda=1.0,
+        device="cpu",
         verbose=0,
     )
 
@@ -127,7 +135,37 @@ def test_training_writes_model_config_and_provenance_hashes(
     assert metadata["training_config_sha256"] == result.training_config_sha256
     assert metadata["training_config"]["environment_factory"] == "training_env:build"
     assert metadata["training_config"]["code_revision"] == "deadbeef"
+    assert metadata["training_config"]["gamma"] == 0.0
+    assert metadata["training_config"]["gae_lambda"] == 1.0
+    assert metadata["training_config"]["device"] == "cpu"
+    assert constructor_kwargs["gamma"] == 0.0
+    assert constructor_kwargs["gae_lambda"] == 1.0
+    assert constructor_kwargs["device"] == "cpu"
     assert metadata["provenance_files"][0]["sha256"] == hashlib.sha256(
         dataset.read_bytes()
     ).hexdigest()
     assert validate_model_package(output).passed
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("gamma", -0.01), ("gamma", 1.01), ("gae_lambda", -0.01), ("gae_lambda", 1.01)),
+)
+def test_training_rejects_invalid_discount_parameters(
+    tmp_path: Path, name: str, value: float
+) -> None:
+    training = importlib.import_module("learning.train_maskable_ppo")
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text("{}\n", encoding="utf-8")
+    env = SimpleNamespace(
+        action_space=SimpleNamespace(n=8),
+        action_masks=lambda: [True] * 8,
+    )
+    with pytest.raises(ValueError, match=name):
+        training.train_maskable_ppo(
+            env,
+            tmp_path / "model.zip",
+            provenance_files=[dataset],
+            code_revision="deadbeef",
+            **{name: value},
+        )

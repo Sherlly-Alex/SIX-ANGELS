@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -71,6 +72,9 @@ def train_maskable_ppo(
     learning_rate: float = 3.0e-4,
     n_steps: int = 256,
     batch_size: int = 64,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    device: str = "auto",
     verbose: int = 1,
     provenance_files: Sequence[str | Path],
     environment_factory: str | None = None,
@@ -80,6 +84,12 @@ def train_maskable_ppo(
 
     if total_timesteps <= 0:
         raise ValueError("total_timesteps must be positive")
+    if not math.isfinite(float(gamma)) or not 0.0 <= float(gamma) <= 1.0:
+        raise ValueError("gamma must be finite and within [0, 1]")
+    if not math.isfinite(float(gae_lambda)) or not 0.0 <= float(gae_lambda) <= 1.0:
+        raise ValueError("gae_lambda must be finite and within [0, 1]")
+    if not str(device).strip():
+        raise ValueError("device must be non-empty")
     if not str(code_revision).strip():
         raise ValueError("code_revision must be non-empty")
     if not provenance_files:
@@ -97,6 +107,9 @@ def train_maskable_ppo(
         learning_rate=float(learning_rate),
         n_steps=int(n_steps),
         batch_size=int(batch_size),
+        gamma=float(gamma),
+        gae_lambda=float(gae_lambda),
+        device=str(device).strip(),
         verbose=int(verbose),
     )
     model.learn(total_timesteps=int(total_timesteps), progress_bar=False)
@@ -115,6 +128,9 @@ def train_maskable_ppo(
         "learning_rate": float(learning_rate),
         "n_steps": int(n_steps),
         "batch_size": int(batch_size),
+        "gamma": float(gamma),
+        "gae_lambda": float(gae_lambda),
+        "device": str(device).strip(),
         "max_candidates": max_candidates,
         "environment_factory": environment_factory,
         "code_revision": str(code_revision).strip(),
@@ -174,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--timesteps", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--code-revision",
         required=True,
@@ -192,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
         args.output,
         total_timesteps=args.timesteps,
         seed=args.seed,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        device=args.device,
         provenance_files=args.provenance,
         environment_factory=args.env_factory,
         code_revision=args.code_revision,
