@@ -1884,3 +1884,16 @@ R5 已在官方 Server 正式通过：160/160，fatal 计数全为 0；5 条 app
 0.002。至此同 seed Heuristic 基线、候选幂等和 measured-carry A/B 均已封板；下一项只剩
 §18.18 的五 seed Heuristic release matrix，所有 seed 必须使用当前 release candidate 并写入
 独立 matrix 根目录，不能混用旧代码的同名历史日志。
+
+### 18.24 五 seed Heuristic release matrix 结论
+
+当前 release candidate 已在官方 Server 完成 seeds `20260817`–`20260821` 的独立五轮矩阵，
+5/5 均为 160/160，`failed_seeds=[]`、所有 fatal 计数为 0。矩阵共有 36 条 executor-applied
+候选、其中 28 条非中心候选，五轮重复应用均为 0；每轮均找到 FINISHED 终止事件且 EventLog
+完整。最差运行周期 `p95=58.86 ms`、`p99=100.31 ms`，最差执行耗时 `p95=41.38 ms`，
+deadline miss rate 均低于 0.0025，完整矩阵验收结果为 `passed=true`。
+
+至此 Heuristic 默认策略的满分、候选真实应用、幂等性、运行健康、同 seed measured-carry A/B
+以及五 seed 随机布局稳定性全部通过。剩余发布动作仅为 §18.18/最终验收文档中的 EventLog
+回放与 `scheduler-event-v2` 数据资格检查；它只生成离线回放报告和可选数据集，不启用 RL，
+也不改变当前竞赛默认策略。
