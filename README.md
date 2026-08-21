@@ -19,6 +19,78 @@
 
 语义研究模块在 ROS 客户端中默认关闭。启用旁路审计后，Regex/ML/LLM 只对已接受的 Server JSON 做一致性对比，并输出 `SEM_AUDIT` 日志；它们不能修改任务、拒绝任务或阻塞控制器。
 
+## 比赛冻结版本与一键运行
+
+比赛默认配置固定在 `material_sorting_task/config/competition_release.env`。当前冻结基线为：
+
+| 项目 | 冻结值 |
+|---|---|
+| 正式执行模式 | `task123_full` |
+| 调度器 | `v2 / heuristic` |
+| 测量搬运保护 | `0`（默认关闭，实验功能不进入比赛链） |
+| ROS Domain | `102` |
+| 已验收得分 | 官方 Server `160/160` |
+| 验收基线提交 | `1549df9` |
+| 实机动作基线提交 | `5e3233c` |
+
+远程机先设置项目目录并做预检：
+
+```bash
+export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight
+```
+
+正式运行使用两个终端。终端一启动官方 Server（前台运行并保存日志）：
+
+```bash
+export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
+export RUN=competition_$(date +%Y%m%d_%H%M%S)
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" server "$RUN"
+```
+
+终端二使用同一个 `RUN` 启动正式 Client：
+
+```bash
+export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
+export RUN=competition_YYYYMMDD_HHMMSS
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" client "$RUN" v2
+```
+
+运行日志统一写到 `$PROJECT/remote_artifacts/$RUN/`。查看状态或停止容器：
+
+```bash
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" status
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" stop
+```
+
+### 一键冻结、部署与回退
+
+从干净的 Git 工作区生成不可变比赛包和 SHA256：
+
+```bash
+bash material_sorting_task/scripts/competitionctl.sh freeze
+```
+
+部署时必须使用一个新的空目录，不覆盖当前可运行版本：
+
+```bash
+bash material_sorting_task/scripts/deploy_competition_release.sh \
+  /home/abc123/SIX-ANGELS-competition-COMMIT.tar.gz \
+  /home/abc123/polaris/workspace/SIX-ANGELS-release-COMMIT
+export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-release-COMMIT
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight
+```
+
+如果 V2 调度现场异常，保留 Server，只在新终端重启 Client 并切换 Legacy：
+
+```bash
+export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
+export RUN=competition_rollback_$(date +%Y%m%d_%H%M%S)
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" rollback "$RUN"
+```
+
+此回退只切换调度引擎，不替换动作代码、不删除原日志。若需回退整个代码版本，重新部署上一个已校验归档到另一个目录，再修改 `PROJECT`；不要覆盖或删除当前目录。
+
 ## 环境与测试
 
 正式代码需要 ROS 2 Humble、项目提供的仿真容器和对应 GPU/渲染环境。研究依赖不要安装进正式比赛镜像：

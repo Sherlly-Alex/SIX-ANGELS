@@ -41,6 +41,10 @@ semantic_research/                离线语义旁路（Regex/ML/SLM），不进�
 
 ## 运行
 
+比赛冻结配置、一键官方 Server/Client 启动、归档部署和 Legacy 回退命令见仓库根目录
+`README.md` 的“比赛冻结版本与一键运行”。正式比赛优先使用
+`scripts/competitionctl.sh`，避免手工命令遗漏环境变量。
+
 将仓库挂载到赛方 Client 容器的 `/workspace/baseline/material_sorting_task`，然后执行：
 
 ```bash
@@ -66,7 +70,7 @@ MATERIAL_DETECT_BACKEND=color bash scripts/run_client.sh
 正式运行必须使用：
 
 ```text
-ROS_DOMAIN_ID=99
+ROS_DOMAIN_ID=102
 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ```
 

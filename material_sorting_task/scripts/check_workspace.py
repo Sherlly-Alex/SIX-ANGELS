@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TASK = ROOT / "examples" / "material_sorting"
 
 REQUIRED = (
+    ROOT / "config" / "competition_release.env",
     TASK / "client_task.py",
     TASK / "competition_controller.py",
     TASK / "control_types.py",
@@ -52,6 +53,9 @@ REQUIRED = (
     TASK / "desktop_grasp" / "pregrasp_core.py",
     TASK / "shelf" / "placement_feedback.py",
     ROOT / "scripts" / "run_client.sh",
+    ROOT / "scripts" / "competitionctl.sh",
+    ROOT / "scripts" / "freeze_competition_release.sh",
+    ROOT / "scripts" / "deploy_competition_release.sh",
     ROOT / "scripts" / "run_desktop_grasp.sh",
     ROOT / "scripts" / "replay_scheduler_events.py",
     ROOT / "scripts" / "benchmark_scheduler_policy.py",
