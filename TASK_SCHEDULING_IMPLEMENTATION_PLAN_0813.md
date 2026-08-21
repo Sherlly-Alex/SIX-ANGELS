@@ -1897,3 +1897,8 @@ deadline miss rate 均低于 0.0025，完整矩阵验收结果为 `passed=true`�
 以及五 seed 随机布局稳定性全部通过。剩余发布动作仅为 §18.18/最终验收文档中的 EventLog
 回放与 `scheduler-event-v2` 数据资格检查；它只生成离线回放报告和可选数据集，不启用 RL，
 也不改变当前竞赛默认策略。
+
+远程首次直接使用宿主机 `python3` 执行回放时因宿主未安装 NumPy 在导入阶段退出，未生成报告或
+数据集，五 seed EventLog 本身未被读取且无需重跑。最终验收命令改为使用已具备正式运行依赖的
+`material_sorting:offline-client` 镜像，以只读方式挂载代码、读写挂载 matrix 目录并关闭网络；
+不在远程宿主安装额外包，也不需要 GPU。

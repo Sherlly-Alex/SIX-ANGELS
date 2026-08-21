@@ -219,14 +219,23 @@ and export only fully paired records:
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
 export ROOT="$PROJECT/remote_artifacts/v2_matrix_release_candidate"
 
-python3 "$PROJECT/material_sorting_task/scripts/replay_scheduler_events.py" \
-  "$ROOT"/v2_multiseed_*/scheduler_v2_multiseed_*.jsonl \
+docker run --rm --network none --entrypoint bash \
+  -v "$PROJECT/material_sorting_task":/workspace/baseline:ro \
+  -v "$ROOT":/workspace/artifacts:rw \
+  material_sorting:offline-client -lc '
+python3 /workspace/baseline/scripts/replay_scheduler_events.py \
+  /workspace/artifacts/v2_multiseed_*/scheduler_v2_multiseed_*.jsonl \
   --min-decisions 1000 \
   --require-training-ready \
-  --dataset "$ROOT/scheduler_replay_v2.jsonl" \
-  --output "$ROOT/scheduler_replay_acceptance.json"
+  --dataset /workspace/artifacts/scheduler_replay_v2.jsonl \
+  --output /workspace/artifacts/scheduler_replay_acceptance.json
+'
 cat "$ROOT/scheduler_replay_acceptance.json"
 ```
+
+Use the Client image for this step: its learning runtime includes NumPy.  The
+remote host's base Python is intentionally not part of the formal dependency
+contract and may not have NumPy installed.  Replay needs no network or GPU.
 
 This completes the Heuristic scheduler release evidence. It does not require or
 authorize RL training.
