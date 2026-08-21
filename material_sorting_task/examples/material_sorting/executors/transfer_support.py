@@ -121,6 +121,7 @@ class TransferMotion:
         self._carried_checker = CarriedEnvelopeChecker()
         self._held_path_clearance_m: float | None = None
         self._held_min_clearance_m: float | None = None
+        self._last_navigation_failure_detail: str | None = None
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -139,6 +140,10 @@ class TransferMotion:
         with the controller that will actually drive the segment.
         """
         return self._navigation_grid
+
+    @property
+    def last_navigation_failure_detail(self) -> str | None:
+        return self._last_navigation_failure_detail
 
     def reset(self) -> None:
         self._navigation.reset()
@@ -159,6 +164,7 @@ class TransferMotion:
         self._held_geometry = None
         self._held_path_clearance_m = None
         self._held_min_clearance_m = None
+        self._last_navigation_failure_detail = None
 
     def begin_navigation(
         self,
@@ -190,8 +196,10 @@ class TransferMotion:
         self._held_geometry = held_geometry
         self._held_path_clearance_m = None
         self._held_min_clearance_m = None
+        self._last_navigation_failure_detail = None
         if not self._navigation.set_goal(goal, pose[0], pose[1]):
             self._goal = None
+            self._last_navigation_failure_detail = "base planner found no path"
             return False
         if held_geometry is not None:
             # The measured box/arms swept envelope must also survive the
@@ -204,6 +212,7 @@ class TransferMotion:
                 held_geometry.half_width_m,
             )
             if not safety.safe:
+                self._last_navigation_failure_detail = safety.detail
                 self._navigation.reset()
                 self._goal = None
                 self._held_geometry = None

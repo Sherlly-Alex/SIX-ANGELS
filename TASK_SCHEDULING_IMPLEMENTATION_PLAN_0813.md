@@ -1816,3 +1816,22 @@ deadline miss rate 均低于 0.003。候选证据同时显示 264 条 applied（
 本批本地回归结果为 `519 passed, 5 skipped, 1 warning`（仅排除本机未安装 OpenCV 的既有
 `test_empty_layer_verifier.py` 导入项），正式非 ROS unittest 为 `335 tests OK`；53 项工作区
 必需文件与 Python 语法检查通过。
+
+### 18.21 Measured-carry 起点栅格吸附误判修复（当前修复批次）
+
+`2e29d83` 的同 seed Heuristic 基线已在官方 Server 重新通过：160/160、8 条唯一 applied、7 条
+非中心 applied、重复应用 0、运行周期 p99=74.62 ms，证明 §18.20 的候选幂等修复生效。随后开启
+measured-carry 的同 seed 对照组在 Task 1 transport 入口安全阻塞，基线关闭该门时同一路线满分。
+
+本地按远程抓取位姿、0.70 m 桌边后退、实测 `held_center_base` 和 A* 路线复现后确认：平滑路径
+开头保留了栅格中心吸附造成的 2.5–10 cm 前后折返；真实 `NavigationController` 的 pure-pursuit
+最小前视为 0.35 m，会越过这些栅格点直接朝西转向，但 `CarriedEnvelopeChecker.check_path()`
+此前逐边解释成一次不存在的 180° 原地转向，虚构出货箱/手臂扫到东墙或南墙的碰撞。
+
+修复后静态搬运包络仅忽略起点半径 0.15 m 内、且不是最终目标的栅格吸附前缀，仍完整检查后续
+路线、最终朝向和 4 cm 空间采样；每个控制周期的真实命令预测包络不变。`TransferMotion` 同时保留
+规划失败的具体碰撞对与净空原因，后续不再只输出笼统的“两条路线均失败”。新增官方场景回归覆盖
+该起点折返，并保留“真实扫入货架必须拒绝”的原测试。
+
+本批本地回归为 `520 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
+`336 tests OK`；53 项工作区必需文件与 Python 语法检查通过。

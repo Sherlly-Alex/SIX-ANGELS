@@ -97,6 +97,13 @@ class CarriedEnvelopeChecker:
     DEFAULT_CLEARANCE_M = 0.02
     PATH_SAMPLE_M = 0.04
     YAW_SAMPLE_RAD = 0.10
+    # NavigationController's pure-pursuit carrot is never closer than 0.35 m.
+    # A* nevertheless starts at a snapped cell centre and can leave a tiny
+    # forward/backward prefix after smoothing. Treating every such cell edge
+    # as a commanded heading invents 180-degree turns the controller never
+    # executes. Ignore only this bounded start-cell prefix; live command
+    # sweeps remain checked independently on every control tick.
+    INITIAL_GRID_SNAP_RADIUS_M = 0.15
 
     def __init__(
         self,
@@ -233,8 +240,19 @@ class CarriedEnvelopeChecker:
     ) -> EnvelopeCheck:
         if not path_xy:
             return EnvelopeCheck(False, float("-inf"), "navigation path is empty")
-        points = [(float(start_pose[0]), float(start_pose[1]))]
-        points.extend((float(x), float(y)) for x, y in path_xy)
+        start_xy = (float(start_pose[0]), float(start_pose[1]))
+        raw_points = [(float(x), float(y)) for x, y in path_xy]
+        first_control_index = 0
+        while (
+            first_control_index < len(raw_points) - 1
+            and math.hypot(
+                raw_points[first_control_index][0] - start_xy[0],
+                raw_points[first_control_index][1] - start_xy[1],
+            ) <= self.INITIAL_GRID_SNAP_RADIUS_M
+        ):
+            first_control_index += 1
+        points = [start_xy]
+        points.extend(raw_points[first_control_index:])
         current_yaw = float(start_pose[2])
         best = EnvelopeCheck(True, float("inf"), "path unchecked")
 

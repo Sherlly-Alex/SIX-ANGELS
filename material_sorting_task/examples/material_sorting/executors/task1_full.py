@@ -591,7 +591,8 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 ):
                     return StageResult.blocked(
                         "task 1 direct A* and legacy shelf-turn route both failed "
-                        "safe path planning",
+                        "safe path planning; "
+                        f"last_failure={self._transfer.last_navigation_failure_detail}",
                         arm_command=self._held_arm_command,
                     )
                 self._motion_started = True

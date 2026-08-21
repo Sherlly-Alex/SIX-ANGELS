@@ -144,6 +144,41 @@ class TransferHeldGeometryTests(unittest.TestCase):
         self.assertFalse(started)
         self.assertIsNone(transfer.goal)
         self.assertIsNone(transfer._held_geometry)
+        self.assertIn("shelf", transfer.last_navigation_failure_detail)
+
+    def test_begin_ignores_uncommanded_start_cell_snap_reversal(self) -> None:
+        # The controller's >=0.35 m pure-pursuit lookahead skips this snapped
+        # 2.5/7.5 cm north/south prefix and aims west. The payload checker
+        # must not invent a 180-degree turn at those grid cell centres.
+        start = (-0.185, 0.85, math.pi / 2.0)
+        path = [
+            (-0.185, 0.875),
+            (-0.185, 0.775),
+            (-0.385, 0.775),
+            (-0.985, 0.775),
+        ]
+        transfer = self._transfer(path)
+        geometry = HeldObjectGeometry((0.715, -0.085, 0.984), 0.14, source="task1")
+        goal = NavigationGoal(
+            x=-0.985,
+            y=0.775,
+            yaw=math.pi,
+            position_tolerance=0.08,
+            yaw_tolerance=0.06,
+            safety_radius=0.0,
+            segment=NavigationSegment.NAV_SHELF,
+            source_tag="start_grid_snap_regression",
+        )
+
+        started = transfer.begin_navigation(
+            goal,
+            odometry(*start),
+            held_geometry=geometry,
+        )
+
+        self.assertTrue(started)
+        self.assertIsNone(transfer.last_navigation_failure_detail)
+        self.assertGreaterEqual(transfer._held_path_clearance_m, 0.02)
 
     def test_tick_gate_stops_unsafe_command_with_measured_envelope(self) -> None:
         transfer = self._transfer(
