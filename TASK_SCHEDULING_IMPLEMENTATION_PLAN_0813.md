@@ -1298,8 +1298,8 @@ MATERIAL_SEMANTIC_AUDIT_SLM=0
 - [x] Task 2/3 detection epoch 已从 `client_task.py` 的任务编号特判迁入执行器生命周期：
   `detection_epoch_policy(...)` 只读策略 + ROS-free 的 `apply_detection_epoch_decisions`
   助手，客户端不再包含 task==2/task==3 分支。
-- [x] 全量纯 Python 单元与已实现故障注入回归通过（503 passed，5 skipped，1 warning；
-  本机缺少 OpenCV 的既有视觉测试按约定排除）；正式非 ROS unittest 入口 323 tests OK。
+- [x] 全量纯 Python 单元与已实现故障注入回归通过（526 passed，5 skipped，1 warning；
+  本机缺少 OpenCV 的既有视觉测试按约定排除）；正式非 ROS unittest 入口 342 tests OK。
 - [x] 官方 4090 标定与满分基线通过后，正式调度默认值切换为 `v2 + heuristic`；
   `MATERIAL_SCHEDULER_ENGINE=legacy` 保留为单命令现场回退。携物实测包络仍由独立 feature gate
   控制，不因默认引擎切换而自动启用。
@@ -1902,3 +1902,17 @@ deadline miss rate 均低于 0.0025，完整矩阵验收结果为 `passed=true`�
 数据集，五 seed EventLog 本身未被读取且无需重跑。最终验收命令改为使用已具备正式运行依赖的
 `material_sorting:offline-client` 镜像，以只读方式挂载代码、读写挂载 matrix 目录并关闭网络；
 不在远程宿主安装额外包，也不需要 GPU。
+
+### 18.25 EventLog 回放与 Heuristic 发布封板
+
+五 seed 的 `scheduler-event-v2` 日志已在正式 Client 依赖环境中完成只读离线回放：5 个文件和
+5 个 session 共得到 5,889 组完全配对的 candidate/selection 决策，未配对事件、畸形行、非法
+选择和 legacy 决策均为 0。其中 4,745 条满足训练数据资格并已导出为约 11 MB 的
+`scheduler_replay_v2.jsonl`；1,144 次 no-safe-candidate 按设计不进入训练集。选择来源为
+Heuristic 3,731 次、hysteresis 1,014 次、RL 0 次，回放总结果 `passed=true`。
+
+由此 Heuristic 发布证据全部完成：本地回归、官方满分、故障注入、候选真实应用与幂等性、
+measured-carry、五 seed 矩阵及 EventLog 数据资格均已通过。当前默认继续保持
+`MATERIAL_SCHEDULER_POLICY=heuristic`。RL 路径属于条件式后续：只有在明确开始模型训练后，才进入
+模型包校验、100-seed 成对盲测、至少 1,000 次官方 Shadow、审批清单和独立 guarded canary；
+本轮结果不自动授权或启用 RL。
