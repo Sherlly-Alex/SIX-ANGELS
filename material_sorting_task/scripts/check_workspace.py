@@ -63,10 +63,16 @@ REQUIRED = (
     ROOT / "scripts" / "validate_rl_shadow.py",
     ROOT / "scripts" / "validate_scheduler_model.py",
     ROOT / "scripts" / "approve_guarded_policy.py",
+    ROOT / "scripts" / "split_replay_dataset.py",
+    ROOT / "scripts" / "validate_rl1_heldout.py",
+    ROOT / "scripts" / "run_rl1_pipeline.py",
+    ROOT / "examples" / "material_sorting" / "learning" / "replay_split.py",
+    ROOT / "examples" / "material_sorting" / "learning" / "heldout_gate.py",
     ROOT / "scripts" / "validate_runtime_health_run.py",
     ROOT / "docs" / "PROJECT_SIMULATION_BENCHMARK.md",
     ROOT / "docs" / "GUARDED_POLICY_PROMOTION.md",
     ROOT / "docs" / "FINAL_SCHEDULER_REMOTE_ACCEPTANCE.md",
+    ROOT / "docs" / "RL_PHASE1.md",
 )
 
 

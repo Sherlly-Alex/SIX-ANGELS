@@ -21,6 +21,11 @@
 
 ## 比赛冻结版本与一键运行
 
+RL-1 离线候选阶段见
+[RL_PHASE1.md](material_sorting_task/docs/RL_PHASE1.md)。比赛冻结版本仍锁定
+`MATERIAL_SCHEDULER_POLICY=heuristic`；RL-1 通过后最多进入 `rl_shadow`，
+不得直接进入 `rl_guarded`。
+
 比赛默认配置固定在 `material_sorting_task/config/competition_release.env`。当前冻结基线为：
 
 | 项目 | 冻结值 |

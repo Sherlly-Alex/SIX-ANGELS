@@ -1916,3 +1916,25 @@ measured-carry、五 seed 矩阵及 EventLog 数据资格均已通过。当前�
 `MATERIAL_SCHEDULER_POLICY=heuristic`。RL 路径属于条件式后续：只有在明确开始模型训练后，才进入
 模型包校验、100-seed 成对盲测、至少 1,000 次官方 Shadow、审批清单和独立 guarded canary；
 本轮结果不自动授权或启用 RL。
+
+## 18.26 RL-1 离线候选模型（当前批次）
+
+状态：代码已就绪，模型尚未训练，RL 尚未放行。
+
+目标是将已审计的 4745 条 training-ready scheduler replay 记录按
+`(source_sha256, session_index)` 整组做确定性 train/validation/test 划分，
+只用 train 集训练 MaskablePPO，并用硬 action mask 在两个 held-out 集合执行
+fail-closed 验收。默认划分为 validation/test 各 1 个 session，其余 session
+进入 train；manifest 必须记录输入/输出 hash、schema、记录数和 session 隔离
+证明。
+
+门槛：两个 held-out 集合均须完成全部 episode、policy errors 为 0、masked
+action violations 为 0，回报不超过 utility oracle 容差且不劣于当前
+selected-action baseline 容差。模型包、train provenance、split manifest 和
+schema/hash 链必须一致。通过后只允许生成 `rl_shadow` 候选证据，
+`rl_guarded_authorized=false`；比赛冻结默认仍为 heuristic，禁止因本阶段
+代码就绪而声称 RL 已通过或启用 guarded。
+
+后续顺序：隔离环境运行 `scripts/run_rl1_pipeline.py`，审查
+`rl1_acceptance.json`；若通过，再做多 seed shadow、回放、运行健康和官方
+Server 验收，最后才另行评审 guarded promotion。
