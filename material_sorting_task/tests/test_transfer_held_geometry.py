@@ -227,6 +227,21 @@ class TransferHeldGeometryTests(unittest.TestCase):
         self.assertIn("path_clearance=", detail)
         self.assertIn("minimum_clearance=", detail)
 
+    def test_manual_command_uses_measured_guard_and_emits_telemetry(self) -> None:
+        transfer = self._transfer([(-1.40, 0.85)])
+
+        safe, detail = transfer.check_held_command(
+            odometry(*START_POSE),
+            (0.0, 0.10),
+            HELD,
+        )
+
+        self.assertTrue(safe)
+        self.assertIn("measured_carried_guard=active", detail)
+        self.assertIn("source=test", detail)
+        self.assertIn("path_clearance=", detail)
+        self.assertIn("minimum_clearance=", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

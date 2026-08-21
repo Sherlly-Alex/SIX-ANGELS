@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 
 from desktop_grasp.pregrasp_core import (
     PregraspInputError,
@@ -279,7 +280,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             # of truth for task-3 arm commands as well.
             return super().tick(stage, context)
         if stage is TaskStage.TRANSPORT:
-            return self._tick_task3_transport(context)
+            result = self._tick_task3_transport(context)
+            return self._guard_task3_transport_command(result, context)
         if stage is TaskStage.ALIGN_FOR_PLACE:
             return self._tick_task3_align_for_place(context)
         if stage is TaskStage.PLACE:
@@ -295,6 +297,34 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         # The inherited release, verification and safe retreat sequence is
         # retained for verification and other stages.
         return super().tick(stage, context)
+
+    def _guard_task3_transport_command(
+        self,
+        result: StageResult,
+        context: ExecutionContext,
+    ) -> StageResult:
+        """Apply measured payload safety to every task-3 transport command."""
+
+        if not self._measured_carry_guard_enabled or not result.controls_base:
+            return result
+        geometry = self.held_object_geometry(context)
+        if geometry is None:
+            return StageResult.blocked(
+                "task 3 measured carried guard lost the held-object geometry",
+                arm_command=result.arm_command or self._held_arm_command,
+            )
+        safe, detail = self._transfer.check_held_command(
+            context.odometry,
+            (result.base_linear_x, result.base_angular_z),
+            geometry,
+        )
+        if not safe:
+            return StageResult.blocked(
+                f"task 3 measured carried guard stopped transport: {detail}",
+                arm_command=result.arm_command or self._held_arm_command,
+            )
+        message = f"{result.message}; {detail}" if result.message else detail
+        return replace(result, message=message)
 
     def _tick_lift(self, context: ExecutionContext) -> StageResult:
         """Lift with a task-3-only bounded-contact completion fallback."""

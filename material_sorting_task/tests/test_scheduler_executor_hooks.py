@@ -6,6 +6,8 @@ import unittest
 
 from executors.base import (
     ExecutionContext,
+    StageResult,
+    StageStatus,
     TaskStage,
     apply_detection_epoch_decisions,
     resolve_executor_for_task_index,
@@ -423,6 +425,42 @@ class Task3IntegratedHookTests(unittest.TestCase):
         self.assertIsNotNone(nominal)
         self.assertAlmostEqual(nominal[1], 0.90)
         self.assertAlmostEqual(nominal[2], math.pi)
+
+    def test_measured_guard_covers_manual_task3_transport_command(self) -> None:
+        self.executor.set_measured_carry_guard(True)
+        self.executor._contact = SimpleNamespace(half_width=0.20)
+        self.executor._transfer.check_held_command = lambda *_args: (
+            True,
+            "measured_carried_guard=active source=task3 "
+            "half_width=0.200m path_clearance=0.120m "
+            "minimum_clearance=0.120m",
+        )
+
+        result = self.executor._guard_task3_transport_command(
+            StageResult.running("turning", base_command=(0.0, 0.2)),
+            self.context,
+        )
+
+        self.assertIs(result.status, StageStatus.RUNNING)
+        self.assertTrue(result.controls_base)
+        self.assertIn("measured_carried_guard=active source=task3", result.message)
+
+    def test_measured_guard_stops_unsafe_manual_task3_command(self) -> None:
+        self.executor.set_measured_carry_guard(True)
+        self.executor._contact = SimpleNamespace(half_width=0.20)
+        self.executor._transfer.check_held_command = lambda *_args: (
+            False,
+            "measured_carried_guard=active source=task3 collision",
+        )
+
+        result = self.executor._guard_task3_transport_command(
+            StageResult.running("turning", base_command=(0.0, 0.2)),
+            self.context,
+        )
+
+        self.assertIs(result.status, StageStatus.BLOCKED)
+        self.assertFalse(result.controls_base)
+        self.assertIn("stopped transport", result.message)
 
     def test_accepts_transport_scan_stand(self) -> None:
         self.executor.active_stage = TaskStage.TRANSPORT

@@ -280,6 +280,39 @@ class TransferMotion:
             detail = f"{detail}; {goal_reached_event(self._goal)}"
         return status, (command.linear_x, command.angular_z), detail
 
+    def check_held_command(
+        self,
+        odometry: Any,
+        command: tuple[float, float],
+        held_geometry: HeldObjectGeometry,
+    ) -> tuple[bool, str]:
+        """Check and describe a manually generated carried-object command.
+
+        Task 3 deliberately uses bounded retreat, turn, straight and lateral
+        controllers instead of A* for its constrained transfer corridor.  They
+        still need the same measured payload sweep check and telemetry as an
+        A* navigation tick.
+        """
+
+        pose = odometry_pose(odometry)
+        if pose is None:
+            return False, "measured carried guard waiting for valid odometry"
+        safety = self._carried_checker.check_command(
+            pose,
+            (float(command[0]), float(command[1])),
+            held_geometry.center_base,
+            held_geometry.half_width_m,
+        )
+        clearance = float(safety.clearance_m)
+        detail = (
+            "measured_carried_guard=active "
+            f"source={held_geometry.source or 'unknown'} "
+            f"half_width={held_geometry.half_width_m:.3f}m "
+            f"path_clearance={clearance:.3f}m "
+            f"minimum_clearance={clearance:.3f}m; {safety.detail}"
+        )
+        return safety.safe, detail
+
     def begin_lateral_alignment(
         self,
         target_xy: tuple[float, float],

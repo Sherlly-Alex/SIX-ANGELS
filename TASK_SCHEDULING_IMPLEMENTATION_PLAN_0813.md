@@ -1844,3 +1844,19 @@ R2 远程诊断进一步给出实际因果链：transport sidecar 在固定 0.70
 
 本批最终本地回归为 `521 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
 `337 tests OK`；53 项工作区必需文件与 Python 语法检查通过。
+
+### 18.22 Task 3 手工运输段的实测包络闭环（当前修复批次）
+
+`c860f2e` 的 measured-carry R3 已在官方 Server 完成 160/160，Client 无 blocked、safe-hold、
+执行器错误或碰撞；候选应用 5 条且全部唯一、非中心应用 5 条，另有 34 条 audit-only；运行周期
+`p95=58.37 ms`、`p99=75.97 ms`。R2 的运输候选时序问题已消失。但 measured-carry 验收门发现
+只有 `source=task1` 的活跃净空遥测，缺少 `source=task3`，因此整体验收按设计保持失败。
+
+代码审查确认这不是单纯日志遗漏：Task 3 为受限通道使用退离、原地转向、直行和横移控制器，
+没有全部经过 A* `tick_navigation()` 内的实测货箱逐周期检查。现由 Task 3 transport 的统一命令
+出口对每条实际底盘命令执行同一个 `CarriedEnvelopeChecker.check_command()`：安全命令追加
+`measured_carried_guard=active source=task3`、半宽和净空遥测；不安全或丢失实测几何时立即返回
+零速 BLOCKED。A* 路段原有规划期与逐周期检查继续保留，关闭 measured-carry 时行为完全不变。
+
+本批最终本地回归为 `524 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
+`340 tests OK`；随后仍需在官方 Server 用同 seed R4 证明 Task 1/Task 3 均有正向实测包络证据。
