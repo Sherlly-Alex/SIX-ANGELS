@@ -259,6 +259,24 @@ class Task1IntegratedHookTests(unittest.TestCase):
         self.assertEqual(geometry.center_base, self.executor._held_center_base)
         self.assertAlmostEqual(geometry.half_width_m, 0.24)
 
+    def test_measured_guard_keeps_pre_retreat_transport_offer_audit_only(self) -> None:
+        self._enter_transport()
+        self.executor.set_measured_carry_guard(True)
+        nominal = self.executor.scheduler_nominal_goal(
+            TaskStage.TRANSPORT, self.context
+        )
+        left = self.generator.generate(
+            nominal, task_id=1, step_id="transport"
+        )[1]
+        selected, outcome = selection(left)
+
+        status = self.executor.apply_scheduler_candidate(
+            selected, outcome, self.context
+        )
+
+        self.assertIs(status, CandidateApplicationStatus.AUDIT_ONLY)
+        self.assertIsNone(self.executor._shelf_scan_stand)
+
     def test_return_stand_accept_and_commitment_window(self) -> None:
         self.executor.active_stage = TaskStage.RETURN_TO_END
         self.executor._phase = "retreat_shelf"

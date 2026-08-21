@@ -389,6 +389,15 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self, selected, outcome, context
     ) -> CandidateApplicationStatus:
         del outcome
+        # With measured payload geometry, candidate safety depends on the
+        # pose where A* will actually start.  Offers arrive while the fixed
+        # 0.70 m table retreat is still moving, so evaluating from the live
+        # pre-retreat pose can approve a south-shifted stand that becomes
+        # unsafe at the eventual start pose.  Keep such offers audit-only;
+        # the nominal stand is checked with the latched measured envelope
+        # immediately after retreat, before any navigation command starts.
+        if self._measured_carry_guard_enabled:
+            return CandidateApplicationStatus.AUDIT_ONLY
         # Accept only while the table retreat is still running, before any
         # A* shelf goal has been committed.  Repeated offers may converge
         # (the decision service owns hysteresis), but a later offer can
