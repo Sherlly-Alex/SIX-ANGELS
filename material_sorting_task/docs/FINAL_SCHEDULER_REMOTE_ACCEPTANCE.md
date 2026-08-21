@@ -116,6 +116,7 @@ python3 "$PROJECT/material_sorting_task/scripts/validate_remote_run.py" \
   --server "$OUT/server_$RUN.log" \
   --events "$OUT/scheduler_$RUN.jsonl" \
   --require-candidate-application \
+  --reject-duplicate-candidate-applications \
   --min-applied-candidates 1 \
   --max-interval-p99-ms 125 \
   --output "$OUT/acceptance.json"
@@ -151,6 +152,7 @@ python3 "$PROJECT/material_sorting_task/scripts/validate_remote_run.py" \
   --events "$OUT/scheduler_$RUN.jsonl" \
   --require-measured-carry \
   --require-candidate-application \
+  --reject-duplicate-candidate-applications \
   --min-applied-candidates 1 \
   --max-interval-p99-ms 125 \
   --output "$OUT/acceptance.json"
@@ -185,6 +187,7 @@ python3 "$PROJECT/material_sorting_task/scripts/validate_remote_matrix.py" \
   --seeds 20260817 20260818 20260819 20260820 20260821 \
   --require-events \
   --require-candidate-application \
+  --reject-duplicate-candidate-applications \
   --min-applied-candidates-per-seed 1 \
   --min-noncenter-applied-total 1 \
   --max-interval-p99-ms 125 \
@@ -194,8 +197,9 @@ cat "$ROOT/multiseed_acceptance.json"
 
 Required result: five passed seeds, no failed seeds, at least five total
 executor-applied candidates and at least one non-centre applied stand across
-the matrix. Neither `--require-events` nor `--require-candidate-application`
-may be removed for a new release candidate.
+the matrix. `--require-events`, `--require-candidate-application` and
+`--reject-duplicate-candidate-applications` may not be removed for a new
+release candidate.
 
 ## 5. New EventLog replay/data qualification
 

@@ -321,6 +321,90 @@ class SchedulerDecisionTests(unittest.TestCase):
         ]
         self.assertEqual(len(applications), 1)
         self.assertEqual(applications[0].details["application_status"], "applied")
+
+        # Periodic sidecar outcomes must not reapply an unchanged semantic
+        # action in the same step; doing so can reset a live navigation goal.
+        outcome = controller._backend.last_decision
+        controller._backend._offer_candidate_to_executor(outcome, context)
+        self.assertEqual(hook.selected, ["chosen"])
+        self.assertEqual(
+            len([event for event in sink.events if event.type == "candidate_application"]),
+            1,
+        )
+
+        # Recovery/stage re-entry starts a fresh step run and intentionally
+        # permits the current candidate to be installed again.
+        controller._backend._start_step_run()
+        controller._backend._offer_candidate_to_executor(outcome, context)
+        self.assertEqual(hook.selected, ["chosen", "chosen"])
+        controller.close()
+
+    def test_candidate_offer_reapplies_when_goal_pose_changes(self) -> None:
+        class HookExecutor:
+            task_id = 1
+            name = "goal-change"
+
+            def __init__(self):
+                self.goals = []
+
+            def reset(self):
+                pass
+
+            def enter_stage(self, stage, execution_context):
+                pass
+
+            def tick(self, stage, execution_context):
+                return StageResult.running("active")
+
+            def cancel(self, reason):
+                pass
+
+            def apply_scheduler_candidate(self, selected, outcome, context):
+                self.goals.append(selected.goal_pose)
+                return CandidateApplicationStatus.APPLIED
+
+        tasks = [
+            {"task": task_id, "target_color": color, "place_world": [0, 0, 0]}
+            for task_id, color in ((1, "pink"), (2, "yellow"), (3, "brown"))
+        ]
+        hook = HookExecutor()
+        executors = build_task_executors("stub")
+        executors[1] = hook
+        controller = CompetitionController(
+            executors,
+            referee_driven=False,
+            scheduler_mode="v2",
+        )
+        controller.configure(tasks)
+        backend = controller._backend
+        backend._start_task_run()
+        backend._start_step_run()
+        context = ExecutionContext(
+            now_s=1.0,
+            instruction=tasks[0],
+            task_index=0,
+            attempt=1,
+        )
+
+        def outcome(x):
+            selected = SimpleNamespace(
+                action_id="same-id",
+                candidate=CandidateAction(
+                    action_id="same-id",
+                    action_type="navigate",
+                    x=x,
+                    y=1.0,
+                    yaw=0.0,
+                    metadata={"lateral_offset_m": 0.0},
+                ),
+            )
+            return SimpleNamespace(selected=selected)
+
+        backend._offer_candidate_to_executor(outcome(0.0), context)
+        backend._offer_candidate_to_executor(outcome(0.0), context)
+        backend._offer_candidate_to_executor(outcome(0.1), context)
+
+        self.assertEqual(hook.goals, [(0.0, 1.0, 0.0), (0.1, 1.0, 0.0)])
         controller.close()
 
     def test_initial_candidate_wait_is_nonblocking_and_strictly_bounded(self) -> None:

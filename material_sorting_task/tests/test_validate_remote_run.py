@@ -309,3 +309,62 @@ progress: measured_carried_guard=active source=task1 half_width=0.080m path_clea
             "invalid_candidate_application_records=2",
             report["failures"],
         )
+
+    def test_candidate_gate_rejects_duplicate_semantic_offer_when_requested(self) -> None:
+        first = candidate_event("applied", "task1:pick:stand:left", 0.08)
+        first.update({"step_run_id": "step-1"})
+        first["details"]["goal_pose"] = [-0.2, 1.5, 1.57]
+        repeated = candidate_event("too_late", "task1:pick:stand:left", 0.08)
+        repeated.update({"step_run_id": "step-1"})
+        repeated["details"]["goal_pose"] = [-0.2, 1.5, 1.57]
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                first,
+                repeated,
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+            )
+        )
+
+        report = MODULE.validate_candidate_applications(
+            events,
+            reject_duplicates=True,
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["duplicate_application_count"], 1)
+        self.assertIn(
+            "duplicate_candidate_application_records=1",
+            report["failures"],
+        )
+
+    def test_candidate_gate_allows_a_policy_switch_back_to_prior_goal(self) -> None:
+        records = []
+        for action, x in (("left", -0.2), ("right", 0.2), ("left", -0.2)):
+            event = candidate_event("applied", action, x)
+            event.update({"step_run_id": "step-1"})
+            event["details"]["goal_pose"] = [x, 1.5, 1.57]
+            records.append(event)
+        events = "\n".join(
+            json.dumps(event)
+            for event in (
+                {"event_type": "scheduler_started", "details": {}},
+                *records,
+                {
+                    "event_type": "scheduler_transition",
+                    "details": {"state": "finished"},
+                },
+            )
+        )
+
+        report = MODULE.validate_candidate_applications(
+            events,
+            reject_duplicates=True,
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["duplicate_application_count"], 0)

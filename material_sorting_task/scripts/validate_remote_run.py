@@ -50,9 +50,14 @@ def validate_run(
     require_candidate_application: bool = False,
     min_applied_candidates: int = 1,
     min_noncenter_applied: int = 0,
+    reject_duplicate_candidate_applications: bool = False,
 ) -> dict[str, object]:
     """Return a stable machine-readable acceptance report."""
 
+    if reject_duplicate_candidate_applications and not require_candidate_application:
+        raise ValueError(
+            "duplicate candidate rejection requires candidate application validation"
+        )
     failures: list[str] = []
     fatal_counts = {
         name: len(pattern.findall(client_text))
@@ -126,6 +131,7 @@ def validate_run(
                 scheduler_events_text,
                 min_applied_candidates=min_applied_candidates,
                 min_noncenter_applied=min_noncenter_applied,
+                reject_duplicates=reject_duplicate_candidate_applications,
             )
         failures.extend(
             f"candidate_applications: {message}"
@@ -153,6 +159,7 @@ def validate_candidate_applications(
     *,
     min_applied_candidates: int = 1,
     min_noncenter_applied: int = 0,
+    reject_duplicates: bool = False,
 ) -> dict[str, object]:
     """Prove that ranked candidates reached opt-in executors in one session."""
 
@@ -204,6 +211,8 @@ def validate_candidate_applications(
     noncenter_applied = 0
     invalid_records = 0
     applied_actions: set[str] = set()
+    last_application_key: tuple[object, ...] | None = None
+    duplicate_records = 0
     for event in evaluated:
         if str(event.get("event_type", "")) != "candidate_application":
             continue
@@ -219,6 +228,30 @@ def validate_candidate_applications(
             invalid_records += 1
             continue
         statuses[status] = statuses.get(status, 0) + 1
+        if reject_duplicates:
+            step_run_id = event.get("step_run_id")
+            raw_goal = details.get("goal_pose")
+            if not isinstance(step_run_id, str) or not step_run_id.strip():
+                invalid_records += 1
+                continue
+            if raw_goal is None:
+                goal_pose = None
+            elif isinstance(raw_goal, (list, tuple)) and len(raw_goal) == 3:
+                try:
+                    goal_pose = tuple(float(value) for value in raw_goal)
+                except (TypeError, ValueError, OverflowError):
+                    invalid_records += 1
+                    continue
+                if not all(math.isfinite(value) for value in goal_pose):
+                    invalid_records += 1
+                    continue
+            else:
+                invalid_records += 1
+                continue
+            application_key = (step_run_id, action_id, goal_pose)
+            if application_key == last_application_key:
+                duplicate_records += 1
+            last_application_key = application_key
         if status != "applied":
             continue
         try:
@@ -237,6 +270,8 @@ def validate_candidate_applications(
         failures.append(f"malformed_event_lines={malformed}")
     if invalid_records:
         failures.append(f"invalid_candidate_application_records={invalid_records}")
+    if reject_duplicates and duplicate_records:
+        failures.append(f"duplicate_candidate_application_records={duplicate_records}")
     if applied < min_applied_candidates:
         failures.append(
             f"applied_count={applied} below {min_applied_candidates}"
@@ -253,10 +288,12 @@ def validate_candidate_applications(
         "applied_count": applied,
         "noncenter_applied_count": noncenter_applied,
         "unique_applied_action_count": len(applied_actions),
+        "duplicate_application_count": duplicate_records,
         "terminal_event_found": terminal_index is not None,
         "limits": {
             "min_applied_candidates": min_applied_candidates,
             "min_noncenter_applied": min_noncenter_applied,
+            "reject_duplicates": bool(reject_duplicates),
         },
         "failures": failures,
     }
@@ -475,6 +512,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-applied-candidates", type=int, default=1)
     parser.add_argument("--min-noncenter-applied", type=int, default=0)
+    parser.add_argument(
+        "--reject-duplicate-candidate-applications",
+        action="store_true",
+        help="reject repeated step/action/goal application records",
+    )
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -494,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
         require_candidate_application=args.require_candidate_application,
         min_applied_candidates=args.min_applied_candidates,
         min_noncenter_applied=args.min_noncenter_applied,
+        reject_duplicate_candidate_applications=(
+            args.reject_duplicate_candidate_applications
+        ),
     )
     payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:

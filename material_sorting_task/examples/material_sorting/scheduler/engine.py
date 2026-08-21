@@ -150,6 +150,12 @@ class SchedulerEngine:
         self._last_decision_submit_s: float | None = None
         self.last_decision: Any = None
         self.last_candidate_application: str | None = None
+        # A stable policy selection is recomputed periodically, but offering
+        # the same semantic action on every sidecar cycle can repeatedly
+        # reset an executor's navigation goal.  Keep executor application
+        # idempotent within one step run; a changed action/pose or a new step
+        # run receives a new key and is offered normally.
+        self._last_candidate_offer_key: tuple[Any, ...] | None = None
         self._closing = False
         self.referee_desync_limit = max(1, int(referee_desync_limit))
 
@@ -241,6 +247,7 @@ class SchedulerEngine:
         self._step_run_id = None
         self.last_decision = None
         self.last_candidate_application = None
+        self._last_candidate_offer_key = None
         self._last_decision_submit_s = None
         self._transition(
             self._states.WAITING_FOR_INPUTS,
@@ -863,14 +870,6 @@ class SchedulerEngine:
         if not callable(hook):
             return
         try:
-            application = hook(selected.candidate, outcome, context)
-            if isinstance(application, CandidateApplicationStatus):
-                status = application.value
-            elif application is None:
-                status = "unreported"
-            else:
-                status = str(application)
-            self.last_candidate_application = status
             candidate = selected.candidate
             raw_goal_pose = getattr(candidate, "goal_pose", None)
             goal_pose = (
@@ -884,6 +883,25 @@ class SchedulerEngine:
                 if isinstance(metadata, Mapping)
                 else None
             )
+            offer_key = (
+                self._step_run_id,
+                str(selected.action_id),
+                str(getattr(candidate, "action_type", "")),
+                goal_pose,
+            )
+            if offer_key == self._last_candidate_offer_key:
+                return
+            application = hook(candidate, outcome, context)
+            if isinstance(application, CandidateApplicationStatus):
+                status = application.value
+            elif application is None:
+                status = "unreported"
+            else:
+                status = str(application)
+            # Record only after the opt-in hook completes.  Exceptions remain
+            # fail-closed and do not poison a later recovery step's offer.
+            self._last_candidate_offer_key = offer_key
+            self.last_candidate_application = status
             self._emit_structured_event(
                 "candidate_application",
                 context,
@@ -1129,9 +1147,11 @@ class SchedulerEngine:
     def _start_attempt_run(self) -> None:
         self._attempt_run_id = uuid.uuid4().hex
         self._step_run_id = None
+        self._last_candidate_offer_key = None
 
     def _start_step_run(self) -> None:
         self._step_run_id = uuid.uuid4().hex
+        self._last_candidate_offer_key = None
 
     def _event_scope_fields(self) -> dict[str, Any]:
         return {

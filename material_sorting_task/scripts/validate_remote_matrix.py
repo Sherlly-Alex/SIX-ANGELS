@@ -21,6 +21,7 @@ def validate_matrix(
     require_candidate_application: bool = False,
     min_applied_candidates_per_seed: int = 1,
     min_noncenter_applied_total: int = 0,
+    reject_duplicate_candidate_applications: bool = False,
     max_interval_p95_ms: float = 65.0,
     max_interval_p99_ms: float = 125.0,
     max_execution_p95_ms: float = 50.0,
@@ -35,6 +36,10 @@ def validate_matrix(
         raise ValueError("candidate application validation requires EventLogs")
     if min_noncenter_applied_total and not require_candidate_application:
         raise ValueError("noncenter application minimum requires candidate validation")
+    if reject_duplicate_candidate_applications and not require_candidate_application:
+        raise ValueError(
+            "duplicate candidate rejection requires candidate application validation"
+        )
     results: dict[str, object] = {}
     failures: list[str] = []
     for seed in seed_values:
@@ -69,6 +74,9 @@ def validate_matrix(
                 require_measured_carry=require_measured_carry,
                 require_candidate_application=require_candidate_application,
                 min_applied_candidates=min_applied_candidates_per_seed,
+                reject_duplicate_candidate_applications=(
+                    reject_duplicate_candidate_applications
+                ),
             )
         results[str(seed)] = report
         if not report["passed"]:
@@ -100,6 +108,9 @@ def validate_matrix(
         "require_events": bool(require_events),
         "require_measured_carry": bool(require_measured_carry),
         "require_candidate_application": bool(require_candidate_application),
+        "reject_duplicate_candidate_applications": bool(
+            reject_duplicate_candidate_applications
+        ),
         "candidate_applied_total": applied_total,
         "candidate_noncenter_applied_total": noncenter_applied_total,
         "matrix_failures": matrix_failures,
@@ -120,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-candidate-application", action="store_true")
     parser.add_argument("--min-applied-candidates-per-seed", type=int, default=1)
     parser.add_argument("--min-noncenter-applied-total", type=int, default=0)
+    parser.add_argument(
+        "--reject-duplicate-candidate-applications",
+        action="store_true",
+    )
     parser.add_argument("--max-interval-p95-ms", type=float, default=65.0)
     parser.add_argument("--max-interval-p99-ms", type=float, default=125.0)
     parser.add_argument("--max-execution-p95-ms", type=float, default=50.0)
@@ -139,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
         require_candidate_application=args.require_candidate_application,
         min_applied_candidates_per_seed=args.min_applied_candidates_per_seed,
         min_noncenter_applied_total=args.min_noncenter_applied_total,
+        reject_duplicate_candidate_applications=(
+            args.reject_duplicate_candidate_applications
+        ),
         max_interval_p95_ms=args.max_interval_p95_ms,
         max_interval_p99_ms=args.max_interval_p99_ms,
         max_execution_p95_ms=args.max_execution_p95_ms,

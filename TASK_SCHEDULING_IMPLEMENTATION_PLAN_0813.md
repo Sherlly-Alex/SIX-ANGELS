@@ -1796,3 +1796,23 @@ Scheduler EventLog 出现 stale、安全停车或完整窗口周期超限，矩�
 这一门只审计既有应用事件，不改变候选偏移、评分、重规划或机器人命令。
 本批完成后全仓离线回归为 `516 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
 `332 tests OK`，53 项工作区必需文件与 Python 语法检查通过。
+
+### 18.20 候选应用幂等性与远程基线结论（当前修复批次）
+
+2026-08-21 官方 Server 单 seed 基线已取得 160/160，Client 无 blocked/safe-hold/执行器错误或
+碰撞，运行健康 `interval p95=58.80 ms`、`p99=70.00 ms`、`execution p95=40.24 ms`，两类
+deadline miss rate 均低于 0.003。候选证据同时显示 264 条 applied（其中 261 条非中心），证明
+调度输出确实进入执行器；但 823 条应用事件中另有 457 条 `too_late`，同一
+`step_run_id + action_id + goal_pose` 被约 4 Hz 重复投递。该运行可作为满分与性能证据，但不能
+作为候选应用生命周期的最终封板证据。
+
+本批将 Executor offer 改为步内幂等：同一步、同动作、同目标只调用一次 hook；策略切换目标、
+目标坐标变化或恢复/阶段重进产生新 `step_run_id` 时才重新应用。状态仅在 hook 正常返回后记录，
+异常仍 fail-closed。单轮与矩阵验证器新增
+`--reject-duplicate-candidate-applications`，最终新代码远程验收必须启用它；旧基线日志预期会被
+该新门拒绝。完成本地回归后，先重跑一轮 Heuristic 官方 Server 基线确认重复数为 0，再继续
+§18.8 measured-carry A/B 和 §18.18 五 seed 矩阵。
+
+本批本地回归结果为 `519 passed, 5 skipped, 1 warning`（仅排除本机未安装 OpenCV 的既有
+`test_empty_layer_verifier.py` 导入项），正式非 ROS unittest 为 `335 tests OK`；53 项工作区
+必需文件与 Python 语法检查通过。

@@ -85,6 +85,7 @@ python3 scripts/validate_remote_matrix.py \
   --seeds 20260817 20260818 20260819 20260820 20260821 \
   --require-events \
   --require-candidate-application \
+  --reject-duplicate-candidate-applications \
   --min-applied-candidates-per-seed 1 \
   --min-noncenter-applied-total 1 \
   --max-interval-p99-ms 125 \
@@ -104,3 +105,8 @@ the complete matrix needs at least one applied candidate whose lateral offset
 is non-zero. This proves that the scheduler did more than audit the calibrated
 centre stand. `audit_only`, `too_late`, malformed or post-FINISHED records do
 not satisfy the gate.
+
+The duplicate-application gate is mandatory for new scheduler builds. Within
+one `step_run_id`, the same action and goal pose may be installed only once;
+periodic policy reevaluation must not reset a live navigation goal. A changed
+action/pose or recovery into a new step run remains eligible for application.
