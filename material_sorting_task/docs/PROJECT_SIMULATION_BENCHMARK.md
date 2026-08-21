@@ -22,6 +22,9 @@ validation.
 
 - Configuration is fixed by `learning/configs/project_simulation_v1.json` and
   rejected on unknown keys or schema mismatch.
+- The simulator uses the production scheduler's eight candidate slots. Model
+  loading must pass the exact observation-schema hash check; no padding adapter
+  or hash bypass is permitted.
 - Pose/yaw, RGB-D scale, detection noise/dropout, speed/friction, message
   latency, planner failure and dynamic obstacle presence are seeded before an
   episode. Paired environments receive identical samples and success draws.

@@ -1,6 +1,6 @@
 {
   "schema_version": "scheduler-project-sim-v1",
-  "max_candidates": 6,
+  "max_candidates": 8,
   "minimum_clearance_m": 0.22,
   "remaining_time_s": 300.0,
   "stages": [

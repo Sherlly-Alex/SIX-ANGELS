@@ -57,7 +57,9 @@ DEFAULT_SIMULATION_STAGES = tuple(
 @dataclass(frozen=True)
 class ProjectSimulationConfig:
     stages: tuple[SimulationStage, ...] = DEFAULT_SIMULATION_STAGES
-    max_candidates: int = 6
+    # Keep the simulator on the production SchedulerDecisionConfig schema so
+    # replay-trained models can be integrity-checked without adapters.
+    max_candidates: int = 8
     minimum_clearance_m: float = 0.22
     remaining_time_s: float = 300.0
     randomization: DomainRandomizationConfig = DomainRandomizationConfig()
@@ -432,7 +434,7 @@ def load_project_simulation_config(
         )
     return ProjectSimulationConfig(
         stages=tuple(stages),
-        max_candidates=int(payload.get("max_candidates", 6)),
+        max_candidates=int(payload.get("max_candidates", 8)),
         minimum_clearance_m=float(payload.get("minimum_clearance_m", 0.22)),
         remaining_time_s=float(payload.get("remaining_time_s", 300.0)),
         randomization=DomainRandomizationConfig(**dict(randomization)),

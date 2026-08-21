@@ -5,6 +5,7 @@ import pytest
 import json
 
 from learning.env import SchedulingEnv
+from learning.observation import observation_schema_hash
 from learning.simulation_backend import (
     DEFAULT_PROJECT_SIMULATION_CONFIG_PATH,
     DEFAULT_SIMULATION_STAGES,
@@ -131,7 +132,10 @@ def test_project_simulation_versioned_config_loads_and_rejects_unknown_keys(
 ) -> None:
     config = load_project_simulation_config()
     assert config.stages == DEFAULT_SIMULATION_STAGES
-    assert config.max_candidates == 6
+    assert config.max_candidates == 8
+    assert build_project_sim_env().observation_builder.schema_hash == (
+        observation_schema_hash(8)
+    )
 
     source = DEFAULT_PROJECT_SIMULATION_CONFIG_PATH
     payload = json.loads(source.read_text(encoding="utf-8"))
