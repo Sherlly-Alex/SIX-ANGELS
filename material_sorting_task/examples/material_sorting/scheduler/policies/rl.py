@@ -197,6 +197,32 @@ class RLPolicy:
             deterministic=bool(deterministic),
         )
 
+    def warmup(
+        self,
+        *,
+        observation_size: int,
+        action_count: int,
+        iterations: int = 2,
+    ) -> tuple[float, ...]:
+        """Load and warm the inference backend before the guarded deadline starts.
+
+        Warm-up uses synthetic finite input and cannot dispatch an action.  Any
+        package, schema, dependency or prediction failure remains fail-closed.
+        """
+
+        if observation_size <= 0 or action_count <= 0 or iterations <= 0:
+            raise ValueError("warmup dimensions and iterations must be positive")
+        observation = np.zeros(int(observation_size), dtype=np.float32)
+        action_mask = np.ones(int(action_count), dtype=np.bool_)
+        return tuple(
+            self.predict(
+                observation,
+                action_masks=action_mask,
+                deterministic=True,
+            ).inference_ms
+            for _ in range(int(iterations))
+        )
+
 
 __all__ = [
     "InvalidPolicyOutput",

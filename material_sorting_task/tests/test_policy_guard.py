@@ -28,9 +28,11 @@ class Evaluation:
 class FakeMaskableModel:
     def __init__(self, action):
         self.action = action
+        self.predict_count = 0
 
     def predict(self, observation, *, action_masks, deterministic):
         del observation, deterministic
+        self.predict_count += 1
         assert len(action_masks) == 3
         return np.asarray([self.action]), None
 
@@ -121,6 +123,17 @@ def test_runtime_policy_rejects_boolean_and_fractional_actions() -> None:
         RLPolicy(model=FakeMaskableModel(1.5)).predict(
             observation, action_masks=mask
         )
+
+
+def test_policy_warmup_runs_before_guarded_inference() -> None:
+    model = FakeMaskableModel(1)
+    policy = RLPolicy(model=model)
+
+    timings = policy.warmup(observation_size=4, action_count=3, iterations=2)
+
+    assert len(timings) == 2
+    assert all(value >= 0.0 for value in timings)
+    assert model.predict_count == 2
 
 
 def test_invalid_mask_falls_back_without_running_model() -> None:

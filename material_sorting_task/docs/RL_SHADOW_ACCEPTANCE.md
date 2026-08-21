@@ -29,6 +29,11 @@ The production loader independently checks model bytes against the configured
 SHA256 and checks that metadata names the same bytes, approved metadata schema,
 MaskablePPO algorithm and observation schema.
 
+The Client loads the approved model and performs two synthetic, non-dispatching
+inferences before the scheduler loop starts. This absorbs CUDA/model cold-start
+latency outside the 25 ms guarded deadline; warm-up failure falls back to the
+Heuristic scheduler before any task action is selected.
+
 ## Shadow EventLog gate
 
 Each `action_selected` event records the policy suggestion, guard reason,

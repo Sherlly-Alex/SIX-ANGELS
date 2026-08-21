@@ -262,6 +262,15 @@ class CompetitionClient(Node):
                             expected_sha256=expected_hash or None,
                             expected_schema_hash=builder.schema_hash,
                         )
+                        warmup_ms = rl_policy.warmup(
+                            observation_size=builder.size,
+                            action_count=builder.max_candidates,
+                        )
+                        self.get_logger().info(
+                            "scheduler RL model loaded and prewarmed outside "
+                            "the guarded inference deadline; warmup_ms="
+                            + ",".join(f"{value:.3f}" for value in warmup_ms)
+                        )
                 decision_service = SchedulerDecisionService(
                     config=DecisionConfig(
                         policy_mode=self.scheduler_policy,
