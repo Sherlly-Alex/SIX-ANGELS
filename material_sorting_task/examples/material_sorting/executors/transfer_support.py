@@ -110,6 +110,8 @@ class TransferMotion:
         self._lateral_target: tuple[float, float] | None = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
+        self._lateral_travel_heading = 0.0
+        self._lateral_drive_sign = 1.0
         self._lateral_phase = "idle"
         self._lateral_start_s: float | None = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
@@ -156,6 +158,8 @@ class TransferMotion:
         self._lateral_target = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
+        self._lateral_travel_heading = 0.0
+        self._lateral_drive_sign = 1.0
         self._lateral_phase = "idle"
         self._lateral_start_s = None
         self._lateral_position_tolerance_m = self.LATERAL_POSITION_TOLERANCE_M
@@ -323,6 +327,7 @@ class TransferMotion:
         position_tolerance_m: float | None = None,
         yaw_tolerance_rad: float | None = None,
         timeout_s: float | None = None,
+        drive_in_reverse: bool = False,
     ) -> bool:
         """Start a bounded shelf-front lateral alignment.
 
@@ -383,8 +388,13 @@ class TransferMotion:
         self._lateral_position_tolerance_m = tolerance
         self._lateral_yaw_tolerance_rad = yaw_tolerance
         self._lateral_timeout_s = timeout
-        self._lateral_heading = (
+        self._lateral_travel_heading = (
             math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
+        )
+        self._lateral_drive_sign = -1.0 if drive_in_reverse else 1.0
+        self._lateral_heading = _wrap_to_pi(
+            self._lateral_travel_heading
+            + (math.pi if drive_in_reverse else 0.0)
         )
         self._lateral_phase = (
             "rotate_final"
@@ -441,12 +451,17 @@ class TransferMotion:
                 x_error = target_x - pose[0]
                 heading_offset = max(
                     -0.25,
-                    min(0.25, -math.sin(self._lateral_heading) * 0.8 * x_error),
+                    min(
+                        0.25,
+                        -math.sin(self._lateral_travel_heading) * 0.8 * x_error,
+                    ),
                 )
                 desired_yaw = self._lateral_heading + heading_offset
                 yaw_error = _wrap_to_pi(desired_yaw - pose[2])
                 angular = max(-0.30, min(0.30, 1.2 * yaw_error))
-                linear = min(0.09, max(0.035, 0.55 * abs(y_error)))
+                linear = self._lateral_drive_sign * min(
+                    0.09, max(0.035, 0.55 * abs(y_error))
+                )
                 if abs(yaw_error) > 0.18:
                     linear = 0.0
                 return NavigationStatus.NAVIGATING, (linear, angular), (

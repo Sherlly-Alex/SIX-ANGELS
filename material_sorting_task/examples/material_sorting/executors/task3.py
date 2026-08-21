@@ -834,6 +834,12 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     position_tolerance_m=self.TASK3_LATERAL_POSITION_TOLERANCE_M,
                     yaw_tolerance_rad=self.TASK3_SHELF_TURN_TOLERANCE_RAD,
                     timeout_s=self.TASK3_LATERAL_TIMEOUT_S,
+                    # With the long held-box offset, facing south while
+                    # translating south makes the payload reach the perimeter
+                    # before the base reaches this otherwise safe row.  In
+                    # measured mode face north and reverse toward the row so
+                    # the payload stays on the wall-opposite side.
+                    drive_in_reverse=self._measured_carry_guard_enabled,
                 ):
                     return StageResult.blocked(
                         "task 3 could not start bounded lateral motion at the "

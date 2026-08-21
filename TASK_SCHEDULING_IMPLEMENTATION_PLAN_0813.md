@@ -1860,3 +1860,19 @@ R2 远程诊断进一步给出实际因果链：transport sidecar 在固定 0.70
 
 本批最终本地回归为 `524 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
 `340 tests OK`；随后仍需在官方 Server 用同 seed R4 证明 Task 1/Task 3 均有正向实测包络证据。
+
+### 18.23 Task 3 横移的载荷朝向安全路由（当前修复批次）
+
+`05fd991` 的 measured-carry R4 证明 Task 3 逐周期门已真实运行：退离、转向、直行和横移均持续
+输出 `source=task3`，前段净空约 0.31–0.57 m。向包装箱行横移的末段，净空依次降至
+0.132 m、0.040 m，最终在 0.019 m 处由 0.020 m 硬门限正确零速阻塞；此时总分 140，说明保护
+不是伪日志，但原横移姿态把长载荷朝向了南墙。
+
+根因是通用横移控制器向南移动时采用“朝南、正向行驶”，而 Task 3 的货箱中心位于底盘前方约
+0.82 m。现为横移控制器增加显式倒车模式：travel heading 与 chassis heading 分离，线速度符号、
+横向 x 误差修正和最终朝向恢复仍由同一状态机控制。Task 3 仅在 measured-carry 开启时选择
+“朝北、倒车向南”，使货箱保持在远离南墙的一侧；名义目标行、候选策略、2 cm 门限和默认关闭
+模式均不改变。场景回归明确证明同一南向位移下朝南正向会被拒绝，而朝北倒车保持安全。
+
+本批最终本地回归为 `526 passed, 5 skipped, 1 warning`，正式非 ROS unittest 为
+`342 tests OK`；下一轮同 seed R5 只需重新验证 measured-carry 官方 Server 闭环。

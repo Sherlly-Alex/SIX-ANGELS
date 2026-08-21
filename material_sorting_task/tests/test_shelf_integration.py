@@ -1051,6 +1051,31 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         self.assertEqual(command[0], 0.0)
         self.assertIn("restoring shelf-facing yaw", detail)
 
+    def test_transfer_lateral_alignment_can_reverse_away_from_payload_wall(self) -> None:
+        motion = TransferMotion()
+        self.assertTrue(
+            motion.begin_lateral_alignment(
+                (-1.30, 0.85),
+                math.pi,
+                _odom(-1.30, 1.20, math.pi),
+                0.0,
+                drive_in_reverse=True,
+            )
+        )
+
+        status, command, detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 1.20, math.pi), 0.05
+        )
+        self.assertEqual(status, NavigationStatus.NAVIGATING)
+        self.assertEqual(command[0], 0.0)
+        self.assertIn("rotating toward shelf-front", detail)
+
+        status, command, _detail = motion.tick_lateral_alignment(
+            _odom(-1.30, 1.20, math.pi / 2.0), 0.20
+        )
+        self.assertEqual(status, NavigationStatus.NAVIGATING)
+        self.assertLess(command[0], 0.0)
+
     def test_transfer_lateral_alignment_keeps_default_timeout(self) -> None:
         motion = TransferMotion()
         self.assertTrue(

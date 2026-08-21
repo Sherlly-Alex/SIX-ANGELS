@@ -242,6 +242,25 @@ class TransferHeldGeometryTests(unittest.TestCase):
         self.assertIn("path_clearance=", detail)
         self.assertIn("minimum_clearance=", detail)
 
+    def test_reverse_southbound_route_keeps_front_payload_away_from_south_wall(self) -> None:
+        transfer = self._transfer([(-1.40, 0.85)])
+        long_hold = HeldObjectGeometry((0.82, 0.0, 0.90), 0.087, source="task3")
+
+        forward_safe, _ = transfer.check_held_command(
+            odometry(-1.70, 0.90, -math.pi / 2.0),
+            (0.09, 0.0),
+            long_hold,
+        )
+        reverse_safe, detail = transfer.check_held_command(
+            odometry(-1.70, 0.90, math.pi / 2.0),
+            (-0.09, 0.0),
+            long_hold,
+        )
+
+        self.assertFalse(forward_safe)
+        self.assertTrue(reverse_safe)
+        self.assertIn("source=task3", detail)
+
 
 if __name__ == "__main__":
     unittest.main()
