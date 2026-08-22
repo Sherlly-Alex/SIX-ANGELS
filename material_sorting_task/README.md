@@ -161,7 +161,9 @@ bash scripts/run_client.sh
 冻结的 Guarded 模型已经通过离线回放、100 盲种子仿真、两场 Shadow 和官方 Server
 金丝雀验收。比赛发布包显式携带模型、metadata、批准清单和验收报告，并使用专用 Client
 镜像；项目不会自动下载或静默替换模型。批准文件或模型哈希不一致时运行时拒绝 RL 权限，
-`competitionctl.sh rollback` 则直接使用独立的正式 Client 镜像启动 V2 Heuristic。
+`competitionctl.sh rollback` 则直接使用独立的正式 Client 镜像启动 V2 Heuristic。运行时
+对单次超过 50 ms 的推理立即安全回退；只有连续 3 次超时才永久隔离策略，避免主机偶发
+调度抖动让整场 RL 失效。正式验收仍要求有效推理 P95 ≤25 ms、孤立超时 ≤2、隔离事件为 0。
 
 每次候选评估还会记录经过严格白名单编码的 observation、action mask、schema 版本和哈希。
 训练前必须先回放 EventLog；旧版日志仍可用于选择一致性审计，但由于缺少精确 observation，

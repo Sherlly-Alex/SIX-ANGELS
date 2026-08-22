@@ -232,3 +232,37 @@ def test_shadow_timeout_falls_back_without_permanent_quarantine() -> None:
         assert not guard.quarantined
     finally:
         guard.close()
+
+
+def test_guarded_policy_quarantines_only_after_consecutive_timeouts() -> None:
+    guard = PolicyGuard(
+        PolicyGuardConfig(
+            inference_timeout_s=0.005,
+            consecutive_timeouts_before_quarantine=2,
+        )
+    )
+    try:
+        first = guard.select(
+            SlowPolicy(),
+            np.zeros(2),
+            candidates=_candidates(),
+            action_mask=(True, True, False),
+            heuristic_best=_candidates()[0],
+        )
+        assert first.reason == "inference_timeout"
+        assert not guard.quarantined
+
+        # The first timed-out invocation still owns the single worker until it
+        # returns, so wait before measuring a genuinely consecutive timeout.
+        time.sleep(0.05)
+        second = guard.select(
+            SlowPolicy(),
+            np.zeros(2),
+            candidates=_candidates(),
+            action_mask=(True, True, False),
+            heuristic_best=_candidates()[0],
+        )
+        assert second.reason == "inference_timeout"
+        assert guard.quarantined
+    finally:
+        guard.close()

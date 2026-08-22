@@ -67,8 +67,10 @@ The gate fails when:
 
 In Shadow mode, a deadline miss is recorded as a heuristic fallback and later
 audit sampling continues; Shadow has no control authority to quarantine. The
-fallback-rate gate still fails repeated misses. In `rl_guarded`, the same first
-deadline miss permanently quarantines the policy for the rest of the process.
+fallback-rate gate still fails repeated misses. In `rl_guarded`, every deadline
+miss also falls back immediately, but quarantine is reserved for three
+consecutive misses; a successful inference resets the strike count. Official
+acceptance permits at most two isolated misses and no quarantine events.
 
 Passing this offline gate permits evaluation to continue. It does not permit
 `rl_guarded` control. Simulation, multi-seed Shadow and final official-Server

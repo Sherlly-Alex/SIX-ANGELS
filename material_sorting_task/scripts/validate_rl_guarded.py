@@ -15,7 +15,6 @@ from typing import Any, Mapping
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _POLICY_FAILURE_REASONS = frozenset(
     {
-        "inference_timeout",
         "inference_timeout_quarantined",
         "policy_unavailable",
         "invalid_index",
@@ -36,6 +35,7 @@ def validate_guarded_log(
     expected_model_sha256: str,
     minimum_rl_takeovers: int = 1,
     maximum_inference_p95_ms: float = 25.0,
+    maximum_isolated_timeouts: int = 0,
 ) -> dict[str, Any]:
     if not _SHA256_RE.fullmatch(expected_model_sha256):
         raise ValueError("expected_model_sha256 must be 64 hexadecimal characters")
@@ -43,6 +43,8 @@ def validate_guarded_log(
         raise ValueError("minimum_rl_takeovers must be positive")
     if not math.isfinite(maximum_inference_p95_ms) or maximum_inference_p95_ms <= 0:
         raise ValueError("maximum_inference_p95_ms must be finite and positive")
+    if isinstance(maximum_isolated_timeouts, bool) or maximum_isolated_timeouts < 0:
+        raise ValueError("maximum_isolated_timeouts must be a non-negative integer")
 
     sessions = 0
     in_guarded = False
@@ -82,7 +84,7 @@ def validate_guarded_log(
 
         if reason in _POLICY_FAILURE_REASONS:
             failures.append(f"line {line_number}: policy failure {reason}")
-        elif reason not in {None, "accepted"}:
+        elif reason not in {None, "accepted", "inference_timeout"}:
             failures.append(f"line {line_number}: unexpected policy reason {reason}")
 
         if reason == "accepted":
@@ -124,6 +126,12 @@ def validate_guarded_log(
             f"inference p95={inference_p95_ms:.6f} ms exceeds "
             f"{maximum_inference_p95_ms:.6f} ms"
         )
+    isolated_timeouts = policy_reasons["inference_timeout"]
+    if isolated_timeouts > maximum_isolated_timeouts:
+        failures.append(
+            f"isolated inference_timeout count={isolated_timeouts} exceeds "
+            f"{maximum_isolated_timeouts}"
+        )
 
     failures = list(dict.fromkeys(failures))
     return {
@@ -139,7 +147,8 @@ def validate_guarded_log(
         "limits": {
             "minimum_rl_takeovers": minimum_rl_takeovers,
             "maximum_inference_p95_ms": maximum_inference_p95_ms,
-            "policy_failures_allowed": 0,
+            "maximum_isolated_timeouts": maximum_isolated_timeouts,
+            "quarantine_events_allowed": 0,
         },
     }
 
@@ -150,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-model-sha256", required=True)
     parser.add_argument("--minimum-rl-takeovers", type=int, default=1)
     parser.add_argument("--maximum-inference-p95-ms", type=float, default=25.0)
+    parser.add_argument("--maximum-isolated-timeouts", type=int, default=0)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     report = validate_guarded_log(
@@ -157,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_model_sha256=args.expected_model_sha256,
         minimum_rl_takeovers=args.minimum_rl_takeovers,
         maximum_inference_p95_ms=args.maximum_inference_p95_ms,
+        maximum_isolated_timeouts=args.maximum_isolated_timeouts,
     )
     payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -40,9 +40,19 @@ written. `rl_shadow` intentionally does not require the promotion manifest,
 because it never controls the selected action.
 
 This manifest is an operator-controlled release artifact, not a substitute for
-the final official-Server guarded canary. The frozen 2026-08-22 release passed
-that canary with score 160, 745 RL-controlled selections, zero policy failures
-and 4.56 ms inference p95. `competitionctl.sh client RUN guarded` therefore
+the final official-Server guarded canary. The final 2026-08-22 recovery canary
+passed with score 160, 774 RL-controlled selections, 5.17 ms inference p95,
+one isolated timeout that recovered, and zero quarantine events.
+`competitionctl.sh client RUN guarded` therefore
 starts the approved policy with CPU math pools capped at one thread, while
 `competitionctl.sh rollback RUN` remains an asset-independent V2 Heuristic
 escape hatch.
+
+The competition runtime uses a 50 ms per-inference hard deadline. A missed
+deadline immediately selects the safe Heuristic fallback. It takes three
+consecutive misses to quarantine the learned policy for the rest of the
+process; any successful inference resets the strike count. Official acceptance
+still requires accepted-inference p95 at most 25 ms, no more than two isolated
+timeouts, and zero quarantine events. This separates recoverable host
+scheduling jitter from a persistent policy failure without allowing a late RL
+result to control the robot.

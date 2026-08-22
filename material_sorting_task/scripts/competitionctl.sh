@@ -214,7 +214,17 @@ run_client() {
       -v "$approval:/workspace/rl_release/scheduler_guarded_approval.json:ro"
     )
   fi
-  docker "${run_args[@]}" "$image" bash -lc 'tail -f /dev/null' >/dev/null
+  # The frozen Guarded image has its own entrypoint.  Override it explicitly
+  # for the short-lived bootstrap container; otherwise Docker appends
+  # `bash -lc ...` to that entrypoint and the container can exit before the
+  # actual client process is started with docker exec below.
+  docker "${run_args[@]}" --entrypoint bash "$image" \
+    -lc 'exec tail -f /dev/null' >/dev/null
+
+  if [[ "$(docker inspect -f '{{.State.Running}}' material_sorting_client 2>/dev/null || true)" != "true" ]]; then
+    echo "material_sorting_client bootstrap container exited before client launch" >&2
+    exit 1
+  fi
 
   exec_env=(
     -e ROS_DOMAIN_ID="$ROS_DOMAIN_ID"
@@ -243,6 +253,7 @@ run_client() {
       -e MATERIAL_RL_GUARDED_APPROVAL_SHA256="$MATERIAL_RL_APPROVAL_SHA256"
       -e MATERIAL_RL_DEVICE="$MATERIAL_RL_DEVICE"
       -e MATERIAL_RL_TIMEOUT_MS="$MATERIAL_RL_TIMEOUT_MS"
+      -e MATERIAL_RL_QUARANTINE_AFTER_TIMEOUTS="$MATERIAL_RL_QUARANTINE_AFTER_TIMEOUTS"
     )
   fi
 

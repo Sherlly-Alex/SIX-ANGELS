@@ -26,12 +26,21 @@ class PolicyGuardConfig:
     minimum_safety_lower_bound: float = 0.0
     require_safety_lower_bound: bool = False
     quarantine_after_timeout: bool = True
+    consecutive_timeouts_before_quarantine: int = 1
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.inference_timeout_s) or self.inference_timeout_s <= 0:
             raise ValueError("inference_timeout_s must be finite and positive")
         if not math.isfinite(self.minimum_safety_lower_bound):
             raise ValueError("minimum_safety_lower_bound must be finite")
+        if (
+            isinstance(self.consecutive_timeouts_before_quarantine, bool)
+            or not isinstance(self.consecutive_timeouts_before_quarantine, int)
+            or self.consecutive_timeouts_before_quarantine <= 0
+        ):
+            raise ValueError(
+                "consecutive_timeouts_before_quarantine must be a positive integer"
+            )
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,7 @@ class PolicyGuard:
             max_workers=1, thread_name_prefix="scheduler-rl-policy"
         )
         self._quarantined_reason: str | None = None
+        self._consecutive_timeouts = 0
 
     @property
     def quarantined(self) -> bool:
@@ -96,6 +106,16 @@ class PolicyGuard:
 
     def reset_quarantine(self) -> None:
         self._quarantined_reason = None
+        self._consecutive_timeouts = 0
+
+    def _record_timeout(self) -> None:
+        self._consecutive_timeouts += 1
+        if (
+            self.config.quarantine_after_timeout
+            and self._consecutive_timeouts
+            >= self.config.consecutive_timeouts_before_quarantine
+        ):
+            self._quarantined_reason = "inference_timeout_quarantined"
 
     @staticmethod
     def _find_heuristic_index(
@@ -337,8 +357,7 @@ class PolicyGuard:
             prediction = future.result(timeout=self.config.inference_timeout_s)
         except FutureTimeout:
             future.cancel()
-            if self.config.quarantine_after_timeout:
-                self._quarantined_reason = "inference_timeout_quarantined"
+            self._record_timeout()
             return self._fallback(
                 "inference_timeout",
                 candidates,
@@ -347,6 +366,7 @@ class PolicyGuard:
                 inference_ms=(time.perf_counter() - started) * 1000.0,
             )
         except Exception as exc:
+            self._consecutive_timeouts = 0
             message = str(exc).lower()
             reason = (
                 "non_finite_action"
@@ -360,6 +380,7 @@ class PolicyGuard:
                 mask,
                 inference_ms=(time.perf_counter() - started) * 1000.0,
             )
+        self._consecutive_timeouts = 0
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         reported_ms = _field(prediction, "inference_ms", elapsed_ms)
         try:
@@ -367,6 +388,7 @@ class PolicyGuard:
         except (TypeError, ValueError, OverflowError):
             inference_ms = elapsed_ms
         if inference_ms > self.config.inference_timeout_s * 1000.0:
+            self._record_timeout()
             return self._fallback(
                 "inference_timeout",
                 candidates,

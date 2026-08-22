@@ -25,7 +25,9 @@ RL-1 离线候选阶段见
 [RL_PHASE1.md](material_sorting_task/docs/RL_PHASE1.md)。当前模型已经依次通过模型包、
 100 个盲种子配对仿真、两场官方 Client Shadow 和官方 Server Guarded 金丝雀门；冻结包
 因此默认启用 `rl_guarded`。RL 仍只能选择通过硬过滤的离散宏动作，任何批准文件、模型、
-schema、动作掩码或 25 ms 推理门异常都会 fail-closed。`rollback` 不依赖 RL 模型，直接
+schema 或动作掩码异常都会 fail-closed。正式运行的单次推理硬超时为 50 ms：孤立超时
+立即回退 Heuristic，连续 3 次超时才隔离 RL；验收仍要求有效推理 p95 不超过 25 ms，且
+最多允许 2 次孤立超时、零隔离事件。`rollback` 不依赖 RL 模型，直接
 恢复已经独立获得 160 分验收的 `v2 / heuristic`。
 
 比赛默认配置固定在 `material_sorting_task/config/competition_release.env`。当前冻结基线为：
@@ -40,6 +42,7 @@ schema、动作掩码或 25 ms 推理门异常都会 fail-closed。`rollback` �
 | 验收基线提交 | `e3f5284` |
 | Guarded 模型 | `364d5cf5...e3322` |
 | Guarded 批准清单 | `4aa38963...d59ac` |
+| 推理保护 | 50 ms 单次硬超时；连续 3 次才隔离；验收 p95 ≤25 ms |
 
 远程机先设置项目目录并做预检：
 
@@ -116,6 +119,9 @@ Guarded 比赛完成后可用仓库内正式验收器生成结构化报告：
 python3 "$PROJECT/material_sorting_task/scripts/validate_rl_guarded.py" \
   "$PROJECT/remote_artifacts/$RUN/scheduler_$RUN.jsonl" \
   --expected-model-sha256 364d5cf5e94be08597cd9bde643b1ed132ab347ec520bd8e16d2d24fc68e3322 \
+  --minimum-rl-takeovers 1 \
+  --maximum-inference-p95-ms 25 \
+  --maximum-isolated-timeouts 2 \
   --output "$PROJECT/remote_artifacts/$RUN/guarded_policy_acceptance.json"
 ```
 

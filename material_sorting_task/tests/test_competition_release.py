@@ -26,7 +26,11 @@ def test_competition_defaults_match_accepted_runtime() -> None:
     assert values["MATERIAL_SCHEDULER_POLICY"] == "rl_guarded"
     assert values["MATERIAL_MEASURED_CARRY_GUARD"] == "0"
     assert values["MATERIAL_ACCEPTANCE_BASE_COMMIT"] == "e3f5284"
-    assert values["MATERIAL_RL_TIMEOUT_MS"] == "25"
+    # Keep the hard fail-safe deadline above the measured 25 ms promotion
+    # gate so a single host scheduling hiccup does not quarantine an otherwise
+    # healthy policy for the rest of an official run.
+    assert values["MATERIAL_RL_TIMEOUT_MS"] == "50"
+    assert values["MATERIAL_RL_QUARANTINE_AFTER_TIMEOUTS"] == "3"
     assert len(values["MATERIAL_RL_MODEL_SHA256"]) == 64
     assert len(values["MATERIAL_RL_APPROVAL_SHA256"]) == 64
 

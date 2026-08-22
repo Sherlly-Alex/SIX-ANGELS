@@ -79,6 +79,34 @@ def test_guarded_log_rejects_timeout_even_after_real_takeover(tmp_path: Path) ->
     assert any("inference_timeout" in item for item in report["failures"])
 
 
+def test_guarded_log_allows_bounded_isolated_timeout(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    timeout = _selection(source="heuristic", reason="inference_timeout")
+    timeout["details"]["policy_suggestion"] = None
+    timeout["details"]["policy_model_sha256"] = None
+    _write(
+        path,
+        [
+            {
+                "event_type": "scheduler_started",
+                "details": {"policy_mode": "rl_guarded"},
+            },
+            _selection(),
+            timeout,
+            _selection(),
+        ],
+    )
+
+    report = validate_guarded_log(
+        path,
+        expected_model_sha256=MODEL_HASH,
+        maximum_isolated_timeouts=1,
+    )
+
+    assert report["passed"] is True
+    assert report["policy_reason_counts"]["inference_timeout"] == 1
+
+
 def test_guarded_log_rejects_wrong_model_and_suggestion(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     selected = _selection()

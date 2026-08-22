@@ -227,6 +227,15 @@ class CompetitionClient(Node):
                 )
                 if rl_timeout_ms <= 0.0:
                     raise ValueError("MATERIAL_RL_TIMEOUT_MS must be positive")
+                rl_quarantine_after_timeouts = int(
+                    os.environ.get(
+                        "MATERIAL_RL_QUARANTINE_AFTER_TIMEOUTS", "3"
+                    )
+                )
+                if rl_quarantine_after_timeouts <= 0:
+                    raise ValueError(
+                        "MATERIAL_RL_QUARANTINE_AFTER_TIMEOUTS must be positive"
+                    )
 
                 rl_policy = None
                 if self.scheduler_policy != "heuristic":
@@ -264,7 +273,7 @@ class CompetitionClient(Node):
                             # Keep the small scheduler MLP away from the CUDA
                             # stream used by high-rate YOLO perception.  CPU
                             # inference is deterministic and avoids GPU
-                            # contention tripping the 25 ms policy guard.
+                            # contention tripping the bounded policy guard.
                             device=os.environ.get(
                                 "MATERIAL_RL_DEVICE", "cpu"
                             ).strip(),
@@ -295,6 +304,9 @@ class CompetitionClient(Node):
                             # retains permanent quarantine after one timeout.
                             quarantine_after_timeout=(
                                 self.scheduler_policy == "rl_guarded"
+                            ),
+                            consecutive_timeouts_before_quarantine=(
+                                rl_quarantine_after_timeouts
                             ),
                         )
                     ),
