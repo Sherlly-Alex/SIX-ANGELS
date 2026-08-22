@@ -26,10 +26,14 @@ COLORED_CLASSES = frozenset(("pink", "yellow", "brown"))
 # validation in ``_classify`` is authoritative here: a material-box detection
 # inside the shelf ROI is the packaging box, while the real desktop
 # material_box remains far outside that ROI and is rejected.
-# ``shelf_obstacle`` is deliberately excluded because its sparse L1 occupancy
-# probe does not identify the randomized prop reliably across all layers.
 WHITE_CLASSES = frozenset(("packaging_box", "material_box"))
 EMPTY_CLASSES = frozenset(("shelf_empty",))
+# This depth-only probe covers L1.  It is never allowed to decide shelf
+# semantics by itself: it may provide the packaging-box center only after the
+# coloured object and explicitly confirmed empty layer make L1 the unique
+# remaining occupied layer.  This recovers from a missed white YOLO label
+# without weakening the RGB-D empty-layer gate.
+OCCUPANCY_CLASSES = frozenset(("shelf_obstacle",))
 
 
 @dataclass(frozen=True)
@@ -140,6 +144,9 @@ class ShelfStateTracker:
         self._empty_samples: deque[
             tuple[int, tuple[float, float, float], float]
         ] = deque(maxlen=self.window_size)
+        self._occupancy_samples: deque[
+            tuple[int, tuple[float, float, float], float]
+        ] = deque(maxlen=self.window_size)
         self._stable_colored: (
             tuple[str, int, tuple[float, float, float], float, int] | None
         ) = None
@@ -147,6 +154,9 @@ class ShelfStateTracker:
             tuple[int, tuple[float, float, float], float, int] | None
         ) = None
         self._stable_empty: (
+            tuple[int, tuple[float, float, float], float, int] | None
+        ) = None
+        self._stable_occupancy: (
             tuple[int, tuple[float, float, float], float, int] | None
         ) = None
         self._last_signature: tuple[tuple[str, float], ...] | None = None
@@ -157,9 +167,11 @@ class ShelfStateTracker:
         self._colored_samples.clear()
         self._packaging_samples.clear()
         self._empty_samples.clear()
+        self._occupancy_samples.clear()
         self._stable_colored = None
         self._stable_packaging = None
         self._stable_empty = None
+        self._stable_occupancy = None
         self._last_signature = None
         self._last_empty_observation_stamp = None
 
@@ -199,9 +211,10 @@ class ShelfStateTracker:
         colored = self._colored_vote_status()
         packaging = self._packaging_vote_status()
         empty = self._empty_vote_status()
+        occupancy = self._occupancy_vote_status()
         return (
             f"frames={len(self._frames)}, colored={colored}, "
-            f"packaging={packaging}, empty={empty}"
+            f"packaging={packaging}, empty={empty}, occupancy={occupancy}"
         )
 
     def update(
@@ -232,6 +245,7 @@ class ShelfStateTracker:
                 label not in COLORED_CLASSES
                 and label not in WHITE_CLASSES
                 and label not in EMPTY_CLASSES
+                and label not in OCCUPANCY_CLASSES
             ):
                 continue
             age_s = max(0.0, float(now_s) - float(observation.received_at_s))
@@ -281,15 +295,17 @@ class ShelfStateTracker:
                     self._colored_samples.append((label, layer, point, score))
                 elif label in WHITE_CLASSES:
                     self._packaging_samples.append((layer, point, score))
-                else:
+                elif label in EMPTY_CLASSES:
                     self._empty_samples.append((layer, point, score))
+                else:
+                    self._occupancy_samples.append((layer, point, score))
             self._lock_independent_targets()
 
         return self.result()
 
     def result(self) -> ShelfState | None:
         self._lock_independent_targets()
-        if self._stable_colored is None or self._stable_packaging is None:
+        if self._stable_colored is None:
             return None
         (
             colored_label,
@@ -298,17 +314,16 @@ class ShelfStateTracker:
             colored_score,
             colored_count,
         ) = self._stable_colored
-        (
-            white_layer,
-            packaging_center,
-            packaging_score,
-            white_count,
-        ) = self._stable_packaging
+        packaging = self._resolved_packaging_evidence()
+        if packaging is None:
+            return None
+        white_layer, packaging_center, packaging_score, white_count = packaging
         if colored_layer == white_layer:
             return None
-        empty_layer = self.semantic_empty_candidate
-        if empty_layer is None:
+        candidates = {1, 2, 3} - {colored_layer, white_layer}
+        if len(candidates) != 1:
             return None
+        empty_layer = candidates.pop()
         if self.require_empty_confirmation:
             if self._stable_empty is None:
                 return None
@@ -418,6 +433,54 @@ class ShelfStateTracker:
                     count,
                 )
 
+        if self._stable_occupancy is None and self._occupancy_samples:
+            votes = Counter(layer for layer, _point, _score in self._occupancy_samples)
+            layer, count = votes.most_common(1)[0]
+            if count >= self.required_votes:
+                matching = [
+                    (point, score)
+                    for sample_layer, point, score in self._occupancy_samples
+                    if sample_layer == layer
+                ]
+                self._stable_occupancy = (
+                    layer,
+                    _median_center([point for point, _score in matching]),
+                    _median(score for _point, score in matching),
+                    count,
+                )
+
+    def _resolved_packaging_evidence(
+        self,
+    ) -> tuple[int, tuple[float, float, float], float, int] | None:
+        """Return direct white evidence or a strictly corroborated L1 probe.
+
+        The depth occupancy probe cannot classify an object and covers only
+        L1.  It is accepted only when independent stable colour and explicit
+        RGB-D empty evidence leave exactly that same layer occupied.  Direct
+        packaging detections always remain authoritative.
+        """
+
+        if self._stable_packaging is not None:
+            return self._stable_packaging
+        if (
+            not self.require_empty_confirmation
+            or self._stable_colored is None
+            or self._stable_empty is None
+            or self._stable_occupancy is None
+        ):
+            return None
+        colored_layer = self._stable_colored[1]
+        empty_layer = self._stable_empty[0]
+        if colored_layer == empty_layer:
+            return None
+        remaining = {1, 2, 3} - {colored_layer, empty_layer}
+        if len(remaining) != 1:
+            return None
+        inferred_layer = remaining.pop()
+        if self._stable_occupancy[0] != inferred_layer:
+            return None
+        return self._stable_occupancy
+
     def _colored_vote_status(self) -> str:
         if self._stable_colored is not None:
             label, layer, _center, _score, count = self._stable_colored
@@ -453,6 +516,16 @@ class ShelfStateTracker:
         layer, count = votes.most_common(1)[0]
         return f"L{layer}({count}/{self.required_votes})"
 
+    def _occupancy_vote_status(self) -> str:
+        if self._stable_occupancy is not None:
+            layer, _center, _score, count = self._stable_occupancy
+            return f"locked:L{layer}({count})"
+        if not self._occupancy_samples:
+            return f"none(0/{self.required_votes})"
+        votes = Counter(layer for layer, _point, _score in self._occupancy_samples)
+        layer, count = votes.most_common(1)[0]
+        return f"L{layer}({count}/{self.required_votes})"
+
     def _classify(
         self,
         label: str,
@@ -468,7 +541,7 @@ class ShelfStateTracker:
             return None
         half_z = (
             self.PACKAGING_HALF_Z
-            if label in WHITE_CLASSES
+            if label in WHITE_CLASSES or label in OCCUPANCY_CLASSES
             else self.COLORED_HALF_Z
         )
         layer = layer_from_object_center_z(
@@ -506,4 +579,9 @@ def _median_center(points: list[tuple[float, float, float]]) -> tuple[float, flo
     )
 
 
-__all__ = ["EMPTY_CLASSES", "ShelfState", "ShelfStateTracker"]
+__all__ = [
+    "EMPTY_CLASSES",
+    "OCCUPANCY_CLASSES",
+    "ShelfState",
+    "ShelfStateTracker",
+]

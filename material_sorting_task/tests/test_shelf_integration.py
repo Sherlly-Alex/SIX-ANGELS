@@ -127,6 +127,89 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertEqual(result.empty_layer, 3)
         self.assertEqual(result.layer_contents, ("packaging_box", "pink", "EMPTY"))
 
+    def test_depth_occupancy_recovers_missed_l1_packaging_label(self) -> None:
+        tracker = ShelfStateTracker(
+            required_votes=3,
+            require_empty_confirmation=True,
+        )
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "yellow": observation(
+                        "yellow", (-2.63, 0.778, 0.837), stamp
+                    ),
+                    "shelf_empty": observation(
+                        "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                    ),
+                    "shelf_obstacle": observation(
+                        "shelf_obstacle", (-2.61, 0.742, 0.557), stamp, 0.75
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="pink",
+                expected_colored_class_id="yellow",
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.layer_contents, ("packaging_box", "yellow", "EMPTY"))
+        self.assertEqual(result.white_obstacle_layer, 1)
+        self.assertEqual(
+            result.task3_packaging_box_center_world,
+            (-2.61, 0.742, 0.557),
+        )
+        self.assertIn("occupancy=locked:L1", tracker.diagnostic_summary)
+
+    def test_depth_occupancy_cannot_replace_missing_semantic_evidence(self) -> None:
+        tracker = ShelfStateTracker(
+            required_votes=3,
+            require_empty_confirmation=True,
+        )
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "yellow": observation(
+                        "yellow", (-2.63, 0.778, 0.837), stamp
+                    ),
+                    "shelf_obstacle": observation(
+                        "shelf_obstacle", (-2.61, 0.742, 0.557), stamp, 0.75
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="pink",
+            )
+
+        self.assertIsNone(result)
+
+    def test_depth_occupancy_must_match_unique_remaining_layer(self) -> None:
+        tracker = ShelfStateTracker(
+            required_votes=3,
+            require_empty_confirmation=True,
+        )
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "yellow": observation(
+                        "yellow", (-2.63, 0.778, 0.530), stamp
+                    ),
+                    "shelf_empty": observation(
+                        "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                    ),
+                    # The current depth-only probe is physically restricted
+                    # to L1, while the unique remaining layer here is L2.
+                    "shelf_obstacle": observation(
+                        "shelf_obstacle", (-2.61, 0.742, 0.557), stamp, 0.75
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="pink",
+            )
+
+        self.assertIsNone(result)
+
     def test_uses_recent_static_packaging_during_fresh_colored_scan(self) -> None:
         tracker = ShelfStateTracker(required_votes=3, max_observation_age_s=2.0)
         result = None
