@@ -7,7 +7,7 @@
 
 - `material_sorting_task/examples/material_sorting/`：正式 ROS 2 客户端、控制器和任务执行器。
 - `material_sorting_task/examples/material_sorting/scheduler/`：Legacy/Shadow/V2 调度、资源安全、代价评价与策略护栏。
-- `material_sorting_task/examples/material_sorting/learning/`：可选离散宏动作训练/评估接口，不进入默认控制链。
+- `material_sorting_task/examples/material_sorting/learning/`：离散宏动作训练、评估与 Guarded 运行时护栏。
 - `material_sorting_task/semantic_research/`：离线 Regex、ML 和本地 LLM 研究模块。
 - `material_sorting_task/scripts/`：正式测试、研究测试和可选模型安装脚本。
 - `SEMANTIC_PARSING_IMPLEMENTATION_PLAN.md`：语义解析分阶段实施与审查记录。
@@ -22,27 +22,30 @@
 ## 比赛冻结版本与一键运行
 
 RL-1 离线候选阶段见
-[RL_PHASE1.md](material_sorting_task/docs/RL_PHASE1.md)。比赛冻结版本仍锁定
-`MATERIAL_SCHEDULER_POLICY=heuristic`；RL-1 通过后最多进入 `rl_shadow`，
-不得直接进入 `rl_guarded`。
+[RL_PHASE1.md](material_sorting_task/docs/RL_PHASE1.md)。当前模型已经依次通过模型包、
+100 个盲种子配对仿真、两场官方 Client Shadow 和官方 Server Guarded 金丝雀门；冻结包
+因此默认启用 `rl_guarded`。RL 仍只能选择通过硬过滤的离散宏动作，任何批准文件、模型、
+schema、动作掩码或 25 ms 推理门异常都会 fail-closed。`rollback` 不依赖 RL 模型，直接
+恢复已经独立获得 160 分验收的 `v2 / heuristic`。
 
 比赛默认配置固定在 `material_sorting_task/config/competition_release.env`。当前冻结基线为：
 
 | 项目 | 冻结值 |
 |---|---|
 | 正式执行模式 | `task123_full` |
-| 调度器 | `v2 / heuristic` |
+| 调度器 | `v2 / rl_guarded`（一键回退 `v2 / heuristic`） |
 | 测量搬运保护 | `0`（默认关闭，实验功能不进入比赛链） |
 | ROS Domain | `102` |
 | 已验收得分 | 官方 Server `160/160` |
-| 验收基线提交 | `1549df9` |
-| 实机动作基线提交 | `5e3233c` |
+| 验收基线提交 | `e3f5284` |
+| Guarded 模型 | `364d5cf5...e3322` |
+| Guarded 批准清单 | `4aa38963...d59ac` |
 
 远程机先设置项目目录并做预检：
 
 ```bash
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
-bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight guarded
 ```
 
 正式运行使用两个终端。终端一启动官方 Server（前台运行并保存日志）：
@@ -58,7 +61,7 @@ bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" server "$RUN"
 ```bash
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
 export RUN=competition_YYYYMMDD_HHMMSS
-bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" client "$RUN" v2
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" client "$RUN" guarded
 ```
 
 运行日志统一写到 `$PROJECT/remote_artifacts/$RUN/`。查看状态或停止容器：
@@ -70,9 +73,17 @@ bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" stop
 
 ### 一键冻结、部署与回退
 
-从干净的 Git 工作区生成不可变比赛包和 SHA256：
+从干净的 Git 工作区生成不可变比赛包和 SHA256。Guarded 冻结还必须显式提供六个已经
+通过的模型/证据文件；冻结脚本会校验模型和批准清单哈希、检查四份报告的 `passed=true`，
+并将它们一并封装：
 
 ```bash
+export MATERIAL_FREEZE_MODEL_SOURCE=/path/to/scheduler_policy.zip
+export MATERIAL_FREEZE_APPROVAL_SOURCE=/path/to/scheduler_guarded_approval.json
+export MATERIAL_FREEZE_BENCHMARK_SOURCE=/path/to/project_sim_blind_report.json
+export MATERIAL_FREEZE_SHADOW_SOURCE=/path/to/rl_shadow_acceptance.json
+export MATERIAL_FREEZE_GUARDED_ACCEPTANCE_SOURCE=/path/to/guarded_policy_acceptance.json
+export MATERIAL_FREEZE_REMOTE_ACCEPTANCE_SOURCE=/path/to/remote_acceptance.json
 bash material_sorting_task/scripts/competitionctl.sh freeze
 ```
 
@@ -83,10 +94,11 @@ bash material_sorting_task/scripts/deploy_competition_release.sh \
   /home/abc123/SIX-ANGELS-competition-COMMIT.tar.gz \
   /home/abc123/polaris/workspace/SIX-ANGELS-release-COMMIT
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-release-COMMIT
-bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight
+bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" preflight guarded
 ```
 
-如果 V2 调度现场异常，保留 Server，只在新终端重启 Client 并切换 Legacy：
+如果 Guarded 调度现场异常，保留 Server，只在新终端重启 Client 并切换到不需要模型或
+批准文件的 V2 Heuristic：
 
 ```bash
 export PROJECT=/home/abc123/polaris/workspace/SIX-ANGELS-v5
@@ -94,7 +106,18 @@ export RUN=competition_rollback_$(date +%Y%m%d_%H%M%S)
 bash "$PROJECT/material_sorting_task/scripts/competitionctl.sh" rollback "$RUN"
 ```
 
-此回退只切换调度引擎，不替换动作代码、不删除原日志。若需回退整个代码版本，重新部署上一个已校验归档到另一个目录，再修改 `PROJECT`；不要覆盖或删除当前目录。
+此回退只切换策略，不替换动作代码、不删除原日志。需要进一步回退调度引擎时可显式运行
+`client "$RUN" legacy`。若需回退整个代码版本，重新部署上一个已校验归档到另一个目录，
+再修改 `PROJECT`；不要覆盖或删除当前目录。
+
+Guarded 比赛完成后可用仓库内正式验收器生成结构化报告：
+
+```bash
+python3 "$PROJECT/material_sorting_task/scripts/validate_rl_guarded.py" \
+  "$PROJECT/remote_artifacts/$RUN/scheduler_$RUN.jsonl" \
+  --expected-model-sha256 364d5cf5e94be08597cd9bde643b1ed132ab347ec520bd8e16d2d24fc68e3322 \
+  --output "$PROJECT/remote_artifacts/$RUN/guarded_policy_acceptance.json"
+```
 
 ## 环境与测试
 

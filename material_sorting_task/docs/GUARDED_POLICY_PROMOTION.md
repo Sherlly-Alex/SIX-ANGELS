@@ -40,5 +40,9 @@ written. `rl_shadow` intentionally does not require the promotion manifest,
 because it never controls the selected action.
 
 This manifest is an operator-controlled release artifact, not a substitute for
-the final official-Server guarded canary. Keep Heuristic as the competition
-default until that separate canary is explicitly approved.
+the final official-Server guarded canary. The frozen 2026-08-22 release passed
+that canary with score 160, 745 RL-controlled selections, zero policy failures
+and 4.56 ms inference p95. `competitionctl.sh client RUN guarded` therefore
+starts the approved policy with CPU math pools capped at one thread, while
+`competitionctl.sh rollback RUN` remains an asset-independent V2 Heuristic
+escape hatch.

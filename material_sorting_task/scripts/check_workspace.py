@@ -63,6 +63,8 @@ REQUIRED = (
     ROOT / "scripts" / "validate_rl_shadow.py",
     ROOT / "scripts" / "validate_scheduler_model.py",
     ROOT / "scripts" / "approve_guarded_policy.py",
+    ROOT / "scripts" / "validate_guarded_release.py",
+    ROOT / "scripts" / "validate_rl_guarded.py",
     ROOT / "scripts" / "split_replay_dataset.py",
     ROOT / "scripts" / "validate_rl1_heldout.py",
     ROOT / "scripts" / "run_rl1_pipeline.py",
