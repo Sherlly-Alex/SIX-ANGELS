@@ -136,6 +136,11 @@ def test_policy_warmup_runs_before_guarded_inference() -> None:
     assert model.predict_count == 2
 
 
+def test_policy_rejects_empty_inference_device() -> None:
+    with pytest.raises(ValueError, match="device"):
+        RLPolicy(model=FakeMaskableModel(1), device="  ")
+
+
 def test_invalid_mask_falls_back_without_running_model() -> None:
     guard = PolicyGuard()
     try:

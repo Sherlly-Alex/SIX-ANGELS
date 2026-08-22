@@ -261,6 +261,13 @@ class CompetitionClient(Node):
                             model_path=model_path or None,
                             expected_sha256=expected_hash or None,
                             expected_schema_hash=builder.schema_hash,
+                            # Keep the small scheduler MLP away from the CUDA
+                            # stream used by high-rate YOLO perception.  CPU
+                            # inference is deterministic and avoids GPU
+                            # contention tripping the 25 ms policy guard.
+                            device=os.environ.get(
+                                "MATERIAL_RL_DEVICE", "cpu"
+                            ).strip(),
                         )
                         warmup_ms = rl_policy.warmup(
                             observation_size=builder.size,
@@ -268,7 +275,8 @@ class CompetitionClient(Node):
                         )
                         self.get_logger().info(
                             "scheduler RL model loaded and prewarmed outside "
-                            "the guarded inference deadline; warmup_ms="
+                            "the guarded inference deadline; device="
+                            f"{rl_policy.device}; warmup_ms="
                             + ",".join(f"{value:.3f}" for value in warmup_ms)
                         )
                 decision_service = SchedulerDecisionService(

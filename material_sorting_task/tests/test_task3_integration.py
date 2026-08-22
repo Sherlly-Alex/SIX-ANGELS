@@ -90,7 +90,12 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
-        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
+        self.assertEqual(executor.TASK3_POST_RELEASE_INSERT_MARGIN_M, 0.04)
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.44)
+        self.assertGreater(
+            executor.TASK3_POST_RELEASE_PUSH_M,
+            executor.TASK3_POST_RELEASE_RETREAT_M,
+        )
         self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
 
     def test_executor_uses_task1_grasp_and_task3_orientation(self) -> None:
@@ -119,7 +124,12 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
-        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
+        self.assertEqual(executor.TASK3_POST_RELEASE_INSERT_MARGIN_M, 0.04)
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.44)
+        self.assertGreater(
+            executor.TASK3_POST_RELEASE_PUSH_M,
+            executor.TASK3_POST_RELEASE_RETREAT_M,
+        )
         self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
         self.assertTrue(executor._held_insert.allow_extension)
         self.assertEqual(executor._held_insert.max_translation_m, 0.30)

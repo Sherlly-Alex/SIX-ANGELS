@@ -125,7 +125,14 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # ``ReleaseSpreadController`` interprets this as the per-arm half-width,
     # matching the competition client's gripper-width convention.
     TASK3_POST_RELEASE_HALF_WIDTH_M = 0.065
-    TASK3_POST_RELEASE_PUSH_M = 0.38
+    # The old 0.38 m push stopped 0.02 m short of the 0.40 m release retreat,
+    # so odometry/contact variation could leave the compact open arms without
+    # ever re-contacting the released box.  Return to the release pose and add
+    # a bounded 0.04 m shelf insertion margin.
+    TASK3_POST_RELEASE_INSERT_MARGIN_M = 0.04
+    TASK3_POST_RELEASE_PUSH_M = (
+        TASK3_POST_RELEASE_RETREAT_M + TASK3_POST_RELEASE_INSERT_MARGIN_M
+    )
     TASK3_POST_PUSH_RETREAT_M = 0.45
     TASK3_RETURN_SEQUENCE_TIMEOUT_S = 90.0
     TASK3_RAISE_SPINE_TIMEOUT_S = 30.0

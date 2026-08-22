@@ -34,6 +34,11 @@ inferences before the scheduler loop starts. This absorbs CUDA/model cold-start
 latency outside the 25 ms guarded deadline; warm-up failure falls back to the
 Heuristic scheduler before any task action is selected.
 
+The formal Client defaults Shadow inference to CPU (`MATERIAL_RL_DEVICE=cpu`).
+This small MLP must not contend with the high-rate YOLO CUDA stream. Training
+may still use CUDA, and changing the runtime device does not change model bytes
+or the approved observation/action schema.
+
 ## Shadow EventLog gate
 
 Each `action_selected` event records the policy suggestion, guard reason,

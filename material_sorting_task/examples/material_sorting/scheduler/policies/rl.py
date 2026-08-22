@@ -59,12 +59,16 @@ class RLPolicy:
         model_path: str | Path | None = None,
         expected_sha256: str | None = None,
         expected_schema_hash: str | None = None,
+        device: str = "auto",
         loader: Callable[[str], Any] | None = None,
     ) -> None:
         self._model = model
         self.model_path = None if model_path is None else Path(model_path)
         self.expected_sha256 = expected_sha256
         self.expected_schema_hash = expected_schema_hash
+        self.device = str(device).strip()
+        if not self.device:
+            raise ValueError("policy inference device must be non-empty")
         self._loader = loader
         self._model_sha256: str | None = None
         self.last_error: str | None = None
@@ -139,7 +143,7 @@ class RLPolicy:
                         "training/runtime package 'sb3-contrib'; the heuristic "
                         "scheduler remains available without it"
                     ) from exc
-                model = MaskablePPO.load(str(self.model_path))
+                model = MaskablePPO.load(str(self.model_path), device=self.device)
             if model is None or not callable(getattr(model, "predict", None)):
                 raise ModelUnavailableError("loaded object has no callable predict method")
             self._model = model
