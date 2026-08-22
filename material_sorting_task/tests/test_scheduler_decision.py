@@ -75,6 +75,24 @@ class SchedulerDecisionTests(unittest.TestCase):
         self.assertEqual(outcome.source, "heuristic")
         service.close()
 
+    def test_rl_shadow_fallback_is_not_mislabeled_as_policy_suggestion(self) -> None:
+        service = SchedulerDecisionService(
+            config=DecisionConfig(
+                policy_mode="rl_shadow",
+                candidate_stability_frames=1,
+            ),
+            rl_policy=RLPolicy(),
+        )
+        outcome = service.decide(
+            (candidate("high", 10.0), candidate("low", 1.0)),
+            now_s=1.0,
+        )
+
+        self.assertEqual(outcome.action_id, "high")
+        self.assertIsNone(outcome.policy_suggestion)
+        self.assertEqual(outcome.policy_decision_reason, "model_missing")
+        service.close()
+
     def test_rl_guarded_can_choose_only_an_unmasked_macro_action(self) -> None:
         service = SchedulerDecisionService(
             config=DecisionConfig(

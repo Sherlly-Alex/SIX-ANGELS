@@ -287,7 +287,16 @@ class CompetitionClient(Node):
                     ),
                     rl_policy=rl_policy,
                     policy_guard=PolicyGuard(
-                        PolicyGuardConfig(inference_timeout_s=rl_timeout_ms / 1000.0)
+                        PolicyGuardConfig(
+                            inference_timeout_s=rl_timeout_ms / 1000.0,
+                            # Shadow never controls the robot, so one host
+                            # scheduling hiccup is recorded as a fallback and
+                            # later audit samples continue. Guarded control
+                            # retains permanent quarantine after one timeout.
+                            quarantine_after_timeout=(
+                                self.scheduler_policy == "rl_guarded"
+                            ),
+                        )
                     ),
                     event_log=event_log,
                 )

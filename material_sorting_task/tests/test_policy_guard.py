@@ -210,3 +210,25 @@ def test_timeout_falls_back_and_quarantines_policy() -> None:
         assert second.reason == "inference_timeout_quarantined"
     finally:
         guard.close()
+
+
+def test_shadow_timeout_falls_back_without_permanent_quarantine() -> None:
+    guard = PolicyGuard(
+        PolicyGuardConfig(
+            inference_timeout_s=0.005,
+            quarantine_after_timeout=False,
+        )
+    )
+    try:
+        result = guard.select(
+            SlowPolicy(),
+            np.zeros(2),
+            candidates=_candidates(),
+            action_mask=(True, True, False),
+            heuristic_best=_candidates()[0],
+        )
+        assert result.used_fallback
+        assert result.reason == "inference_timeout"
+        assert not guard.quarantined
+    finally:
+        guard.close()

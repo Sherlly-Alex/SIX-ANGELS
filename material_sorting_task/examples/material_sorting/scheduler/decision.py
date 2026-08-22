@@ -275,11 +275,16 @@ class SchedulerDecisionService:
                 action_mask=mask,
                 heuristic_best=heuristic_best,
             )
-            suggestion = decision.selected
-            if suggestion is not None and not isinstance(
-                suggestion, CandidateEvaluation
+            guard_selected = decision.selected
+            if guard_selected is not None and not isinstance(
+                guard_selected, CandidateEvaluation
             ):
-                suggestion = None
+                guard_selected = None
+            # A guard fallback selects the heuristic action for continuity; it
+            # is not an RL suggestion and must not be logged as one.  Keeping
+            # these fields distinct lets the Shadow gate count a timeout as a
+            # bounded fallback instead of a malformed learned suggestion.
+            suggestion = guard_selected if decision.source == "rl" else None
             if self.config.policy_mode == "rl_shadow":
                 return (
                     heuristic_best,
@@ -290,7 +295,11 @@ class SchedulerDecisionService:
                     decision.inference_ms,
                     decision.model_sha256,
                 )
-            selected = suggestion if suggestion is not None else heuristic_best
+            selected = (
+                guard_selected
+                if guard_selected is not None
+                else heuristic_best
+            )
             return (
                 selected,
                 decision.source,

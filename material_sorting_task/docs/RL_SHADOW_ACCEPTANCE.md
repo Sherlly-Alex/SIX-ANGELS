@@ -65,6 +65,11 @@ The gate fails when:
 - inference p95 exceeds 25 ms or fallback rate exceeds its limit;
 - the underlying replay/schema/training-ready checks fail.
 
+In Shadow mode, a deadline miss is recorded as a heuristic fallback and later
+audit sampling continues; Shadow has no control authority to quarantine. The
+fallback-rate gate still fails repeated misses. In `rl_guarded`, the same first
+deadline miss permanently quarantines the policy for the rest of the process.
+
 Passing this offline gate permits evaluation to continue. It does not permit
 `rl_guarded` control. Simulation, multi-seed Shadow and final official-Server
 validation remain separate release gates.
