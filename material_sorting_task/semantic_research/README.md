@@ -1,115 +1,40 @@
-# Semantic research (offline only)
+# 语义研究旁路
 
-This package compares Chinese-text slot extractors against Server-comparable
-slots. It is **not** part of the competition control path.
+本目录用于离线比较 Regex、传统 ML 和本地 SLM 的中文任务槽位抽取效果。它不是正式机器人控制链的一部分，默认不会由 `run_client.sh` 加载。
 
-## Rules
+## 正式链路边界
 
-- Formal code (`client_task`, `competition_controller`, executors) must never
-  import `semantic_research`.
-- Predictions never include `target_body`, `place_world`, or `place_radius`.
-- Dataset gold labels only cover text-observable slots.
-- Research deps live only in `requirements-research.txt`.
+正式 Client 只信任 Server 发布的结构化 JSON：`target_body`、`target_color`、`place_world`、`place_radius`、`place_type`、`direction` 和 `ref_prop` 等字段缺失或冲突时，Client 拒绝执行并进入安全状态。中文 `instruction` 文本不能补全这些执行字段。
 
-## Dataset
+Regex/ML/SLM 只能对已经被 Server 接受的 JSON 做旁路一致性审计，输出 `SEM_AUDIT` 日志；不能修改任务、拒绝任务、替换目标坐标或阻塞控制器。
 
-`data/text_eval.jsonl` covers:
+正式执行要求 `task`、`target_body`、`target_color`、`place_type`、`place_world` 和
+`place_radius` 等字段真实存在且通过有限值、枚举和任务序列校验；任务三的货架语义还需要
+`direction` 以及 `ref_prop`/`ref_prop_body`。非法或冲突指令进入安全保持，不由文本解析器修复。
 
-- three standard competition sentence patterns
-- pink/yellow/brown permutations
-- desk left/right mentions
-- direction synonyms (左边/左侧/右边/右侧)
-- punctuation / spacing / oral variants
-- negative cases (ambiguous, missing, conflicting)
+## 目录
 
-No fixed `place_world` answers are stored.
+| 文件 | 作用 |
+| --- | --- |
+| `schema.py` | 研究模块的槽位数据结构。 |
+| `regex_adapter.py` | 规则基线。 |
+| `ml_parser.py` | 离线 ML 槽位模型。 |
+| `slm_parser.py` | 本地 SLM 适配器。 |
+| `evaluator.py` | 研究评估和指标。 |
+| `data/` | 训练/评估数据。 |
+| `MODEL_MANIFEST.json` | 模型版本和校验信息。 |
 
-## Regex baseline
+## 运行
 
-```bash
-cd material_sorting_task
-export PYTHONPATH=.
-python -m semantic_research --rows-out artifacts/regex_rows.jsonl --metrics-out artifacts/regex_metrics.json
-```
-
-Metrics: per-slot accuracy, complete-match rate, missing rate, conflict rate,
-P50/P95 latency.
-
-## ML (P3)
+研究依赖不要安装进正式 Client 镜像：
 
 ```bash
-pip install -r semantic_research/requirements-research.txt
-python -m semantic_research.train_ml --out semantic_research/artifacts/ml_slots.joblib
-```
-
-Default training uses **train split only**. `test` is refused. `val` is for
-explicit model-selection runs (`--splits train` or `--splits train` then score
-val separately). Uses per-slot clause features plus char TF-IDF +
-LogisticRegression. Missing model soft-fails. `ml_slots_v2.joblib` is the
-current train-only artifact; it may be selected explicitly by the audit sidecar.
-
-## Optional ROS audit sidecar
-
-The formal client can compare an already accepted Server JSON instruction with
-text-only research predictions. This is disabled by default and is log-only:
-it cannot alter instructions, reject a task, or block the controller.
-
-```bash
-export MATERIAL_SEMANTIC_AUDIT=1
-export MATERIAL_SEMANTIC_AUDIT_ML_MODEL=/workspace/baseline/semantic_research/artifacts/ml_slots_v2.joblib
-# Optional; CPU-heavy, log-only, and disabled unless explicitly set:
-export MATERIAL_SEMANTIC_AUDIT_SLM=1
-export MATERIAL_SEMANTIC_AUDIT_SLM_WEIGHTS=/workspace/baseline/semantic_research/artifacts/slm/qwen2.5-3b-instruct-q4_k_m.gguf
-```
-
-Logs use the `SEM_AUDIT` prefix and report only `MATCH`, `DIFF`, or an
-unavailable parser. ML's optional explicit-consistency guard is enabled by
-default in this sidecar, but remains a separately reportable research layer.
-
-## Optional model setup after clone
-
-Model artifacts are intentionally not stored in Git. The repository contains
-fixed-version setup scripts and a SHA256 manifest instead:
-
-```bash
-# Linux/WSL: install only the small research dependencies and retrain ML
-bash scripts/setup_semantic_research.sh --runtime --ml
-
-# Linux/WSL: additionally download and verify the 2.1 GB Qwen GGUF
-bash scripts/setup_semantic_research.sh --slm
-```
-
-On Windows PowerShell use the equivalent:
-
-```powershell
-.\scripts\setup_semantic_research.ps1 -Runtime -ML
-.\scripts\setup_semantic_research.ps1 -SLM
-```
-
-The LLM file is the official Qwen2.5-3B-Instruct-GGUF Q4_K_M artifact at a
-pinned Hugging Face revision. Its model card identifies the Qwen Research
-License; review that license before redistribution. The scripts never run as
-part of the formal client startup.
-
-## Local SLM (P4)
-
-```bash
-python -m semantic_research.run_slm_eval --rows-out artifacts/slm_rows.jsonl --metrics-out artifacts/slm_metrics.json
-```
-
-Default path does **not** download or load weights. Place a GGUF at
-`semantic_research/artifacts/slm/model.gguf` only for offline experiments.
-Prompt forbids inferring execution fields; **hard timeout via terminable
-subprocess** (generator and llama paths); schema validation before the shared
-evaluator.
-
-## One-shot
-
-```bash
+bash scripts/run_semantic_research_tests.sh
 bash scripts/run_semantic_research_eval.sh
 ```
 
-## Limits
+模型训练只使用规定的 train split，并保留元数据中的 `includes_test=false`。研究结果用于错误分析，不代表正式控制正确率。
 
-- Offline metrics never authorize control-path integration.
-- Formal stability and referee sync outrank NLP score improvements.
+研究依赖写在 `requirements-research.txt`，包括 scikit-learn、joblib、numpy/scipy 和可选的
+`llama-cpp-python`。GGUF/其他模型权重拥有独立许可证，默认放在 gitignored 的 `artifacts/`，
+不能直接打包到正式交付物；具体版本、下载地址和 SHA256 见 `MODEL_MANIFEST.json`。

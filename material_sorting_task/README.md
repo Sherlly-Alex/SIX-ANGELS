@@ -8,10 +8,11 @@ Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 当前已经整理出指令解析、感知、导航、几何计算和 ROS 2 Client 入口。`client_task.py`
 已经接入三任务连续调度状态机，并以 Server 裁判状态作为正式模式下的尝试结算、任务推进
 和得分真值。任务 1 已提供显式 `nav_only`、`pregrasp_only`、`contact_only` 和
-`lift_only` 分段测试模式。`task12_full` 保留为任务 1/2 回归模式；新增的 `task123_full`
+`lift_only` 分段测试模式。`task12_full` 保留为任务 1/2 回归模式；`task123_full`
 在同一套接口中继续接入任务 3：复用任务 1 的桌面抓取与抬升、任务 1 保存的货架状态，
 并使用货架白色长方体的测量中心计算左侧放置位和安全释放位。任务切换仍只由 Server
-裁判确认；该整合模式已经通过本地接口和状态机测试，需在 4090 官方镜像中逐段标定验证。
+裁判确认。历史 release candidate 曾通过官方 Server 的 160/160 和五 seed 验收；当前
+代码或新 seed 运行仍需按 scripts README 的流程重新保存证据。
 
 ## 目录
 
@@ -32,11 +33,13 @@ examples/material_sorting/
   reference/                     赛方示例与本地参考实现，不作为正式入口
 scripts/
   run_client.sh                  容器内正式启动脚本
+  competitionctl.sh              Server/Client 编排和远程验收入口
   run_desktop_grasp.sh           桌面抓取联调启动脚本
   setup_env_gpu.sh               ROS 2 / GPU 环境初始化
 tests/                            不依赖 ROS 2 的单元测试
-docs/                             架构和开发说明
 semantic_research/                离线语义旁路（Regex/ML/SLM），不进入正式控制链
+
+每个主要代码板块的算法、实现流程、接口和调试方式写在该板块目录的 README 中；项目级运行、测试和发布说明见仓库根目录 README。
 ```
 
 ## 运行
@@ -300,11 +303,12 @@ bash scripts/run_client.sh
 彩色方块并放回任务 1 保存的桌面原坐标。任务 2 的缓存货架状态只用于粗导航和层位；
 抓取前会在货架外采集多帧 RGB-D 目标物体中心、横向对中，再直线靠近，不读取 Server
 真实物体坐标。详细接口、目录和停机条件见
-[`docs/SHELF_TASK12_INTEGRATION.md`](docs/SHELF_TASK12_INTEGRATION.md)。
+[`examples/material_sorting/shelf/README.md`](examples/material_sorting/shelf/README.md) 和
+[`examples/material_sorting/executors/README.md`](examples/material_sorting/executors/README.md)。
 
 该模式仍会在本地安全检查失败时立即停止推进。
 
-桌面抓取联调（仅任务 1 或 3）见 [docs/DESKTOP_GRASP.md](docs/DESKTOP_GRASP.md)。
+桌面抓取联调、参数和接触反馈说明见 [examples/material_sorting/desktop_grasp/README.md](examples/material_sorting/desktop_grasp/README.md)。货架状态、空层确认和任务间记忆见 [examples/material_sorting/shelf/README.md](examples/material_sorting/shelf/README.md)。
 
 ## 测试
 
@@ -322,10 +326,6 @@ bash scripts/run_semantic_research_tests.sh
 bash scripts/run_semantic_research_eval.sh
 ```
 
-语义真值与旁路边界见 [docs/SEMANTIC_PARSING.md](docs/SEMANTIC_PARSING.md)、
-[docs/DEPENDENCIES_LICENSES.md](docs/DEPENDENCIES_LICENSES.md)、
-[semantic_research/README.md](semantic_research/README.md)。
+语义真值、研究旁路和依赖边界见 [semantic_research/README.md](semantic_research/README.md)。
 
-开发约束和后续实现顺序见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
-导航 v3 的兼容边界、接入结构和本地/SSH 验证步骤见
-[docs/NAVIGATION_V3_INTEGRATION.md](docs/NAVIGATION_V3_INTEGRATION.md)。
+调度、回放、RL 门禁和远程验收命令见 [examples/material_sorting/scheduler/README.md](examples/material_sorting/scheduler/README.md)、[examples/material_sorting/learning/README.md](examples/material_sorting/learning/README.md) 和 [scripts/README.md](scripts/README.md)。
