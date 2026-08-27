@@ -31,3 +31,5 @@ examples/material_sorting/models/3dgs/
 *.tar.gz
 nav_only_runtime_update_*.zip
 remote_sync*/
+*.before_*
+*.bak

@@ -1,0 +1,42 @@
+{
+  "actual_rl_takeovers": 0,
+  "agreement_count": 1842,
+  "async_abstain_count": 2477,
+  "async_abstain_rate": 0.5046862265688672,
+  "async_abstain_reasons": {
+    "inference_result_expired": 5,
+    "inference_result_stale": 17,
+    "submitted": 2455
+  },
+  "disagreement_count": 290,
+  "eligible_decisions": 4908,
+  "failures": [],
+  "fallback_count": 0,
+  "fallback_rate": 0.0,
+  "files": 5,
+  "inference_max_ms": 13.461185153573751,
+  "inference_p50_ms": 1.3429517857730389,
+  "inference_p95_ms": 1.9003218039870262,
+  "inference_p99_ms": 2.1446868777275085,
+  "limits": {
+    "max_inference_p95_ms": 25.0,
+    "max_runtime_fallback_rate": 0.01,
+    "min_suggestions": 2000
+  },
+  "masked_suggestion_violations": 0,
+  "model_sha256": [
+    "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785"
+  ],
+  "passed": true,
+  "replay_training_ready_decisions": 4908,
+  "runtime_fallback_count": 0,
+  "runtime_fallback_rate": 0.0,
+  "runtime_fallback_reasons": {},
+  "safety_abstain_count": 299,
+  "safety_abstain_rate": 0.06092094539527303,
+  "safety_abstain_reasons": {
+    "rl_dynamic_risk_guard": 299
+  },
+  "shadow_sessions": 5,
+  "suggestion_count": 2132
+}

@@ -41,8 +41,18 @@ def test_control_script_has_safe_explicit_rollback() -> None:
     assert "rollback)" in script
     assert "run_client \"$2\" heuristic" in script
     assert "MATERIAL_SCHEDULER_ENGINE=\"$engine\"" in script
+    assert "MATERIAL_SCHEDULER_RL_ENABLED=\"$rl_enabled\"" in script
     assert "OMP_NUM_THREADS=1" in script
     assert "verify_guarded_assets" in script
+    assert "policy=rl_shadow" in script
+    assert 'local mode="${2:-${MATERIAL_DEFAULT_CLIENT_MODE:-heuristic}}"' in script
+    release = (ROOT / "config" / "competition_release.env").read_text(encoding="utf-8")
+    assert "MATERIAL_DEFAULT_CLIENT_MODE=heuristic" in release
+    assert "MATERIAL_ARTIFACT_ROOT" in script
+    assert "server-detached" in script
+    assert "PYTHONUNBUFFERED=1" in script
+    assert "EXTERNAL_RL_MODEL_RELATIVE_PATH" in script
+    assert "EXTERNAL_RL_APPROVAL_SHA256" in script
 
 
 def test_deploy_requires_frozen_prefix_and_empty_target() -> None:

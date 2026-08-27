@@ -40,7 +40,7 @@ class Task3GeometryTests(unittest.TestCase):
         scoring = (-2.68, 0.540, 0.498)
         release = task3_safe_release_target(scoring, place_radius_m=0.24)
         self.assertAlmostEqual(release[0], -2.59, places=6)
-        self.assertAlmostEqual(release[1], 0.570, places=6)
+        self.assertAlmostEqual(release[1], 0.575, places=6)
         self.assertEqual(release[2], scoring[2])
         # Server task 3 uses a 0.24 m XY placement radius.  Keep explicit
         # margin instead of relying on a point right at its boundary.
@@ -53,10 +53,10 @@ class Task3GeometryTests(unittest.TestCase):
             place_radius_m=0.12,
             opening_yaw=math.pi / 2.0,
         )
-        # Radius 0.12 minus 0.04 margin and 0.03 lateral inset leaves a
-        # conservative 0.05 outward component in the rotated opening frame.
-        self.assertAlmostEqual(release[0], 0.97, places=6)
-        self.assertAlmostEqual(release[1], 2.05, places=6)
+        # Radius 0.12 minus 0.04 margin and 0.035 lateral inset leaves a
+        # conservative 0.045 outward component in the rotated opening frame.
+        self.assertAlmostEqual(release[0], 0.965, places=6)
+        self.assertAlmostEqual(release[1], 2.045, places=6)
         self.assertLess(math.dist(release[:2], scoring[:2]), 0.12)
 
 
@@ -90,12 +90,7 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
-        self.assertEqual(executor.TASK3_POST_RELEASE_INSERT_MARGIN_M, 0.04)
-        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.44)
-        self.assertGreater(
-            executor.TASK3_POST_RELEASE_PUSH_M,
-            executor.TASK3_POST_RELEASE_RETREAT_M,
-        )
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
         self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
 
     def test_executor_uses_task1_grasp_and_task3_orientation(self) -> None:
@@ -124,12 +119,7 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor.TASK3_RELEASE_SUPPORT_SETTLE_S, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_RETREAT_M, 0.40)
         self.assertEqual(executor.TASK3_POST_RELEASE_HALF_WIDTH_M, 0.065)
-        self.assertEqual(executor.TASK3_POST_RELEASE_INSERT_MARGIN_M, 0.04)
-        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.44)
-        self.assertGreater(
-            executor.TASK3_POST_RELEASE_PUSH_M,
-            executor.TASK3_POST_RELEASE_RETREAT_M,
-        )
+        self.assertEqual(executor.TASK3_POST_RELEASE_PUSH_M, 0.38)
         self.assertEqual(executor.TASK3_POST_PUSH_RETREAT_M, 0.45)
         self.assertTrue(executor._held_insert.allow_extension)
         self.assertEqual(executor._held_insert.max_translation_m, 0.30)
@@ -263,9 +253,9 @@ class Task3IntegrationWiringTests(unittest.TestCase):
         self.assertEqual(executor._task3_white_layer, 1)
         self.assertAlmostEqual(executor._task3_scoring_place[1], 0.540, places=6)
         self.assertAlmostEqual(executor._place_world[0], -2.590, places=6)
-        self.assertAlmostEqual(executor._place_world[1], 0.570, places=6)
+        self.assertAlmostEqual(executor._place_world[1], 0.575, places=6)
         self.assertAlmostEqual(
-            executor._task3_release_lateral_inset_m, 0.030, places=6
+            executor._task3_release_lateral_inset_m, 0.035, places=6
         )
         self.assertEqual(executor._task3_place_radius_m, 0.24)
 
@@ -286,13 +276,13 @@ class Task3IntegrationWiringTests(unittest.TestCase):
                 attempt=1,
             )
         )
-        # 0.10 radius minus 0.04 margin and 0.03 lateral inset leaves a
-        # conservative 0.03 outward release component.
-        self.assertAlmostEqual(executor._place_world[0], -2.65, places=6)
-        self.assertAlmostEqual(executor._place_world[1], 0.57, places=6)
+        # Preserve the instruction radius after applying the frozen 0.035 m
+        # lateral inset and 0.04 m scoring margin.
+        self.assertAlmostEqual(executor._place_world[0], -2.655, places=6)
+        self.assertAlmostEqual(executor._place_world[1], 0.575, places=6)
         self.assertEqual(executor._task3_place_radius_m, 0.10)
 
-    def test_release_inset_preserves_minimum_measured_prop_separation(self) -> None:
+    def test_release_keeps_formal_lateral_clearance_from_prop(self) -> None:
         executor = Task3IntegratedExecutor(self._memory())
         executor._ensure_task3_place_target(
             ExecutionContext(
@@ -312,8 +302,8 @@ class Task3IntegrationWiringTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(executor._task3_release_lateral_inset_m, 0.03)
-        self.assertAlmostEqual(executor._place_world[1], 0.620, places=6)
+        self.assertEqual(executor._task3_release_lateral_inset_m, 0.035)
+        self.assertAlmostEqual(executor._place_world[1], 0.625, places=6)
 
     def test_deeper_release_keeps_previous_shallow_base_stand_depth(self) -> None:
         # The target moved 0.08 m inward while arm insertion increased by the

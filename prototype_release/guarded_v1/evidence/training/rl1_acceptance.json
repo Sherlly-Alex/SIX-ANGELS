@@ -1,0 +1,20 @@
+{
+  "code_revision": "rl2-1-contextual-20260826",
+  "dataset_sha256": "32f8f269ba05d68de30eedbe78ead2a8f1ab7abd2e150499f3c604f08bdb6260",
+  "device": "auto",
+  "failures": [],
+  "gae_lambda": 1.0,
+  "gamma": 0.0,
+  "heldout_report": "/workspace/output/contextual_success_seed20260826/heldout_acceptance.json",
+  "model_package_report": "/workspace/output/contextual_success_seed20260826/model_package_acceptance.json",
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "next_allowed_mode": "rl_shadow",
+  "passed": true,
+  "pipeline": "rl-1",
+  "rl_guarded_authorized": false,
+  "seed": 20260826,
+  "split_manifest": "/workspace/output/contextual_success_seed20260826/split/split_manifest.json",
+  "split_manifest_sha256": "c825c4ef7e7ccf04bbd0abab3a6ec0676829703313b7172eedcb2c5bc5212f56",
+  "timesteps": 150000,
+  "training_only_dataset_sha256": "5fefe989ee4f07c7554817863646fbfc29ca7c817e72074587ae4857f67427f2"
+}

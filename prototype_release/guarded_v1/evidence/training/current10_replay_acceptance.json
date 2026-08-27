@@ -1,0 +1,21 @@
+{
+  "candidate_events": 11383,
+  "failures": [],
+  "files": 10,
+  "heuristic_selection_count": 7527,
+  "hysteresis_selection_count": 2415,
+  "invalid_selections": 0,
+  "legacy_decisions": 0,
+  "malformed_lines": 0,
+  "maximum_heuristic_regret": 0.3867049773450981,
+  "mean_heuristic_regret": 0.026114659289258126,
+  "no_safe_candidate_decisions": 1441,
+  "paired_decisions": 11383,
+  "passed": true,
+  "rl_selection_count": 0,
+  "selection_events": 11383,
+  "sessions": 10,
+  "training_ready_decisions": 9942,
+  "unpaired_candidate_events": 0,
+  "unpaired_selection_events": 0
+}

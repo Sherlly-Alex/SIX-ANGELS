@@ -1,0 +1,10 @@
+{
+  "failures": [],
+  "metadata_path": "/workspace/output/contextual_success_seed20260826/model/scheduler_policy.zip.metadata.json",
+  "model_path": "/workspace/output/contextual_success_seed20260826/model/scheduler_policy.zip",
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "observation_schema_hash": "b9822b0819a43a7fb9289d4452e9d152df5c8d848cb1327309d4d7f979efa2fd",
+  "passed": true,
+  "provenance_file_count": 2,
+  "training_config_sha256": "d5ee196e42e062683b1992f3ecb7c233edde8191517feec4ce6296888e68f743"
+}

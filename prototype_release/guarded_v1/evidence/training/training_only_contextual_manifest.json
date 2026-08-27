@@ -1,0 +1,15 @@
+{
+  "dataset": "/workspace/output/training_only_contextual.jsonl",
+  "dataset_bytes": 161417908,
+  "dataset_sha256": "5fefe989ee4f07c7554817863646fbfc29ca7c817e72074587ae4857f67427f2",
+  "failures": [],
+  "official_root": "/workspace/historical",
+  "passed": true,
+  "record_count": 58536,
+  "simulation_root": "/workspace/simulation",
+  "source_counts": {
+    "project-sim": 47619,
+    "shadow": 10917
+  },
+  "training_ready_decisions": 58536
+}

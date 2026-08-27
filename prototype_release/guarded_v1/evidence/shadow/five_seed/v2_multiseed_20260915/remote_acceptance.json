@@ -1,0 +1,57 @@
+{
+  "candidate_applications": {
+    "applied_count": 7,
+    "duplicate_application_count": 0,
+    "event_count": 34,
+    "failures": [],
+    "limits": {
+      "min_applied_candidates": 1,
+      "min_noncenter_applied": 0,
+      "reject_duplicates": true
+    },
+    "noncenter_applied_count": 7,
+    "passed": true,
+    "status_counts": {
+      "applied": 7,
+      "audit_only": 26,
+      "too_late": 1
+    },
+    "terminal_event_found": true,
+    "unique_applied_action_count": 7
+  },
+  "expected_score": 160,
+  "failures": [],
+  "fatal_counts": {
+    "controller_blocked": 0,
+    "controller_safe_hold": 0,
+    "executor_error": 0,
+    "unsafe_collision": 0
+  },
+  "final_score": 160,
+  "measured_carry": null,
+  "passed": true,
+  "runtime_health": {
+    "evaluated_event_count": 2225,
+    "execution_deadline_miss_rate": 0.003074916138650764,
+    "failures": [],
+    "interval_deadline_miss_rate": 0.002609262883235486,
+    "limits": {
+      "max_deadline_miss_rate": 0.01,
+      "max_execution_p95_ms": 50.0,
+      "max_interval_p95_ms": 65.0,
+      "max_interval_p99_ms": 125.0
+    },
+    "max_execution_p95_ms": 13.508189003914595,
+    "max_interval_p95_ms": 58.842211961746216,
+    "max_interval_p99_ms": 99.61243392899632,
+    "passed": true,
+    "report_count": 104,
+    "session_event_count": 2225,
+    "terminal_event_found": true
+  },
+  "server_all_tasks_done": true,
+  "task_cumulative_scores": {
+    "1": 40,
+    "2": 100
+  }
+}

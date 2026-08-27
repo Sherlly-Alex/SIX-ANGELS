@@ -1,0 +1,7 @@
+{
+  "failures": [],
+  "manifest_path": "release_assets\\rl_guarded\\scheduler_guarded_approval.json",
+  "manifest_sha256": "0f92ad4a1a0039c9dbefc54d3710aeba38910b0aaf259a443db7dd9af9a95f0a",
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "passed": true
+}

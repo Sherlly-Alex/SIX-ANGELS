@@ -1,0 +1,39 @@
+{
+  "failures": [],
+  "gate": {
+    "baselines": {
+      "test": 250.02489007797126,
+      "validation": 249.16743182194585
+    },
+    "criteria": {
+      "baseline_not_worse_than_tolerance": 0.02,
+      "completed_equals_episodes": true,
+      "masked_action_violations": 0,
+      "oracle_tolerance": 0.02,
+      "policy_errors": 0
+    },
+    "failures": [],
+    "oracles": {
+      "test": 256.0,
+      "validation": 256.0
+    },
+    "passed": true,
+    "test": {
+      "completed_episodes": 20,
+      "episodes": 20,
+      "masked_action_violations": 0,
+      "mean_return": 251.2245201331044,
+      "policy_errors": 0
+    },
+    "validation": {
+      "completed_episodes": 20,
+      "episodes": 20,
+      "masked_action_violations": 0,
+      "mean_return": 250.39519743216596,
+      "policy_errors": 0
+    }
+  },
+  "manifest_sha256": "c825c4ef7e7ccf04bbd0abab3a6ec0676829703313b7172eedcb2c5bc5212f56",
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "passed": true
+}

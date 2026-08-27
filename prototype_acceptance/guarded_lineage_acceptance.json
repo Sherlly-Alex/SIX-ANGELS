@@ -1,0 +1,192 @@
+{
+  "applied_count": 16,
+  "failures": [],
+  "files": 2,
+  "passed": true,
+  "results": [
+    {
+      "applications": [
+        {
+          "action_id": "task1:navigate_to_pick:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "navigate_to_pick",
+          "step_run_id": "61aa5472d7a8409db9187a91de5db5b5",
+          "task_id": 1
+        },
+        {
+          "action_id": "task1:transport:stand:center",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "transport",
+          "step_run_id": "861f9914701043068ede5b29eacdc0f4",
+          "task_id": 1
+        },
+        {
+          "action_id": "task1:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "e8284432331d4144af237d5a494dd132",
+          "task_id": 1
+        },
+        {
+          "action_id": "task2:navigate_to_pick:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "navigate_to_pick",
+          "step_run_id": "2e611b5395214f0483e82032b71a4993",
+          "task_id": 2
+        },
+        {
+          "action_id": "task2:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "8998f9ee17d84951879c7c4eb22ca9cb",
+          "task_id": 2
+        },
+        {
+          "action_id": "task3:transport:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "transport",
+          "step_run_id": "e42e5316d71746fea7dc9ff979db8a47",
+          "task_id": 3
+        },
+        {
+          "action_id": "task3:transport:stand:right",
+          "classification": "rl_direct",
+          "source_counts": {
+            "hysteresis": 4,
+            "rl": 1
+          },
+          "step_id": "transport",
+          "step_run_id": "e42e5316d71746fea7dc9ff979db8a47",
+          "task_id": 3
+        },
+        {
+          "action_id": "task3:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "bab578ae42014fbc8fcd2f922e9541ce",
+          "task_id": 3
+        }
+      ],
+      "applied_count": 8,
+      "events_path": "prototype_release\\guarded_v1\\evidence\\guarded\\seeds_20260918_20260919\\v2_multiseed_20260918\\scheduler_v2_multiseed_20260918.jsonl",
+      "lineage_summary": {
+        "rl_direct": 8
+      },
+      "rl_origin_applied": 8
+    },
+    {
+      "applications": [
+        {
+          "action_id": "task1:navigate_to_pick:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "navigate_to_pick",
+          "step_run_id": "48a3cb31db604ff7bc4c550994ff4675",
+          "task_id": 1
+        },
+        {
+          "action_id": "task1:transport:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "transport",
+          "step_run_id": "2b1a5f60f5d64ee3b8db0e546b51da74",
+          "task_id": 1
+        },
+        {
+          "action_id": "task1:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "38ba4f09658f4a5690aeb2226489da80",
+          "task_id": 1
+        },
+        {
+          "action_id": "task2:navigate_to_pick:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "navigate_to_pick",
+          "step_run_id": "1852eef0cf824cbc82bb0d04c051f483",
+          "task_id": 2
+        },
+        {
+          "action_id": "task2:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "392f7bf1185c44c9b24222847d2667b8",
+          "task_id": 2
+        },
+        {
+          "action_id": "task2:return_to_end:stand:right",
+          "classification": "rl_direct",
+          "source_counts": {
+            "hysteresis": 11,
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "392f7bf1185c44c9b24222847d2667b8",
+          "task_id": 2
+        },
+        {
+          "action_id": "task3:transport:stand:right",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "transport",
+          "step_run_id": "28aa6060c2704b3e9114fcaaa22befe0",
+          "task_id": 3
+        },
+        {
+          "action_id": "task3:return_to_end:stand:left",
+          "classification": "rl_direct",
+          "source_counts": {
+            "rl": 1
+          },
+          "step_id": "return_to_end",
+          "step_run_id": "8e4b9b607e744bb58d0ab040011b06e6",
+          "task_id": 3
+        }
+      ],
+      "applied_count": 8,
+      "events_path": "prototype_release\\guarded_v1\\evidence\\guarded\\seeds_20260918_20260919\\v2_multiseed_20260919\\scheduler_v2_multiseed_20260919.jsonl",
+      "lineage_summary": {
+        "rl_direct": 8
+      },
+      "rl_origin_applied": 8
+    }
+  ],
+  "rl_origin_applied": 16,
+  "schema_version": "guarded-lineage-acceptance-v1"
+}

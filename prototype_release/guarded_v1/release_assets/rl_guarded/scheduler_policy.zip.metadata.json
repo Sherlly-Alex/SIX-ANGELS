@@ -1,0 +1,33 @@
+{
+  "algorithm": "MaskablePPO",
+  "metadata_schema_version": "scheduler-model-metadata-v1",
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "observation_schema_hash": "b9822b0819a43a7fb9289d4452e9d152df5c8d848cb1327309d4d7f979efa2fd",
+  "observation_schema_version": "scheduler-observation-v1",
+  "provenance_files": [
+    {
+      "name": "train.jsonl",
+      "sha256": "3a6d521f2db06555fabeec8281469b273e09ebf7adbb4d294420dff6f9cd0a76",
+      "size_bytes": 174990633
+    },
+    {
+      "name": "split_manifest.json",
+      "sha256": "c825c4ef7e7ccf04bbd0abab3a6ec0676829703313b7172eedcb2c5bc5212f56",
+      "size_bytes": 559333
+    }
+  ],
+  "training_config": {
+    "batch_size": 64,
+    "code_revision": "rl2-1-contextual-20260826",
+    "device": "auto",
+    "environment_factory": "learning.replay_env:build_replay_env",
+    "gae_lambda": 1.0,
+    "gamma": 0.0,
+    "learning_rate": 0.0003,
+    "max_candidates": 8,
+    "n_steps": 256,
+    "seed": 20260826,
+    "total_timesteps": 150000
+  },
+  "training_config_sha256": "d5ee196e42e062683b1992f3ecb7c233edde8191517feec4ce6296888e68f743"
+}

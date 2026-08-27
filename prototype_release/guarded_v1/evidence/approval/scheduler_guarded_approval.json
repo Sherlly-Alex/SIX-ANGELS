@@ -1,0 +1,18 @@
+{
+  "benchmark": {
+    "blind_seed_count": 500,
+    "report_sha256": "57038263116e3335461ad2a596468099ea4f0196e7041bdb61f9ab179a6904d8",
+    "rl_inference_p95_ms": 3.6984640173614025
+  },
+  "model_sha256": "5340c47b1fbcfaf799667e1b36a2474e7809817abca78e38875f690a222fb785",
+  "observation_schema_hash": "b9822b0819a43a7fb9289d4452e9d152df5c8d848cb1327309d4d7f979efa2fd",
+  "schema_version": "scheduler-policy-approval-v1",
+  "shadow": {
+    "fallback_rate": 0.0,
+    "inference_p95_ms": 1.9003218039870262,
+    "report_sha256": "829cf810053ddadc457ec87a8595eb42f4c9550596b27845ef0a1b90a5c5e442",
+    "session_count": 5,
+    "suggestion_count": 2132
+  },
+  "training_config_sha256": "d5ee196e42e062683b1992f3ecb7c233edde8191517feec4ce6296888e68f743"
+}

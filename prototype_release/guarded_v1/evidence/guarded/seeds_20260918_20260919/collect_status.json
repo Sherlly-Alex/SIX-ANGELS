@@ -1,0 +1,28 @@
+{
+  "completed_seeds": [
+    20260918,
+    20260919
+  ],
+  "fail_fast": true,
+  "passed": true,
+  "promotion_allowed": false,
+  "runs": [
+    {
+      "client_log": "/home/abc123/rl2_validation/rl2_guarded_canary_20260918_20260919_r1/v2_multiseed_20260918/client_v2_multiseed_20260918.log",
+      "failures": [],
+      "passed": true,
+      "score": 160,
+      "seed": 20260918,
+      "server_log": "/home/abc123/rl2_validation/rl2_guarded_canary_20260918_20260919_r1/v2_multiseed_20260918/server_v2_multiseed_20260918.log"
+    },
+    {
+      "client_log": "/home/abc123/rl2_validation/rl2_guarded_canary_20260918_20260919_r1/v2_multiseed_20260919/client_v2_multiseed_20260919.log",
+      "failures": [],
+      "passed": true,
+      "score": 160,
+      "seed": 20260919,
+      "server_log": "/home/abc123/rl2_validation/rl2_guarded_canary_20260918_20260919_r1/v2_multiseed_20260919/server_v2_multiseed_20260919.log"
+    }
+  ],
+  "stopped_at_seed": null
+}

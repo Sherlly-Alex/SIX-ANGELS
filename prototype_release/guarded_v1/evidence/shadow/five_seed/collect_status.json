@@ -1,0 +1,19 @@
+{
+  "completed_seeds": [
+    20260915
+  ],
+  "fail_fast": true,
+  "passed": true,
+  "promotion_allowed": false,
+  "runs": [
+    {
+      "client_log": "/home/abc123/rl2_validation/rl2_1_shadow_asyncfix_pairs_20260911_20260912_r1/shadow/v2_multiseed_20260915/client_v2_multiseed_20260915.log",
+      "failures": [],
+      "passed": true,
+      "score": 160,
+      "seed": 20260915,
+      "server_log": "/home/abc123/rl2_validation/rl2_1_shadow_asyncfix_pairs_20260911_20260912_r1/shadow/v2_multiseed_20260915/server_v2_multiseed_20260915.log"
+    }
+  ],
+  "stopped_at_seed": null
+}

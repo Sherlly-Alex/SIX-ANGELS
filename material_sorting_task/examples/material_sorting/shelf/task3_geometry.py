@@ -19,11 +19,11 @@ TASK3_SHELF_DEPTH_OFFSET_M = 0.050
 # The shelf board front is about x=-2.49 and the carried box extends 0.08 m
 # outward from its centre.  A 0.17 m outward offset put roughly 0.06 m of the
 # box beyond the support edge and it fell after release.  Keep the centre only
-# 0.09 m outward from the formal target, and move at most 0.03 m toward the
+# 0.09 m outward from the formal target, and move at most 0.035 m toward the
 # packaging prop; the executor further bounds that inset using the measured
 # prop separation.
 TASK3_SAFE_RELEASE_REAR_M = 0.090
-TASK3_SAFE_RELEASE_CENTER_INSET_M = 0.030
+TASK3_SAFE_RELEASE_CENTER_INSET_M = 0.035
 TASK3_SAFE_RELEASE_RADIUS_MARGIN_M = 0.040
 TASK3_BOX_HALF_Z_M = 0.095
 

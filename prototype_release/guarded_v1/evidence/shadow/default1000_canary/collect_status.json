@@ -1,0 +1,19 @@
+{
+  "completed_seeds": [
+    20260916
+  ],
+  "fail_fast": true,
+  "passed": true,
+  "promotion_allowed": false,
+  "runs": [
+    {
+      "client_log": "/home/abc123/rl2_validation/rl2_1_shadow_default1000_canary_20260916_r1/v2_multiseed_20260916/client_v2_multiseed_20260916.log",
+      "failures": [],
+      "passed": true,
+      "score": 160,
+      "seed": 20260916,
+      "server_log": "/home/abc123/rl2_validation/rl2_1_shadow_default1000_canary_20260916_r1/v2_multiseed_20260916/server_v2_multiseed_20260916.log"
+    }
+  ],
+  "stopped_at_seed": null
+}
