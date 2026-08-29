@@ -79,7 +79,7 @@ class Task2FailureCodeTests(unittest.TestCase):
         self.assertIs(result.status, StageStatus.RETRYABLE_FAILURE)
         self.assertIs(result.failure_code, FailureCode.NAV_STUCK)
 
-    def test_shelf_center_timeout_is_recoverable_target_lost(self) -> None:
+    def test_shelf_center_timeout_requests_one_bounded_camera_refresh(self) -> None:
         executor = self.build_executor()
         executor._phase = "acquire_center"
         executor._phase_started_s = 0.0
@@ -90,8 +90,26 @@ class Task2FailureCodeTests(unittest.TestCase):
             context(executor.SHELF_CENTER_ACQUIRE_TIMEOUT_S + 0.1, task=2, color="brown")
         )
 
-        self.assertIs(result.status, StageStatus.RETRYABLE_FAILURE)
-        self.assertIs(result.failure_code, FailureCode.TARGET_LOST)
+        self.assertIs(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "refresh_camera")
+        self.assertTrue(executor._camera_reacquire_used)
+
+    def test_empty_second_shelf_center_window_uses_preserved_rgbd_center(self) -> None:
+        executor = self.build_executor()
+        executor._phase = "acquire_center"
+        executor._phase_started_s = 0.0
+        executor._camera_reacquire_used = True
+        executor._locked_target_world = (-2.55, 0.81, 0.84)
+        executor._coarse_target_world = (-2.55, 0.81, 0.84)
+
+        result = executor._tick_align_for_pick(
+            context(executor.SHELF_CENTER_ACQUIRE_TIMEOUT_S + 0.1, task=2, color="brown")
+        )
+
+        self.assertIs(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "approach_pick")
+        self.assertEqual(executor._locked_target_world, (-2.55, 0.81, 0.84))
+        self.assertIn("constrained fallback", result.message)
 
 
 class Task3FailureCodeTests(unittest.TestCase):

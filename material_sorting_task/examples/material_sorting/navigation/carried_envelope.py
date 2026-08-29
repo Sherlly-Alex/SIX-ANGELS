@@ -230,6 +230,17 @@ class CarriedEnvelopeChecker:
             f"{minimum_clearance:.3f} m ({minimum_pair})",
         )
 
+    def obstacle_bounds(
+        self, name: str
+    ) -> tuple[float, float, float, float] | None:
+        """Return ``(xmin, xmax, ymin, ymax)`` for a named static obstacle."""
+
+        key = str(name)
+        for obstacle_name, rectangle in self._obstacles:
+            if obstacle_name == key:
+                return tuple(float(value) for value in rectangle)
+        return None
+
     def check_path(
         self,
         start_pose: tuple[float, float, float],

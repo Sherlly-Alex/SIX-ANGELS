@@ -371,6 +371,53 @@ class ShelfStateTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.semantic_empty_candidate, 1)
         self.assertIn("empty=none", tracker.diagnostic_summary)
 
+    def test_missing_colored_l1_is_observation_hint_not_shelf_state(self) -> None:
+        tracker = ShelfStateTracker(
+            required_votes=3,
+            require_empty_confirmation=True,
+        )
+
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = tracker.update(
+                {
+                    "packaging_box": observation(
+                        "packaging_box", (-2.63, 0.778, 0.837), stamp
+                    ),
+                    "shelf_empty": observation(
+                        "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+                expected_colored_class_id="brown",
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNone(tracker.result())
+        self.assertEqual(tracker.missing_colored_layer_candidate, 1)
+
+        for stamp in (4.0, 5.0, 6.0):
+            result = tracker.update(
+                {
+                    "brown": observation(
+                        "brown", (-2.63, 0.778, 0.530), stamp
+                    ),
+                    "packaging_box": observation(
+                        "packaging_box", (-2.63, 0.778, 0.837), stamp
+                    ),
+                    "shelf_empty": observation(
+                        "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                    ),
+                },
+                now_s=stamp,
+                carried_class_id="yellow",
+                expected_colored_class_id="brown",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertIsNone(tracker.missing_colored_layer_candidate)
+
 
 class StableTargetCenterTrackerTests(unittest.TestCase):
     def test_task2_tracker_rejects_visible_surface_fallbacks(self) -> None:
@@ -679,6 +726,65 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.status, StageStatus.RUNNING)
         self.assertEqual(executor._phase, "scan_shelf")
+
+    def test_task1_l1_recovery_also_handles_missing_colored_target(self) -> None:
+        class RecordingSlideHold:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def plan(self, hold_command, _target_slide, _joint_states):
+                self.calls += 1
+                return hold_command
+
+        memory = CompetitionTaskMemory()
+        memory.record_task1_origin((-0.22, 2.20, 0.84), "yellow")
+        executor = Task1IntegratedExecutor(memory)
+        executor.configure_instructions(
+            (
+                {"task": 1, "target_color": "yellow"},
+                {"task": 2, "target_color": "brown"},
+            )
+        )
+        executor._held_center_base = (0.70, 0.0, 0.96)
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._phase = "scan_shelf"
+        executor._stage_started_s = 0.0
+        slide = RecordingSlideHold()
+        executor._slide_hold = slide
+
+        result = None
+        for stamp in (1.0, 2.0, 3.0):
+            result = executor._tick_align_for_place(
+                ExecutionContext(
+                    now_s=stamp,
+                    instruction={"task": 1, "target_color": "yellow"},
+                    task_index=1,
+                    attempt=1,
+                    target_observations={
+                        "packaging_box": observation(
+                            "packaging_box", (-2.63, 0.778, 0.837), stamp
+                        ),
+                        "shelf_empty": observation(
+                            "shelf_empty", (-2.63, 0.778, 1.166), stamp
+                        ),
+                    },
+                )
+            )
+
+        assert result is not None
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "l1_visibility_clearance")
+        self.assertEqual(slide.calls, 1)
+        self.assertIn("missing colored target", result.message)
+        self.assertIsNone(executor._shelf_state)
+        self.assertIsNone(memory.shelf_state)
 
     def test_task1_direct_route_uses_project_geometry_not_legacy_turn_point(self) -> None:
         memory = CompetitionTaskMemory()

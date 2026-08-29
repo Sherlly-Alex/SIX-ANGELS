@@ -38,6 +38,42 @@ def material_grid_with_cached_distance_map():
 
 
 class NavigationControllerTests(unittest.TestCase):
+    def test_experimental_linear_scale_remains_inside_safety_limiter(self) -> None:
+        controller = NavigationController(
+            material_grid_with_cached_distance_map(),
+            SpeedLimits(0.20, 0.65, 0.35, 1.20, 0.20, 0.50),
+            pos_tolerance=0.08,
+            yaw_tolerance=0.05,
+            timeout=60.0,
+            emergency_distance=0.20,
+        )
+        goal = NavigationGoal(
+            x=-0.70,
+            y=1.55,
+            yaw=math.pi / 2.0,
+            position_tolerance=0.08,
+            yaw_tolerance=0.05,
+            safety_radius=0.65,
+            segment=NavigationSegment.NAV_TABLE,
+            source_tag="scaled_test",
+        )
+        x, y, yaw = -0.70, 0.55, math.pi / 2.0
+        self.assertTrue(controller.set_goal(goal, x, y))
+
+        for _ in range(400):
+            command = controller.update(
+                x, y, yaw, 0.05, None, linear_scale=2.0
+            )
+            self.assertLessEqual(abs(command.linear_x), 0.20 + 1e-9)
+            self.assertLessEqual(abs(command.angular_z), 0.65 + 1e-9)
+            x += command.linear_x * math.cos(yaw) * 0.05
+            y += command.linear_x * math.sin(yaw) * 0.05
+            yaw = (yaw + command.angular_z * 0.05 + math.pi) % (2.0 * math.pi) - math.pi
+            if controller.status is NavigationStatus.GOAL_REACHED:
+                break
+
+        self.assertEqual(controller.status, NavigationStatus.GOAL_REACHED)
+
     def test_long_segment_lookahead_starts_from_robot_projection(self) -> None:
         goal = select_local_goal(
             4.0,

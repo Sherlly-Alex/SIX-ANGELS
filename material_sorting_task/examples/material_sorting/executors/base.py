@@ -130,6 +130,9 @@ class ExecutionContext:
     score: int = 0
     unsafe_collision: bool = False
     input_ages_s: Mapping[str, float] = field(default_factory=dict)
+    # Optional RGB-D rolling-map hint.  None preserves the validated path.
+    # It is populated only when MATERIAL_LOCAL_MAP=1.
+    local_map_advice: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

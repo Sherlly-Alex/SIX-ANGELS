@@ -9,7 +9,12 @@ Pipeline:
   -> camera pose from MMK2 FK transforms points to world frame
   -> complete color-mask RGB-D cloud fits the cuboid geometric center
   -> fitted geometric center is published on /material/detections
+When ``MATERIAL_LOCAL_MAP=1``, the same decoded depth frame is also fused
+into the optional local height map (throttled) and advice is published on
+``/material/local_map_advice`` so ``client_task`` does not subscribe depth
+twice.
 """
+import json
 import os
 import argparse
 import numpy as np
@@ -21,7 +26,7 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo, JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection3DArray, Detection3D, ObjectHypothesisWithPose
 
@@ -31,9 +36,18 @@ from perception.shelf_empty_confirm import ShelfEmptyLayerVerifier
 try:
     from .backends import COLOR_HSV, ColorBackend, GtProjectionBackend, YoloBackend
     from .gt_direct_backend import GtDirectBackend
+    from .local_map import local_map_enabled, local_map_min_interval_s
+    from .local_map_sidecar import LocalMapSidecar
 except ImportError:
     from backends import COLOR_HSV, ColorBackend, GtProjectionBackend, YoloBackend
     from gt_direct_backend import GtDirectBackend
+    try:
+        from local_map import local_map_enabled, local_map_min_interval_s
+        from local_map_sidecar import LocalMapSidecar
+    except ImportError:
+        local_map_enabled = lambda default=False: False  # type: ignore
+        local_map_min_interval_s = lambda default_hz=0.5: 2.0  # type: ignore
+        LocalMapSidecar = None  # type: ignore
 
 LAYOUT_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "material_competition_layout.json")
@@ -122,6 +136,27 @@ class BoxDetectNode(Node):
         self.shelf_empty_verifier = (
             None if backend == "gt_direct" else ShelfEmptyLayerVerifier()
         )
+        self._last_odom_msg = None
+        self.local_map_sidecar = None
+        self.local_map_advice_pub = None
+        self._local_map_last_tick_s = 0.0
+        self._local_map_min_interval_s = 2.0
+        if local_map_enabled(False) and LocalMapSidecar is not None:
+            try:
+                self._local_map_min_interval_s = local_map_min_interval_s()
+                self.local_map_sidecar = LocalMapSidecar(log=self.get_logger().info)
+                if self.local_map_sidecar.enabled:
+                    self.local_map_advice_pub = self.create_publisher(
+                        String,
+                        "/material/local_map_advice",
+                        5,
+                    )
+                    self.get_logger().info(
+                        self.local_map_sidecar.describe() + " (fused in box_detect)"
+                    )
+            except Exception as exc:  # pragma: no cover - ROS runtime guard
+                self.local_map_sidecar = None
+                self.get_logger().warning(f"local map disabled: {exc}")
 
         self.backend_name = backend
         if backend == "gt":
@@ -186,10 +221,47 @@ class BoxDetectNode(Node):
                      jp.get("head_pitch_joint", self.head[1])]
 
     def odom_cb(self, msg):
+        self._last_odom_msg = msg
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         self.base_pos = [p.x, p.y, p.z]
         self.base_quat = [q.w, q.x, q.y, q.z]
+
+    def _maybe_update_local_map(
+        self,
+        depth_img,
+        T_cam_world,
+        stamp_s: float,
+        now_s: float,
+    ) -> None:
+        if self.local_map_sidecar is None or not self.local_map_sidecar.enabled:
+            return
+        if self._last_odom_msg is None or self.K is None:
+            return
+        if (
+            self._local_map_last_tick_s > 0.0
+            and (now_s - self._local_map_last_tick_s) < self._local_map_min_interval_s
+        ):
+            return
+        depth_u16 = np.asarray(depth_img)
+        if depth_u16.ndim == 3:
+            depth_u16 = depth_u16[:, :, 0]
+        if np.issubdtype(depth_u16.dtype, np.floating):
+            depth_u16 = np.clip(depth_u16 * 1000.0, 0, 65535).astype(np.uint16)
+        else:
+            depth_u16 = depth_u16.astype(np.uint16, copy=False)
+        self.local_map_sidecar.set_camera_info_K(self.K)
+        self.local_map_sidecar.set_depth_image(depth_u16, stamp_s=stamp_s)
+        advice = self.local_map_sidecar.on_tick(
+            now_s=now_s,
+            odometry=self._last_odom_msg,
+            t_cam_world=T_cam_world,
+        )
+        if self.local_map_advice_pub is not None:
+            out = String()
+            out.data = json.dumps(advice.as_dict())
+            self.local_map_advice_pub.publish(out)
+        self._local_map_last_tick_s = now_s
 
     # ---- camera->world ----
     def camera_world_tmat(self):
@@ -679,6 +751,16 @@ class BoxDetectNode(Node):
         if should_log_detections:
             self.last_detection_log_t = now_t
 
+        now_t = self.get_clock().now().nanoseconds * 1e-9
+        stamp_s = float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+        try:
+            self._maybe_update_local_map(depth, T_cam_world, stamp_s, now_t)
+        except Exception as exc:  # pragma: no cover - runtime fail-open guard
+            self.get_logger().warning(
+                f"local map disabled after frame integration failure: {exc}"
+            )
+            self.local_map_sidecar = None
+            self.local_map_advice_pub = None
         self.publish_detections(out, msg.header.stamp)
         if self.pub_res_img:
             self.img_pub.publish(self.bridge.cv2_to_imgmsg(vis, "bgr8"))

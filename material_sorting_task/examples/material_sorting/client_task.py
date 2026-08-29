@@ -56,6 +56,15 @@ from runtime_health import (
 )
 from scheduler.models import FailureCode
 
+try:
+    from perception.local_map import local_map_enabled
+except ImportError:
+    try:
+        from local_map import local_map_enabled  # type: ignore
+    except ImportError:
+        def local_map_enabled(default: bool = False) -> bool:  # type: ignore
+            return bool(default)
+
 
 class ClientPhase(Enum):
     WAITING_FOR_SERVER = auto()
@@ -98,6 +107,7 @@ class CompetitionClient(Node):
         self.target_observations: dict[str, TargetObservation] = {}
         self._last_wait_log_ns = 0
         self._last_progress_log_ns = 0
+        self._task3_lateral_progress_logged = False
         self._last_controller_serial = -1
         self._last_shadow_divergence_count = 0
         self._last_scheduler_action_id: str | None = None
@@ -108,6 +118,9 @@ class CompetitionClient(Node):
         self._input_fault_injector = InputDropFaultInjector(
             os.environ.get("MATERIAL_INPUT_FAULT_DIR", "")
         )
+        self._local_map_relay_enabled = local_map_enabled(False)
+        self._local_map_advice_dict: dict | None = None
+        self._local_map_last_log_s = 0.0
 
         try:
             self._freshness_watchdog = InputFreshnessWatchdog(
@@ -159,6 +172,22 @@ class CompetitionClient(Node):
             )
             carry_guard_value = "0"
         carry_guard_requested = carry_guard_value in {"1", "true", "yes"}
+        lateral_guard_value = os.environ.get(
+            "MATERIAL_TASK3_LATERAL_GUARD", "1"
+        ).strip().lower()
+        if lateral_guard_value not in {"0", "1", "false", "true", "no", "yes"}:
+            self.get_logger().error(
+                "invalid MATERIAL_TASK3_LATERAL_GUARD="
+                f"{lateral_guard_value!r}; defaulting to enabled"
+            )
+            lateral_guard_value = "1"
+        self.task3_lateral_guard_enabled = lateral_guard_value in {
+            "1",
+            "true",
+            "yes",
+        }
+        # Off = full legacy rotate_lateral / drive_lateral / rotate_final,
+        # not a north-facing travel pose with only the target projection removed.
         if self.scheduler_policy not in {"heuristic", "rl_shadow", "rl_guarded"}:
             invalid_policy = self.scheduler_policy
             self.scheduler_policy = "heuristic"
@@ -276,6 +305,9 @@ class CompetitionClient(Node):
             configure_guard = getattr(executor, "set_measured_carry_guard", None)
             if callable(configure_guard):
                 configure_guard(self.measured_carry_guard_enabled)
+            configure_lateral = getattr(executor, "set_task3_lateral_guard", None)
+            if callable(configure_lateral):
+                configure_lateral(self.task3_lateral_guard_enabled)
         if carry_guard_requested and not self.measured_carry_guard_enabled:
             self.get_logger().warning(
                 "MATERIAL_MEASURED_CARRY_GUARD is ignored outside scheduler v2; "
@@ -317,6 +349,13 @@ class CompetitionClient(Node):
             String, "/referee/gameinfo", self._gameinfo_cb, 5
         )
         self.create_subscription(Int32, "/referee/score", self._score_cb, 5)
+        if self._local_map_relay_enabled:
+            self.create_subscription(
+                String,
+                "/material/local_map_advice",
+                self._local_map_advice_cb,
+                5,
+            )
         self.create_subscription(
             Odometry, "/slamware_ros_sdk_server_node/odom", self._odom_cb, 10
         )
@@ -336,7 +375,8 @@ class CompetitionClient(Node):
         self.get_logger().info(
             f"scheduler_policy={self.scheduler_policy}; "
             f"event_log={event_log_path or 'disabled'}; "
-            f"measured_carry_guard={self.measured_carry_guard_enabled}"
+            f"measured_carry_guard={self.measured_carry_guard_enabled}; "
+            f"task3_lateral_guard={self.task3_lateral_guard_enabled}"
         )
         limits = self._freshness_watchdog.limits_s
         self.get_logger().info(
@@ -414,6 +454,16 @@ class CompetitionClient(Node):
                 "formal mode is referee-driven; placeholder executors fail closed and keep "
                 "the robot stopped until real task actions are connected"
             )
+
+    def _local_map_advice_cb(self, msg: String) -> None:
+        try:
+            import json
+
+            data = json.loads(msg.data)
+            if isinstance(data, dict):
+                self._local_map_advice_dict = data
+        except (TypeError, ValueError):
+            return
 
     def _instruction_cb(self, msg: String) -> None:
         try:
@@ -949,6 +999,25 @@ class CompetitionClient(Node):
             max(0, len(self.instructions) - 1),
         )
         instruction = self.instructions[task_index] if self.instructions else {}
+        local_map_advice = None
+        if self._local_map_relay_enabled:
+            local_map_advice = self._local_map_advice_dict
+            if (
+                local_map_advice is not None
+                and now_s - self._local_map_last_log_s >= 5.0
+            ):
+                self.get_logger().info(
+                    "local_map relay "
+                    f"apply={local_map_advice.get('apply')} "
+                    f"fresh={local_map_advice.get('fresh')} "
+                    f"clear={local_map_advice.get('clear')} "
+                    f"dist={local_map_advice.get('distance_m')} "
+                    f"standoff={local_map_advice.get('suggested_standoff_m')} "
+                    f"acc={local_map_advice.get('frames_accepted')} "
+                    f"rej={local_map_advice.get('frames_rejected')} "
+                    f"reason={local_map_advice.get('reason')}"
+                )
+                self._local_map_last_log_s = now_s
         snapshot = self.controller.tick(
             ExecutionContext(
                 now_s=now_s,
@@ -962,6 +1031,7 @@ class CompetitionClient(Node):
                 referee_taskinfo=self.referee_taskinfo,
                 score=self.score,
                 input_ages_s=dict(freshness.ages_s),
+                local_map_advice=local_map_advice,
             )
         )
 
@@ -1002,16 +1072,30 @@ class CompetitionClient(Node):
                 self.get_logger().info(line)
             self._last_controller_serial = snapshot.transition_serial
             self._last_progress_log_ns = int(now_s * 1e9)
-        elif (
-            snapshot.state is ControllerState.EXECUTING_STAGE
-            and (snapshot.controls_base or snapshot.controls_arm)
-            and int(now_s * 1e9) - self._last_progress_log_ns >= 2_000_000_000
-        ):
+        else:
             stage = snapshot.stage.value if snapshot.stage is not None else "-"
-            self.get_logger().info(
-                f"progress task={snapshot.task_id} stage={stage}: {snapshot.message}"
+            if snapshot.task_id != 3 or stage != "align_for_place":
+                self._task3_lateral_progress_logged = False
+            task3_lateral_heartbeat = (
+                snapshot.task_id == 3
+                and stage == "align_for_place"
+                and "TASK3_LATERAL" in (snapshot.message or "")
+                and not self._task3_lateral_progress_logged
             )
-            self._last_progress_log_ns = int(now_s * 1e9)
+            if (
+                snapshot.state is ControllerState.EXECUTING_STAGE
+                and (snapshot.controls_base or snapshot.controls_arm)
+                and (
+                    int(now_s * 1e9) - self._last_progress_log_ns >= 2_000_000_000
+                    or task3_lateral_heartbeat
+                )
+            ):
+                self.get_logger().info(
+                    f"progress task={snapshot.task_id} stage={stage}: {snapshot.message}"
+                )
+                self._last_progress_log_ns = int(now_s * 1e9)
+                if task3_lateral_heartbeat:
+                    self._task3_lateral_progress_logged = True
 
         divergence_count = len(self.controller.shadow_divergences)
         if divergence_count > self._last_shadow_divergence_count:

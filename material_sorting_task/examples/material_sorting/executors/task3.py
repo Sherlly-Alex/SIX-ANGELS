@@ -18,12 +18,20 @@ from executors.base import (
     TaskStage,
     annotate_placement_result,
 )
+from executors.local_map_motion import map_linear_scale
 from executors.scheduler_candidate import CandidateApplicationStatus
 from executors.task1_full import Task1IntegratedExecutor, shelf_observation_stand
 from executors.transfer_support import stand_from_held_center
+from navigation.carried_envelope import HeldObjectGeometry
 from navigation.navigation_types import NavigationGoal, NavigationSegment, NavigationStatus
 from navigation.competition_adapter import goal_reached_event
 from navigation.robot_geometry import FootprintMode
+from navigation.task3_lateral_safety import (
+    SafeLateralTarget,
+    Task3LateralGuardParams,
+    compute_safe_lateral_target,
+    format_task3_lateral_log,
+)
 from scheduler.models import FailureCode
 from shelf.manipulation import HeldTransportController
 from shelf.placement_feedback import CompliantSlideLoweringController
@@ -115,6 +123,11 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     # retaining all position/yaw/collision completion checks.
     TASK3_LATERAL_TIMEOUT_S = 50.0
     TASK3_LATERAL_POSITION_TOLERANCE_M = 0.015
+    # Extra -Y after the GitHub/qzhRL clamp.  Official white Y is 0.778;
+    # 0.58 still clips the packaging cuboid on the extra 0.15 m push.
+    # 8 cm left → parking Y = max(0.50, 0.58-0.08) = 0.50.
+    TASK3_LATERAL_LEFT_BIAS_M = 0.08
+    TASK3_LATERAL_Y_MIN_M = 0.50
     TASK3_SHELF_TURN_TOLERANCE_RAD = 0.06
     TASK3_SHELF_TURN_MIN_ANGULAR_Z = 0.10
     TASK3_SHELF_TURN_MAX_ANGULAR_Z = 0.35
@@ -128,6 +141,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_ARM_INSERTION_M = 0.240
     TASK3_ARM_INSERT_TIMEOUT_S = 20.0
     TASK3_EXTRA_BASE_ADVANCE_M = 0.15
+    TASK3_EXTRA_BASE_ADVANCE_TIMEOUT_S = 8.0
     TASK3_POST_RELEASE_RETREAT_M = 0.40
     # ``ReleaseSpreadController`` interprets this as the per-arm half-width,
     # matching the competition client's gripper-width convention.
@@ -183,11 +197,21 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         )
         self._task3_release_lateral_inset_m = 0.0
         self._task3_shallow_place_stand: tuple[float, float] | None = None
+        # GitHub qzhRL parking Y: stand_from_held_center + clamp [0.58, 0.98].
+        self._task3_qzhrl_lateral_y: float | None = None
+        self._task3_legacy_lateral_y: float | None = None
         self._task3_insert_target_base: tuple[float, float, float] | None = None
         self._task3_safe_front_stand: tuple[float, float] | None = None
         self._task3_lift_fallback_since_s: float | None = None
         self._task3_target_height_detail = ""
         self._task3_place_lowering = CompliantSlideLoweringController()
+        self._task3_lateral_guard_enabled = True
+        self._task3_lateral_plan: SafeLateralTarget | None = None
+        self._task3_lateral_blocked: StageResult | None = None
+        self._task3_lateral_logged = False
+        self._task3_lateral_start_s: float | None = None
+        self._task3_lateral_start_y: float | None = None
+        self._task3_lateral_correction_count = 0
 
     def reset(self) -> None:
         super().reset()
@@ -202,11 +226,19 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
         self._held_insert.reset()
         self._task3_release_lateral_inset_m = 0.0
         self._task3_shallow_place_stand = None
+        self._task3_qzhrl_lateral_y = None
+        self._task3_legacy_lateral_y = None
         self._task3_insert_target_base = None
         self._task3_safe_front_stand = None
         self._task3_lift_fallback_since_s = None
         self._task3_target_height_detail = ""
         self._task3_place_lowering.reset()
+        self._task3_lateral_plan = None
+        self._task3_lateral_blocked = None
+        self._task3_lateral_logged = False
+        self._task3_lateral_start_s = None
+        self._task3_lateral_start_y = None
+        self._task3_lateral_correction_count = 0
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
         super().enter_stage(stage, context)
@@ -222,11 +254,19 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._held_insert.reset()
             self._task3_release_lateral_inset_m = 0.0
             self._task3_shallow_place_stand = None
+            self._task3_qzhrl_lateral_y = None
+            self._task3_legacy_lateral_y = None
             self._task3_insert_target_base = None
             self._task3_safe_front_stand = None
             self._locked_target_world = None
             self._locked_target_orientation = None
             self._task3_target_height_detail = ""
+            self._task3_lateral_plan = None
+            self._task3_lateral_blocked = None
+            self._task3_lateral_logged = False
+            self._task3_lateral_start_s = None
+            self._task3_lateral_start_y = None
+            self._task3_lateral_correction_count = 0
         elif stage is TaskStage.ACQUIRE_TARGET:
             # Keep samples collected while navigating.  The target remains
             # fixed on the table, so throwing away the navigation-stage
@@ -245,7 +285,15 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._transfer.reset()
             self._held_insert.reset()
             self._task3_shallow_place_stand = None
+            self._task3_qzhrl_lateral_y = None
+            self._task3_legacy_lateral_y = None
             self._task3_insert_target_base = None
+            self._task3_lateral_plan = None
+            self._task3_lateral_blocked = None
+            self._task3_lateral_logged = False
+            self._task3_lateral_start_s = None
+            self._task3_lateral_start_y = None
+            self._task3_lateral_correction_count = 0
         elif stage is TaskStage.PLACE:
             # Task 3 owns a separate placement-feedback epoch.  Only its
             # vertical lowering is replaced; release and the post-release
@@ -293,7 +341,16 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             result = self._tick_task3_transport(context)
             return self._guard_task3_transport_command(result, context)
         if stage is TaskStage.ALIGN_FOR_PLACE:
-            return self._tick_task3_align_for_place(context)
+            try:
+                result = self._tick_task3_align_for_place(context)
+            except Exception as exc:
+                result = self._block_task3_lateral(
+                    "TASK3_LATERAL_BLOCKED reason=align_exception "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if result is self._task3_lateral_blocked:
+                return result
+            return self._annotate_task3_align_result(context, result)
         if stage is TaskStage.PLACE:
             result = self._tick_task3_place(context)
             return annotate_placement_result(
@@ -959,7 +1016,9 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                 )
             self._motion_started = True
         status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+            context.odometry,
+            context.now_s,
+            linear_scale=map_linear_scale(context),
         )
         if status is NavigationStatus.GOAL_REACHED:
             self._phase = next_phase
@@ -991,6 +1050,7 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             return StageResult.blocked(f"task 3 cannot prepare shelf placement: {exc}")
         assert self._place_world is not None
         assert self._shelf_scan_stand is not None
+        self._freeze_task3_github_parking_stand()
 
         if self._phase == "task3_clearance":
             if not self._slide_hold.planned:
@@ -1022,29 +1082,56 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._transfer.reset()
 
         if self._phase == "task3_lateral":
-            if self._final_place_stand is None:
-                self._final_place_stand = stand_from_held_center(
-                    self._place_world,
-                    self._held_center_base,
-                    self.SHELF_YAW,
-                )
-                self._final_place_stand = (
-                    self._final_place_stand[0],
-                    max(0.58, min(0.98, self._final_place_stand[1])),
-                )
-                opening_yaw = float(self._shelf_tracker.geometry.opening_yaw)
-                self._task3_shallow_place_stand = (
-                    self._final_place_stand[0]
-                    + self.TASK3_ARM_INSERTION_M * math.cos(opening_yaw),
-                    self._final_place_stand[1]
-                    + self.TASK3_ARM_INSERTION_M * math.sin(opening_yaw),
-                )
+            if self._task3_lateral_blocked is not None:
+                return self._task3_lateral_blocked
+            self._freeze_task3_github_parking_stand()
             assert self._task3_shallow_place_stand is not None
-            if not self._motion_started:
+            projected = self._ensure_task3_safe_lateral_plan(context)
+            if projected is not None:
+                return projected
+            pose = self._odometry_pose(context.odometry)
+            parking_y = self._task3_parking_y()
+            already_at_parking_y = (
+                pose is not None
+                and abs(pose[1] - parking_y)
+                <= self.TASK3_LATERAL_POSITION_TOLERANCE_M
+            )
+            yaw_aligned = (
+                pose is not None
+                and abs(_wrap_task3_angle(self.SHELF_YAW - pose[2]))
+                <= self.TASK3_SHELF_TURN_TOLERANCE_RAD
+            )
+            # Already inside the parking-Y deadband and shelf yaw: do not
+            # start a Y slide.  Yaw still off → rotate_final only.
+            if (
+                self._task3_lateral_guard_enabled
+                and already_at_parking_y
+                and yaw_aligned
+            ):
+                self._phase = "task3_advance"
+                self._motion_started = False
+                self._transfer.reset()
+                line = (
+                    self._format_task3_lateral_log(
+                        "TASK3_LATERAL", self._task3_lateral_plan
+                    )
+                    if self._task3_lateral_plan is not None
+                    else "TASK3_LATERAL"
+                )
+                return StageResult.running(
+                    f"{line}; {self._log_task3_lateral_done(context, 0.0)}",
+                    arm_command=self._held_arm_command,
+                )
+            elif not self._motion_started:
+                geometry = self._task3_lateral_held_geometry()
+                if self._task3_lateral_guard_enabled and geometry is None:
+                    return self._block_task3_lateral(
+                        "TASK3_LATERAL_BLOCKED reason=carried_envelope_unavailable",
+                    )
                 if not self._transfer.begin_lateral_alignment(
                     (
                         self._shelf_scan_stand[0],
-                        self._task3_shallow_place_stand[1],
+                        parking_y,
                     ),
                     self.SHELF_YAW,
                     context.odometry,
@@ -1053,31 +1140,95 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                         self.TASK3_LATERAL_POSITION_TOLERANCE_M
                     ),
                     timeout_s=self.TASK3_LATERAL_TIMEOUT_S,
+                    held_geometry=geometry if self._task3_lateral_guard_enabled else None,
+                    travel_face_yaw=(
+                        self._task3_travel_face_yaw()
+                        if self._task3_lateral_guard_enabled
+                        else None
+                    ),
+                    predictive_guard=self._task3_lateral_guard_enabled,
+                    guard_params=self._task3_lateral_params(),
                 ):
-                    return StageResult.blocked(
-                        "task 3 could not plan safe lateral alignment outside shelf",
-                        arm_command=self._held_arm_command,
+                    return self._block_task3_lateral(
+                        "TASK3_LATERAL_BLOCKED reason=could_not_start_safe_alignment",
                     )
                 self._motion_started = True
-            status, command, detail = self._transfer.tick_lateral_alignment(
-                context.odometry, context.now_s
-            )
-            if status is NavigationStatus.GOAL_REACHED:
-                self._phase = "task3_advance"
-                self._motion_started = False
-                self._transfer.reset()
-            elif status in (NavigationStatus.FAILED, NavigationStatus.EMERGENCY_STOP):
-                return StageResult.blocked(
-                    f"task 3 shelf lateral alignment stopped safely: {detail}",
-                    arm_command=self._held_arm_command,
+                pose = self._odometry_pose(context.odometry)
+                if pose is not None and self._task3_lateral_start_y is None:
+                    self._task3_lateral_start_y = pose[1]
+                    self._task3_lateral_start_s = float(context.now_s)
+            if self._phase == "task3_lateral" and self._motion_started:
+                status, command, detail = self._transfer.tick_lateral_alignment(
+                    context.odometry, context.now_s
                 )
-            else:
-                return StageResult.running(
-                    f"task 3 aligning outside shelf for packaging-box left placement; "
-                    f"{detail}",
-                    base_command=command,
-                    arm_command=self._held_arm_command,
-                )
+                if status is NavigationStatus.GOAL_REACHED:
+                    pose = self._odometry_pose(context.odometry)
+                    target_s = float(parking_y)
+                    residual = (
+                        abs(pose[1] - target_s) if pose is not None else 0.0
+                    )
+                    if (
+                        self._task3_lateral_guard_enabled
+                        and residual > self.TASK3_LATERAL_POSITION_TOLERANCE_M
+                        and self._task3_lateral_correction_count < 1
+                    ):
+                        self._task3_lateral_correction_count += 1
+                        self._motion_started = False
+                        self._transfer.reset()
+                    else:
+                        self._phase = "task3_advance"
+                        self._motion_started = False
+                        self._transfer.reset()
+                        done = self._log_task3_lateral_done(context, residual)
+                        prefix = ""
+                        if (
+                            not self._task3_lateral_logged
+                            and self._task3_lateral_plan is not None
+                        ):
+                            self._task3_lateral_logged = True
+                            prefix = (
+                                self._format_task3_lateral_log(
+                                    "TASK3_LATERAL", self._task3_lateral_plan
+                                )
+                                + "; "
+                            )
+                        return StageResult.running(
+                            f"{prefix}{done}",
+                            arm_command=self._held_arm_command,
+                        )
+                elif status in (
+                    NavigationStatus.FAILED,
+                    NavigationStatus.EMERGENCY_STOP,
+                ):
+                    return self._block_task3_lateral(
+                        (
+                            detail
+                            if detail.startswith("TASK3_LATERAL_BLOCKED")
+                            else f"TASK3_LATERAL_BLOCKED reason={detail}"
+                        ),
+                    )
+                else:
+                    message = (
+                        "task 3 aligning outside shelf for packaging-box "
+                        f"left placement; {detail}"
+                    )
+                    if (
+                        not self._task3_lateral_logged
+                        and self._task3_lateral_plan is not None
+                    ):
+                        self._task3_lateral_logged = True
+                        message = (
+                            self._format_task3_lateral_log(
+                                "TASK3_LATERAL", self._task3_lateral_plan
+                            )
+                            + "; "
+                            + message
+                        )
+                    return StageResult.running(
+                        message,
+                        base_command=command,
+                        arm_command=self._held_arm_command,
+                    )
 
         if self._phase == "task3_advance":
             assert self._task3_shallow_place_stand is not None
@@ -1109,6 +1260,15 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
                     )
                 self._motion_started = True
             done, command, detail = self._transfer.tick_advance(context.odometry)
+            elapsed = max(0.0, float(context.now_s) - float(self._phase_started_s))
+            if (
+                not done
+                and elapsed >= self.TASK3_EXTRA_BASE_ADVANCE_TIMEOUT_S
+            ):
+                done = True
+                detail = (
+                    f"{detail}; extra_advance_timeout={elapsed:.1f}s"
+                )
             if not done:
                 return StageResult.running(
                     "task 3 advancing the base an additional "
@@ -1120,14 +1280,274 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
             self._phase = "task3_extra_base_advance_done"
             self._motion_started = False
             self._transfer.reset()
+            timeout_note = (
+                f"; {detail}" if "extra_advance_timeout" in detail else ""
+            )
             return StageResult.succeeded(
                 "task 3 reached the direct base-release position without arm "
-                f"insertion; extra advance={self.TASK3_EXTRA_BASE_ADVANCE_M:.2f} m",
+                f"insertion; extra advance={self.TASK3_EXTRA_BASE_ADVANCE_M:.2f} m"
+                f"{timeout_note}",
                 arm_command=self._held_arm_command,
             )
         return StageResult.blocked(
             f"task 3 invalid shelf-alignment phase {self._phase!r}",
             arm_command=self._held_arm_command,
+        )
+
+    def set_task3_lateral_guard(self, enabled: bool) -> None:
+        """Enable the task-3 shelf-front carry safety layer (competition default).
+
+        ``False`` restores the full pre-change lateral behaviour: unprojected
+        legacy Y, rotate_lateral to ±π/2, drive_lateral, then rotate_final.
+        It does not keep the north-facing travel pose or the predictive
+        carry guard.
+        """
+
+        self._task3_lateral_guard_enabled = bool(enabled)
+
+    def _task3_parking_from_qzhrl_y(self, qzhRL_y: float) -> tuple[float, float]:
+        """Keep the GitHub clamp, then shift a little left (world -Y)."""
+
+        clamped = max(0.58, min(0.98, float(qzhRL_y)))
+        parking = max(
+            self.TASK3_LATERAL_Y_MIN_M,
+            clamped - self.TASK3_LATERAL_LEFT_BIAS_M,
+        )
+        return clamped, parking
+
+    def _freeze_task3_github_parking_stand(self) -> None:
+        """Lock chassis parking: GitHub clamp, then the measured left bias."""
+
+        if self._place_world is None or self._held_center_base is None:
+            return
+        if self._final_place_stand is None:
+            raw = stand_from_held_center(
+                self._place_world,
+                self._held_center_base,
+                self.SHELF_YAW,
+            )
+            qzhRL_y, parking_y = self._task3_parking_from_qzhrl_y(raw[1])
+            self._final_place_stand = (raw[0], parking_y)
+            self._task3_qzhrl_lateral_y = qzhRL_y
+            self._task3_legacy_lateral_y = parking_y
+        if self._task3_shallow_place_stand is None:
+            opening_yaw = float(self._shelf_tracker.geometry.opening_yaw)
+            self._task3_shallow_place_stand = (
+                self._final_place_stand[0]
+                + self.TASK3_ARM_INSERTION_M * math.cos(opening_yaw),
+                self._final_place_stand[1]
+                + self.TASK3_ARM_INSERTION_M * math.sin(opening_yaw),
+            )
+        if self._task3_qzhrl_lateral_y is None:
+            self._task3_qzhrl_lateral_y = float(self._task3_shallow_place_stand[1])
+        if self._task3_legacy_lateral_y is None:
+            self._task3_legacy_lateral_y = self._task3_qzhrl_lateral_y
+
+    def _task3_align_pose_log(self, context: ExecutionContext) -> str:
+        pose = self._odometry_pose(context.odometry)
+        current = float(pose[1]) if pose is not None else float("nan")
+        yaw = float(pose[2]) if pose is not None else float("nan")
+        qzhRL = (
+            float(self._task3_qzhrl_lateral_y)
+            if self._task3_qzhrl_lateral_y is not None
+            else float("nan")
+        )
+        parking = (
+            float(self._task3_legacy_lateral_y)
+            if self._task3_legacy_lateral_y is not None
+            else float("nan")
+        )
+        return (
+            f"TASK3_LATERAL phase={self._phase} "
+            f"current_s={current:.4f} qzhRL_s={qzhRL:.4f} parking_s={parking:.4f} "
+            f"yaw={yaw:.3f}"
+        )
+
+    def _annotate_task3_align_result(
+        self, context: ExecutionContext, result: StageResult
+    ) -> StageResult:
+        pose_line = self._task3_align_pose_log(context)
+        if pose_line in result.message:
+            return result
+        if "current_s=" in result.message and result.message.startswith("TASK3_LATERAL"):
+            return replace(result, message=f"{pose_line}; {result.message}")
+        return replace(result, message=f"{pose_line}; {result.message}")
+
+    def _format_task3_lateral_log(self, prefix: str, plan: SafeLateralTarget) -> str:
+        line = format_task3_lateral_log(prefix, plan)
+        if self._task3_qzhrl_lateral_y is not None:
+            line += f" qzhRL_s={float(self._task3_qzhrl_lateral_y):.4f}"
+        return line
+
+    def _block_task3_lateral(self, message: str) -> StageResult:
+        """Latch a structured lateral failure so the next tick cannot re-begin."""
+
+        result = StageResult.blocked(
+            message,
+            arm_command=self._held_arm_command,
+            failure_code=FailureCode.UNSAFE_COLLISION,
+        )
+        self._task3_lateral_blocked = result
+        return result
+
+    def _task3_travel_face_yaw(self) -> float:
+        # Face north while shifting along the west-facing shelf so the held
+        # box stays on the wall-opposite side of a south/left correction.
+        return _wrap_task3_angle(self.SHELF_YAW - math.pi / 2.0)
+
+    def _task3_lateral_params(self) -> Task3LateralGuardParams:
+        return Task3LateralGuardParams(
+            enabled=self._task3_lateral_guard_enabled,
+            lateral_deadband_m=self.TASK3_LATERAL_POSITION_TOLERANCE_M,
+            yaw_tolerance_rad=self.TASK3_SHELF_TURN_TOLERANCE_RAD,
+            min_prop_center_separation_m=self.TASK3_MIN_PROP_CENTER_SEPARATION_M,
+        )
+
+    def _task3_lateral_held_geometry(self) -> HeldObjectGeometry | None:
+        if self._held_center_base is None:
+            return None
+        try:
+            half = self._require_held_grasp_half_width()
+            return HeldObjectGeometry(
+                self._held_center_base, half, source="task3_lateral"
+            )
+        except PregraspInputError:
+            return None
+
+    def _ensure_task3_safe_lateral_plan(
+        self, context: ExecutionContext
+    ) -> StageResult | None:
+        if self._task3_lateral_plan is not None:
+            return self._apply_task3_safe_lateral_target(
+                self._task3_lateral_plan
+            )
+        pose = self._odometry_pose(context.odometry)
+        if pose is None:
+            return StageResult.running(
+                "task 3 waiting for odometry before safe lateral projection",
+                arm_command=self._held_arm_command,
+            )
+        assert self._shelf_scan_stand is not None
+        assert self._task3_shallow_place_stand is not None
+        # Always plan from the first qzhRL stand, never from a previously
+        # projected stand.  This makes a safe retry converge to exactly the
+        # known-good qzhRL stop rather than accumulating safety corrections.
+        legacy_y = self._task3_legacy_lateral_y
+        if legacy_y is None:
+            legacy_y = float(self._task3_shallow_place_stand[1])
+            self._task3_legacy_lateral_y = legacy_y
+        legacy_xy = (
+            float(self._shelf_scan_stand[0]),
+            legacy_y,
+        )
+        if not self._task3_lateral_guard_enabled:
+            self._task3_lateral_plan = compute_safe_lateral_target(
+                pose,
+                legacy_xy,
+                self.SHELF_YAW,
+                None,
+                params=self._task3_lateral_params(),
+            )
+            return None
+        geometry = self._task3_lateral_held_geometry()
+        white_y: float | None
+        try:
+            white_y = float(self._memory.require_task3_packaging_box_center()[1])
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            return self._block_task3_lateral(
+                "TASK3_LATERAL_BLOCKED reason=white_object_pose_invalid",
+            )
+        scoring_xy = None
+        release_xy = None
+        if self._task3_scoring_place is not None:
+            scoring_xy = (
+                float(self._task3_scoring_place[0]),
+                float(self._task3_scoring_place[1]),
+            )
+        if self._task3_release_place is not None:
+            release_xy = (
+                float(self._task3_release_place[0]),
+                float(self._task3_release_place[1]),
+            )
+        plan = compute_safe_lateral_target(
+            pose,
+            legacy_xy,
+            self.SHELF_YAW,
+            geometry,
+            params=self._task3_lateral_params(),
+            white_object_y=white_y,
+            place_radius_m=self._task3_place_radius_m,
+            scoring_target_xy=scoring_xy,
+            release_xy=release_xy,
+            travel_face_yaw=self._task3_travel_face_yaw(),
+        )
+        self._task3_lateral_plan = plan
+        return self._apply_task3_safe_lateral_target(plan)
+
+    def _task3_parking_y(self) -> float:
+        """Always the frozen qzhRL stand Y for this placement attempt."""
+
+        if self._task3_legacy_lateral_y is not None:
+            return float(self._task3_legacy_lateral_y)
+        assert self._task3_shallow_place_stand is not None
+        return float(self._task3_shallow_place_stand[1])
+
+    def _apply_task3_safe_lateral_target(
+        self, plan: SafeLateralTarget
+    ) -> StageResult | None:
+        """Keep the qzhRL stop.  Envelope results never rewrite parking Y.
+
+        Placement geometry (``_place_world``, ``_final_place_stand``,
+        ``_task3_shallow_place_stand``) is unchanged.  Only a geometrically
+        impossible left gap or a hard planner reject may block.
+        """
+
+        self._task3_lateral_plan = plan
+        if not plan.feasible or plan.safe_target_s is None:
+            return self._block_task3_lateral(
+                self._format_task3_lateral_log("TASK3_LATERAL_BLOCKED", plan),
+            )
+        return None
+
+    def _log_task3_lateral_done(
+        self, context: ExecutionContext, final_error: float
+    ) -> str:
+        start_y = self._task3_lateral_start_y
+        start_s = self._task3_lateral_start_s
+        pose = self._odometry_pose(context.odometry)
+        distance = (
+            abs(float(pose[1]) - float(start_y))
+            if pose is not None and start_y is not None
+            else 0.0
+        )
+        duration = (
+            max(0.0, float(context.now_s) - float(start_s))
+            if start_s is not None
+            else 0.0
+        )
+        clearance = (
+            self._task3_lateral_plan.min_clearance_m
+            if self._task3_lateral_plan is not None
+            else float("nan")
+        )
+        if self._transfer._lateral_min_clearance_m is not None:
+            clearance = min(clearance, self._transfer._lateral_min_clearance_m)
+        qzhRL = (
+            float(self._task3_qzhrl_lateral_y)
+            if self._task3_qzhrl_lateral_y is not None
+            else float("nan")
+        )
+        parking = (
+            float(self._task3_legacy_lateral_y)
+            if self._task3_legacy_lateral_y is not None
+            else float("nan")
+        )
+        return (
+            "TASK3_LATERAL_DONE "
+            f"qzhRL_s={qzhRL:.4f} parking_s={parking:.4f} "
+            f"distance={distance:.4f} duration={duration:.3f} "
+            f"correction_count={self._task3_lateral_correction_count} "
+            f"final_error={final_error:.4f} min_clearance={clearance:.4f}"
         )
 
     def _task3_release_half_width(self) -> float:

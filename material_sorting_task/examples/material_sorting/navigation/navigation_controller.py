@@ -316,6 +316,8 @@ class NavigationController:
         robot_yaw: float,
         dt: float,
         obs: Optional[ObstacleObservation] = None,
+        *,
+        linear_scale: float = 1.0,
     ) -> VelocityCommand:
         """Advance one control tick.
 
@@ -327,12 +329,20 @@ class NavigationController:
             Control period (s).
         obs:
             Optional LiDAR observation for emergency / avoidance.
+        linear_scale:
+            Optional experimental multiplier applied before avoidance, the
+            speed limiter and predictive collision checks. Invalid values are
+            treated as 1.0 and the limiter remains authoritative.
 
         Returns
         -------
         VelocityCommand
             Safe ``(linear_x, angular_z)`` for ``/cmd_vel``.
         """
+        if not math.isfinite(linear_scale) or linear_scale <= 0.0:
+            linear_scale = 1.0
+        linear_scale = max(0.25, min(2.0, float(linear_scale)))
+
         if self._status in (NavigationStatus.IDLE, NavigationStatus.GOAL_REACHED,
                             NavigationStatus.FAILED):
             out = VelocityCommand(0.0, 0.0)
@@ -519,6 +529,7 @@ class NavigationController:
                 self._speed_limiter.reset()
         else:
             raw_lin = min(0.3, 0.8 * dist_to_target) * max(0.0, math.cos(yaw_error)) ** 2
+            raw_lin *= linear_scale
             # Pure-pursuit curvature: kappa = 2 sin(e) / L ; omega = kappa * v.
             L = max(lookahead, 0.2)
             kappa = 2.0 * math.sin(yaw_error) / L

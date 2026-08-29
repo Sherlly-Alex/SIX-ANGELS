@@ -15,6 +15,10 @@ from navigation.navigation_controller import NavigationController
 from navigation.navigation_types import NavigationGoal, NavigationStatus, SpeedLimits
 from navigation.occupancy_grid import LayeredGrid, build_layered_scene_grid
 from navigation.robot_geometry import FootprintMode
+from navigation.task3_lateral_safety import (
+    Task3LateralGuardParams,
+    guard_task3_lateral_cmd,
+)
 
 
 def odometry_pose(odometry: Any) -> tuple[float, float, float] | None:
@@ -124,6 +128,11 @@ class TransferMotion:
         self._held_path_clearance_m: float | None = None
         self._held_min_clearance_m: float | None = None
         self._last_navigation_failure_detail: str | None = None
+        self._lateral_held_geometry: HeldObjectGeometry | None = None
+        self._lateral_predictive_guard = False
+        self._lateral_guard_params = Task3LateralGuardParams()
+        self._lateral_guard_block_count = 0
+        self._lateral_min_clearance_m: float | None = None
 
     @property
     def goal(self) -> NavigationGoal | None:
@@ -169,6 +178,11 @@ class TransferMotion:
         self._held_path_clearance_m = None
         self._held_min_clearance_m = None
         self._last_navigation_failure_detail = None
+        self._lateral_held_geometry = None
+        self._lateral_predictive_guard = False
+        self._lateral_guard_params = Task3LateralGuardParams()
+        self._lateral_guard_block_count = 0
+        self._lateral_min_clearance_m = None
 
     def begin_navigation(
         self,
@@ -229,6 +243,8 @@ class TransferMotion:
         self,
         odometry: Any,
         now_s: float,
+        *,
+        linear_scale: float = 1.0,
     ) -> tuple[NavigationStatus, tuple[float, float], str]:
         pose = odometry_pose(odometry)
         if pose is None:
@@ -240,7 +256,17 @@ class TransferMotion:
             0.20, max(0.01, now - self._last_tick_s)
         )
         self._last_tick_s = now
-        command = self._navigation.update(*pose, dt, obs=None)
+        if linear_scale == 1.0:
+            # Preserve the exact verified call path (and compatible injected
+            # navigation implementations) while the experiment is disabled.
+            command = self._navigation.update(*pose, dt, obs=None)
+        else:
+            command = self._navigation.update(
+                *pose,
+                dt,
+                obs=None,
+                linear_scale=linear_scale,
+            )
         status = self._navigation.status
         if self._held_geometry is not None:
             # Fail-closed per-tick payload gate: any commanded sweep of the
@@ -328,6 +354,11 @@ class TransferMotion:
         yaw_tolerance_rad: float | None = None,
         timeout_s: float | None = None,
         drive_in_reverse: bool = False,
+        held_geometry: HeldObjectGeometry | None = None,
+        travel_face_yaw: float | None = None,
+        predictive_guard: bool = False,
+        large_yaw_threshold_rad: float | None = None,
+        guard_params: Task3LateralGuardParams | None = None,
     ) -> bool:
         """Start a bounded shelf-front lateral alignment.
 
@@ -383,24 +414,61 @@ class TransferMotion:
             # of silently moving the carried object into the shelf front.
             return False
 
+        params = guard_params or Task3LateralGuardParams()
+        large_yaw = (
+            params.large_yaw_threshold_rad
+            if large_yaw_threshold_rad is None
+            else float(large_yaw_threshold_rad)
+        )
+        if (
+            held_geometry is not None or travel_face_yaw is not None
+        ) and abs(_wrap_to_pi(target_yaw - pose[2])) > large_yaw:
+            # Task-3 shelf-front alignment must not start an unconstrained
+            # in-place spin when the pre-place yaw is already lost.
+            return False
+
         self._lateral_target = (target_x, target_y)
         self._lateral_final_yaw = target_yaw
         self._lateral_position_tolerance_m = tolerance
         self._lateral_yaw_tolerance_rad = yaw_tolerance
         self._lateral_timeout_s = timeout
-        self._lateral_travel_heading = (
-            math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
-        )
-        self._lateral_drive_sign = -1.0 if drive_in_reverse else 1.0
-        self._lateral_heading = _wrap_to_pi(
-            self._lateral_travel_heading
-            + (math.pi if drive_in_reverse else 0.0)
-        )
-        self._lateral_phase = (
-            "rotate_final"
-            if abs(target_y - pose[1]) <= self._lateral_position_tolerance_m
-            else "rotate_lateral"
-        )
+        self._lateral_held_geometry = held_geometry
+        self._lateral_predictive_guard = bool(predictive_guard) and held_geometry is not None
+        self._lateral_guard_params = params
+        self._lateral_guard_block_count = 0
+        self._lateral_min_clearance_m = None
+        if travel_face_yaw is not None:
+            # Task-3 carry-safe travel: keep one face yaw (north) and reverse
+            # when the Y error is south, so the held box never sweeps into
+            # the south wall during a left correction.
+            face_yaw = _wrap_to_pi(float(travel_face_yaw))
+            moving_plus_y = target_y >= pose[1]
+            self._lateral_travel_heading = (
+                math.pi / 2.0 if moving_plus_y else -math.pi / 2.0
+            )
+            self._lateral_heading = face_yaw
+            face_y_component = math.sin(face_yaw)
+            if abs(face_y_component) < 0.5:
+                return False
+            desired_y_sign = 1.0 if moving_plus_y else -1.0
+            self._lateral_drive_sign = (
+                1.0 if (desired_y_sign * face_y_component) > 0.0 else -1.0
+            )
+        else:
+            self._lateral_travel_heading = (
+                math.pi / 2.0 if target_y >= pose[1] else -math.pi / 2.0
+            )
+            self._lateral_drive_sign = -1.0 if drive_in_reverse else 1.0
+            self._lateral_heading = _wrap_to_pi(
+                self._lateral_travel_heading
+                + (math.pi if drive_in_reverse else 0.0)
+            )
+        if abs(target_y - pose[1]) <= self._lateral_position_tolerance_m:
+            self._lateral_phase = "rotate_final"
+        elif abs(_wrap_to_pi(self._lateral_heading - pose[2])) <= yaw_tolerance:
+            self._lateral_phase = "drive_lateral"
+        else:
+            self._lateral_phase = "rotate_lateral"
         self._lateral_start_s = start_s
         return True
 
@@ -435,9 +503,11 @@ class TransferMotion:
                 self._lateral_phase = "drive_lateral"
             else:
                 angular = max(-0.35, min(0.35, 1.4 * yaw_error))
-                return NavigationStatus.NAVIGATING, (0.0, angular), (
+                return self._emit_lateral_command(
+                    pose,
+                    (0.0, angular),
                     "lateral alignment rotating toward shelf-front direction; "
-                    f"yaw_err={yaw_error:.3f}"
+                    f"yaw_err={yaw_error:.3f}",
                 )
 
         if self._lateral_phase == "drive_lateral":
@@ -449,24 +519,32 @@ class TransferMotion:
                 # small heading correction while moving along y.  Do not move
                 # forward until the lateral heading is reasonably aligned.
                 x_error = target_x - pose[0]
+                heading_limit = (
+                    self._lateral_yaw_tolerance_rad
+                    if self._lateral_predictive_guard
+                    else 0.25
+                )
                 heading_offset = max(
-                    -0.25,
+                    -heading_limit,
                     min(
-                        0.25,
+                        heading_limit,
                         -math.sin(self._lateral_travel_heading) * 0.8 * x_error,
                     ),
                 )
                 desired_yaw = self._lateral_heading + heading_offset
                 yaw_error = _wrap_to_pi(desired_yaw - pose[2])
                 angular = max(-0.30, min(0.30, 1.2 * yaw_error))
+                max_speed = self._lateral_guard_params.lateral_max_speed_mps
                 linear = self._lateral_drive_sign * min(
-                    0.09, max(0.035, 0.55 * abs(y_error))
+                    max_speed, max(0.035, 0.55 * abs(y_error))
                 )
-                if abs(yaw_error) > 0.18:
+                if abs(yaw_error) > self._lateral_guard_params.large_yaw_threshold_rad:
                     linear = 0.0
-                return NavigationStatus.NAVIGATING, (linear, angular), (
+                return self._emit_lateral_command(
+                    pose,
+                    (linear, angular),
                     "lateral alignment driving along shelf front; "
-                    f"y_err={y_error:.3f}, x_err={x_error:.3f}"
+                    f"y_err={y_error:.3f}, x_err={x_error:.3f}",
                 )
 
         if self._lateral_phase == "rotate_final":
@@ -477,9 +555,11 @@ class TransferMotion:
                     "lateral alignment complete; shelf-facing yaw restored"
                 )
             angular = max(-0.35, min(0.35, 1.4 * yaw_error))
-            return NavigationStatus.NAVIGATING, (0.0, angular), (
+            return self._emit_lateral_command(
+                pose,
+                (0.0, angular),
                 "lateral alignment restoring shelf-facing yaw; "
-                f"yaw_err={yaw_error:.3f}"
+                f"yaw_err={yaw_error:.3f}",
             )
 
         if self._lateral_phase == "done":
@@ -487,6 +567,60 @@ class TransferMotion:
                 "lateral alignment complete"
             )
         return NavigationStatus.FAILED, (0.0, 0.0), "lateral alignment failed"
+
+    def _emit_lateral_command(
+        self,
+        pose: tuple[float, float, float],
+        command: tuple[float, float],
+        detail: str,
+    ) -> tuple[NavigationStatus, tuple[float, float], str]:
+        """Apply the optional predictive carry guard before a lateral command."""
+
+        if not self._lateral_predictive_guard or self._lateral_held_geometry is None:
+            return NavigationStatus.NAVIGATING, command, detail
+        guarded = guard_task3_lateral_cmd(
+            pose,
+            command,
+            self._lateral_held_geometry,
+            checker=self._carried_checker,
+            params=self._lateral_guard_params,
+        )
+        clearance = float(guarded.clearance_m)
+        self._lateral_min_clearance_m = min(
+            clearance,
+            self._lateral_min_clearance_m
+            if self._lateral_min_clearance_m is not None
+            else clearance,
+        )
+        if guarded.blocked:
+            self._lateral_guard_block_count += 1
+            if (
+                self._lateral_guard_block_count
+                >= self._lateral_guard_params.max_consecutive_guard_blocks
+            ):
+                self._lateral_phase = "failed"
+                return (
+                    NavigationStatus.EMERGENCY_STOP,
+                    (0.0, 0.0),
+                    "TASK3_LATERAL_BLOCKED reason=predictive_guard "
+                    f"{guarded.reason}",
+                )
+            return (
+                NavigationStatus.NAVIGATING,
+                (0.0, 0.0),
+                f"{detail}; predictive_guard_hold={guarded.reason}",
+            )
+        self._lateral_guard_block_count = 0
+        suffix = (
+            f"; predictive_guard=slowed clearance={clearance:.3f}m"
+            if guarded.slowed
+            else f"; predictive_guard=ok clearance={clearance:.3f}m"
+        )
+        return (
+            NavigationStatus.NAVIGATING,
+            (guarded.linear_x, guarded.angular_z),
+            detail + suffix,
+        )
 
     def begin_retreat(
         self,

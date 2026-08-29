@@ -206,6 +206,29 @@ class ShelfStateTracker:
         candidates = {1, 2, 3} - {colored_layer, packaging_layer}
         return candidates.pop() if len(candidates) == 1 else None
 
+    @property
+    def missing_colored_layer_candidate(self) -> int | None:
+        """Return the unique layer that still needs direct colour evidence.
+
+        Stable packaging and explicit-empty evidence may select an observation
+        posture.  This complement is never allowed to create ``ShelfState`` or
+        synthesize the task-2 target center.
+        """
+
+        self._lock_independent_targets()
+        if self._stable_colored is not None:
+            return None
+        if not self.require_empty_confirmation:
+            return None
+        if self._stable_packaging is None or self._stable_empty is None:
+            return None
+        packaging_layer = self._stable_packaging[0]
+        empty_layer = self._stable_empty[0]
+        if packaging_layer == empty_layer:
+            return None
+        candidates = {1, 2, 3} - {packaging_layer, empty_layer}
+        return candidates.pop() if len(candidates) == 1 else None
+
     def reset_empty_confirmation(self) -> None:
         """Discard empty votes while preserving stable occupied semantics."""
 

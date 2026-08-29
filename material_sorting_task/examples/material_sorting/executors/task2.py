@@ -24,7 +24,9 @@ from executors.base import (
     TaskStage,
     annotate_placement_result,
 )
+from executors.local_map_motion import map_linear_scale, map_standoff_m
 from executors.task1 import Task1LiftExecutor
+from executors.task1_full import Task1IntegratedExecutor
 from executors.scheduler_candidate import (
     CandidateApplicationStatus,
     CandidateStandPolicy,
@@ -73,11 +75,19 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # advance straight with the arms retracted.  The base turns and the arms
     # are opened only at the final grab stand.
     SHELF_PICK_APPROACH_X = -1.50
+    SHELF_PICK_DEFAULT_CLEARANCE_M = 0.965
+    SHELF_PICK_MAP_STANDOFF_MAX_M = 1.08
+    SHELF_PICK_APPROACH_MAX_X = -1.35
     # The final stand is derived from the detected object centre.  At the
     # shelf-facing yaw, keeping the object 0.75 m forward of the base matches
     # the verified dual-arm reach without reading a Server object coordinate.
     PICK_TARGET_BASE_X = 0.75
     SHELF_CENTER_CAMERA_SETTLE_S = 0.80
+    # If the final shelf-facing view yields no RGB-D target frames at all,
+    # change only the retracted camera posture once before falling back.  This
+    # is deliberately a small spine-only offset: it does not open the arms or
+    # move the base nearer to the shelf.
+    SHELF_CENTER_CAMERA_REFRESH_DELTA_M = -0.045
     # Move only the spine to the coarse shelf layer before locking the fresh
     # RGB-D centre.  The two arm chains remain in the neutral transport pose;
     # this changes the camera/hand height without sweeping an open gripper
@@ -134,6 +144,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
     # the extended payload's sweep on the room side instead of toward the east
     # wall.  A final northbound straight segment reaches the table entry.
     TABLE_ENTRY_MARGIN_M = 0.25
+    TABLE_ENTRY_MAP_MARGIN_MAX_M = 0.42
     TABLE_APPROACH_Y = 1.35
     TABLE_FINAL_LATERAL_TOLERANCE_M = 0.05
 
@@ -169,6 +180,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide: float | None = None
+        self._camera_refresh_target_slide: float | None = None
+        self._camera_reacquire_used = False
         # Validated scheduler stand overrides, consumed only by the
         # matching navigation segment of this executor.
         self._scheduler_pick_stand: tuple[float, float] | None = None
@@ -196,6 +209,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         self._lateral_realign_attempts = 0
         self._post_approach_realign_attempts = 0
         self._camera_target_slide = None
+        self._camera_refresh_target_slide = None
+        self._camera_reacquire_used = False
         self._scheduler_pick_stand = None
         self._scheduler_end_stand = None
 
@@ -226,6 +241,8 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             self._transfer.reset()
             self._pick_stand_world = None
             self._camera_target_slide = None
+            self._camera_refresh_target_slide = None
+            self._camera_reacquire_used = False
             self._target_center_tracker.reset(
                 accept_after_s=(
                     float(context.now_s) + self.SHELF_CENTER_CAMERA_SETTLE_S
@@ -428,6 +445,27 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         # be reused as task 2's pick target.
         return target_color, self._memory.require_task2_target_center()
 
+    def _shelf_pick_approach_x(self, context: ExecutionContext) -> float:
+        """Retreat the shelf staging point only when fresh map advice asks."""
+
+        clearance = map_standoff_m(
+            context,
+            self.SHELF_PICK_DEFAULT_CLEARANCE_M,
+            max_standoff_m=self.SHELF_PICK_MAP_STANDOFF_MAX_M,
+        )
+        approach_x = Task1IntegratedExecutor.SHELF_FRONT_X + clearance
+        approach_x = max(approach_x, self.SHELF_PICK_APPROACH_X)
+        return min(approach_x, self.SHELF_PICK_APPROACH_MAX_X)
+
+    def _table_entry_margin_m(self, context: ExecutionContext) -> float:
+        """Keep the validated margin unless optional map advice is enabled."""
+
+        return map_standoff_m(
+            context,
+            self.TABLE_ENTRY_MARGIN_M,
+            max_standoff_m=self.TABLE_ENTRY_MAP_MARGIN_MAX_M,
+        )
+
     def _tick_navigate_to_pick(self, context: ExecutionContext) -> StageResult:
         try:
             target_color, center = self._task2_target(context)
@@ -435,7 +473,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             return StageResult.blocked(str(exc))
         if not self._motion_started:
             stand_xy = self._scheduler_pick_stand or (
-                self.SHELF_PICK_APPROACH_X,
+                self._shelf_pick_approach_x(context),
                 max(0.58, min(0.98, center[1])),
             )
             goal = NavigationGoal(
@@ -464,7 +502,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 )
             self._motion_started = True
         status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+            context.odometry,
+            context.now_s,
+            linear_scale=map_linear_scale(context),
         )
         if status is NavigationStatus.GOAL_REACHED:
             self._coarse_target_world = center
@@ -498,6 +538,19 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             f"{tuple(round(value, 3) for value in center)}; full RGB-D object "
             "centre will be locked after camera settling"
         )
+
+    def _start_pick_approach(
+        self,
+        center_world: tuple[float, float, float],
+    ) -> None:
+        """Advance only after a fresh lock or a bounded cached-vision fallback."""
+
+        self._locked_target_world = center_world
+        self._locked_target_orientation = self.SOURCE_ORIENTATION
+        self._phase = "approach_pick"
+        self._phase_started_s = 0.0
+        self._motion_started = False
+        self._transfer.reset()
 
     def _tick_align_for_pick(self, context: ExecutionContext) -> StageResult:
         """Lock the box, approach straight, turn, then perform pregrasp."""
@@ -598,6 +651,72 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                 arm_command=command,
             )
 
+        if self._phase == "refresh_camera":
+            if self._held_arm_command is None:
+                return StageResult.blocked(
+                    "task 2 cannot refresh the target camera view without "
+                    "the neutral transport arm command",
+                )
+            if self._camera_refresh_target_slide is None:
+                base_slide = self._camera_target_slide
+                if base_slide is None:
+                    return StageResult.blocked(
+                        "task 2 cannot refresh the target camera view without "
+                        "a staged camera height",
+                        arm_command=self._held_arm_command,
+                    )
+                self._camera_refresh_target_slide = float(
+                    max(
+                        SPINE_MIN,
+                        min(
+                            SPINE_MAX,
+                            base_slide
+                            + self.SHELF_CENTER_CAMERA_REFRESH_DELTA_M,
+                        ),
+                    )
+                )
+                self._slide_hold.reset()
+                try:
+                    self._held_arm_command = self._slide_hold.plan(
+                        self._held_arm_command,
+                        self._camera_refresh_target_slide,
+                        context.joint_states,
+                    )
+                except (PregraspInputError, PregraspPlanningError) as exc:
+                    return StageResult.blocked(
+                        "task 2 could not plan the bounded target-view refresh: "
+                        f"{exc}",
+                        arm_command=self._held_arm_command,
+                    )
+            try:
+                command, reached, detail = self._slide_hold.update(
+                    context.now_s,
+                    context.joint_states,
+                )
+            except (PregraspInputError, PregraspPlanningError) as exc:
+                return StageResult.blocked(
+                    "task 2 bounded target-view refresh failed: " + str(exc),
+                    arm_command=self._held_arm_command,
+                )
+            self._held_arm_command = command
+            if not reached:
+                return StageResult.running(
+                    "task 2 refreshing the retracted RGB-D shelf view; " + detail,
+                    arm_command=command,
+                )
+            self._phase = "acquire_center"
+            self._phase_started_s = float(context.now_s)
+            self._target_center_tracker.reset(
+                accept_after_s=(
+                    float(context.now_s) + self.SHELF_CENTER_CAMERA_SETTLE_S
+                )
+            )
+            return StageResult.running(
+                "task 2 completed one bounded target-view refresh; collecting "
+                "fresh RGB-D target-centre frames again",
+                arm_command=command,
+            )
+
         if self._phase == "acquire_center":
             target_color = str(
                 context.instruction.get("target_color", "")
@@ -612,6 +731,36 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     0.0, float(context.now_s) - self._phase_started_s
                 )
                 if elapsed >= self.SHELF_CENTER_ACQUIRE_TIMEOUT_S:
+                    if not self._camera_reacquire_used:
+                        self._camera_reacquire_used = True
+                        self._camera_refresh_target_slide = None
+                        self._phase = "refresh_camera"
+                        self._phase_started_s = float(context.now_s)
+                        return StageResult.running(
+                            "task 2 could not lock a fresh RGB-D shelf-box centre; "
+                            "performing one bounded retracted-camera refresh; "
+                            f"{self._target_center_tracker.status()}",
+                            arm_command=self._held_arm_command,
+                        )
+
+                    if self._target_center_tracker.sample_count == 0:
+                        # Task 1 already established this exact colored shelf-box
+                        # center from RGB-D and stored it in CompetitionTaskMemory.
+                        # It is never a Server/layout coordinate.  Use it only
+                        # after two settled views produced zero accepted samples;
+                        # non-empty but inconsistent samples remain a failure.
+                        fallback_center = self._coarse_target_world
+                        self._start_pick_approach(fallback_center)
+                        self._phase_started_s = float(context.now_s)
+                        return StageResult.running(
+                            "task 2 fresh RGB-D target-centre lock remained empty "
+                            "after one bounded camera refresh; using the preserved "
+                            "task-1 RGB-D shelf centre as a constrained fallback; "
+                            f"center={tuple(round(value, 3) for value in fallback_center)}; "
+                            f"{self._target_center_tracker.status()}",
+                            arm_command=self._held_arm_command,
+                        )
+
                     return StageResult.retryable_failure(
                         FailureCode.TARGET_LOST,
                         "task 2 could not lock a stable RGB-D shelf-box centre "
@@ -638,19 +787,12 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     estimate.orientation,
                 )
             )
-            self._locked_target_world = corrected_center
-            # The competition shelf slot has a fixed box orientation.  The
-            # RGB-D cuboid orientation can flip under arm occlusion, so it is
-            # not allowed to change the symmetric contact width here.
-            self._locked_target_orientation = self.SOURCE_ORIENTATION
             # The robot has already reached the shelf row while the arms stay
             # retracted.  Approach the grab stand in a single fixed-heading
             # straight segment; the post-approach phase performs the final
             # in-place yaw/lateral correction before opening the grippers.
-            self._phase = "approach_pick"
+            self._start_pick_approach(corrected_center)
             self._phase_started_s = float(context.now_s)
-            self._motion_started = False
-            self._transfer.reset()
             deviation = tuple(
                 round(value, 3) for value in estimate.max_axis_deviation
             )
@@ -1199,7 +1341,7 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
             )
             entry_y = min(
                 self.TABLE_APPROACH_Y,
-                final_y - self.TABLE_ENTRY_MARGIN_M,
+                final_y - self._table_entry_margin_m(context),
             )
             if not self._motion_started:
                 pose = odometry_pose(context.odometry)
@@ -1372,7 +1514,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
         """Run one segment with a short-horizon arm/payload envelope guard."""
 
         status, command, detail = self._transfer.tick_navigation(
-            context.odometry, context.now_s
+            context.odometry,
+            context.now_s,
+            linear_scale=map_linear_scale(context),
         )
         pose = odometry_pose(context.odometry)
         if pose is None:
@@ -1759,7 +1903,9 @@ class Task2IntegratedExecutor(Task1LiftExecutor):
                     )
                 self._motion_started = True
             status, command, detail = self._transfer.tick_navigation(
-                context.odometry, context.now_s
+                context.odometry,
+                context.now_s,
+                linear_scale=map_linear_scale(context),
             )
             if status is NavigationStatus.GOAL_REACHED:
                 return StageResult.succeeded(

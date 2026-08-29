@@ -683,10 +683,16 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
             # sweep; the transport observation epoch is never cleared here.
             state = self._shelf_state or self._update_shelf_state(context)
             if state is None:
+                semantic_empty_l1 = (
+                    self._shelf_tracker.semantic_empty_candidate == 1
+                )
+                missing_colored_l1 = (
+                    self._shelf_tracker.missing_colored_layer_candidate == 1
+                )
                 if (
                     self.task_id == 1
                     and not self._l1_visibility_attempted
-                    and self._shelf_tracker.semantic_empty_candidate == 1
+                    and (semantic_empty_l1 or missing_colored_l1)
                 ):
                     target_held_z = min(
                         self._held_center_base[2],
@@ -713,10 +719,20 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                         )
                     self._l1_visibility_attempted = True
                     self._phase = "l1_visibility_clearance"
+                    if semantic_empty_l1:
+                        message = (
+                            "task 1 identified L1 as the semantic empty candidate; "
+                            "lowering the carried box before explicit empty-layer "
+                            "confirmation"
+                        )
+                    else:
+                        message = (
+                            "task 1 inferred that the missing colored target is on "
+                            "L1; lowering the carried box while preserving the "
+                            "grasp before direct color confirmation"
+                        )
                     return StageResult.running(
-                        "task 1 identified L1 as the semantic empty candidate; "
-                        "lowering the carried box before explicit empty-layer "
-                        "confirmation",
+                        message,
                         arm_command=self._held_arm_command,
                     )
                 if scan_elapsed >= self.SHELF_SCAN_TIMEOUT_S:
