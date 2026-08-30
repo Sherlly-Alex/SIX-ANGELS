@@ -818,7 +818,7 @@ class Task3ExecutorLateralGuardTests(unittest.TestCase):
         )
         self.assertAlmostEqual(executor._task3_shallow_place_stand[1], expected_y, places=6)
         self.assertAlmostEqual(executor._transfer._lateral_target[1], expected_y, places=6)
-        self.assertAlmostEqual(expected_y, 0.50, places=2)
+        self.assertAlmostEqual(expected_y, 0.54, places=2)
         self.assertLess(expected_y, qzhRL_y)
         self.assertIn("parking_s=", result.message)
         self.assertIn("current_s=", result.message)
@@ -828,11 +828,11 @@ class Task3ExecutorLateralGuardTests(unittest.TestCase):
         executor._freeze_task3_github_parking_stand()
         qzhRL_y, parking_y = self._expected_parking_y(executor)
         self.assertAlmostEqual(qzhRL_y, 0.58, places=6)
-        self.assertAlmostEqual(parking_y, 0.50, places=6)
-        self.assertAlmostEqual(executor._task3_parking_y(), 0.50, places=6)
+        self.assertAlmostEqual(parking_y, 0.54, places=6)
+        self.assertAlmostEqual(executor._task3_parking_y(), 0.54, places=6)
         self.assertAlmostEqual(executor._task3_qzhrl_lateral_y, 0.58, places=6)
-        self.assertAlmostEqual(executor._final_place_stand[1], 0.50, places=6)
-        self.assertAlmostEqual(executor._task3_shallow_place_stand[1], 0.50, places=6)
+        self.assertAlmostEqual(executor._final_place_stand[1], 0.54, places=6)
+        self.assertAlmostEqual(executor._task3_shallow_place_stand[1], 0.54, places=6)
 
     def test_disabled_guard_keeps_legacy_y(self) -> None:
         executor = self._executor()
@@ -1188,15 +1188,15 @@ class Task3ExecutorLateralGuardTests(unittest.TestCase):
         executor._phase = "task3_extra_base_advance"
         executor._phase_started_s = 2.0
         executor._motion_started = False
-        executor._final_place_stand = (N_REF, 0.50)
-        executor._task3_shallow_place_stand = (N_REF, 0.50)
+        executor._final_place_stand = (N_REF, 0.54)
+        executor._task3_shallow_place_stand = (N_REF, 0.54)
         first = executor.tick(
-            TaskStage.ALIGN_FOR_PLACE, self._lateral_context(0.50, YAW, now_s=2.0)
+            TaskStage.ALIGN_FOR_PLACE, self._lateral_context(0.54, YAW, now_s=2.0)
         )
         self.assertEqual(first.status, StageStatus.RUNNING)
         self.assertEqual(executor._phase, "task3_extra_base_advance")
         timed_out = executor.tick(
-            TaskStage.ALIGN_FOR_PLACE, self._lateral_context(0.50, YAW, now_s=10.5)
+            TaskStage.ALIGN_FOR_PLACE, self._lateral_context(0.54, YAW, now_s=10.5)
         )
         self.assertEqual(timed_out.status, StageStatus.SUCCEEDED)
         self.assertIn("extra_advance_timeout", timed_out.message)

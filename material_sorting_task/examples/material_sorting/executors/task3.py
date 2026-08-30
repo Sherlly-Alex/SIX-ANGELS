@@ -124,8 +124,8 @@ class Task3IntegratedExecutor(Task1IntegratedExecutor):
     TASK3_LATERAL_TIMEOUT_S = 50.0
     TASK3_LATERAL_POSITION_TOLERANCE_M = 0.015
     # Extra -Y after the GitHub/qzhRL clamp.  Official white Y is 0.778;
-    # 0.58 still clips the packaging cuboid on the extra 0.15 m push.
-    # 8 cm left → parking Y = max(0.50, 0.58-0.08) = 0.50.
+    # the 0.58 stop still lets the carried box catch the packaging cuboid
+    # during the extra 0.15 m shelf push (Canary crawled ~1 mm/s for 100 s).
     TASK3_LATERAL_LEFT_BIAS_M = 0.08
     TASK3_LATERAL_Y_MIN_M = 0.50
     TASK3_SHELF_TURN_TOLERANCE_RAD = 0.06

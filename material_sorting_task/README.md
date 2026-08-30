@@ -1,7 +1,5 @@
 # SIX ANGELS Material Sorting Client
 
-整仓说明见仓库根目录 [`README.md`](../README.md)。本文件只覆盖 Client 工作区的分段实动、调度与训练命令。
-
 DG-202612 文旅机器人搬运赛题的参赛 Client 工作区。本仓库只维护参赛端代码；正式
 Server、场景随机化和裁判由赛方镜像提供，不在这里修改。
 
