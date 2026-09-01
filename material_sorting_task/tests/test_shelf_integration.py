@@ -17,7 +17,7 @@ from executors.task1_full import (
 )
 from executors.task2 import Task2IntegratedExecutor
 from executors.transfer_support import TransferMotion, stand_from_held_center
-from navigation.carried_envelope import CarriedEnvelopeChecker
+from navigation.carried_envelope import CarriedEnvelopeChecker, HeldObjectGeometry
 from navigation.navigation_types import NavigationGoal, NavigationSegment
 from navigation.navigation_types import NavigationStatus
 from shelf.manipulation import (
@@ -944,6 +944,99 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         )
         self.assertIn("aligning laterally", result.message)
 
+    def test_task1_uses_guided_curve_for_small_latched_place_error(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_grasp_half_width = 0.08
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._place_world = (-2.63, 0.778, 0.84)
+        executor._shelf_scan_stand = shelf_observation_stand(
+            executor._held_center_base,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=0.778,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        executor._phase = "check_place_alignment"
+        pose = _odom(
+            executor._shelf_scan_stand[0],
+            executor._shelf_scan_stand[1] - 0.03,
+            executor.SHELF_YAW,
+        )
+
+        result = executor._tick_align_for_place(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=pose,
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "approach_place_guided")
+        self.assertTrue(result.controls_base)
+        self.assertGreater(result.base_linear_x, 0.0)
+        self.assertIn("correcting the final approach", result.message)
+        gate = executor._guided_gate_stand()
+        assert gate is not None
+        gate_center_x = gate[0] - executor._held_center_base[0]
+        self.assertAlmostEqual(
+            gate_center_x,
+            executor.SHELF_FRONT_X
+            + executor._transfer.guided_object_center_clearance_m,
+            places=6,
+        )
+
+    def test_task1_guided_switch_zero_restores_lateral_controller(self) -> None:
+        executor = Task1IntegratedExecutor(CompetitionTaskMemory())
+        executor.set_guided_place_approach(False)
+        executor._held_center_base = (0.70, 0.03, 1.10)
+        executor._held_grasp_half_width = 0.08
+        executor._held_arm_command = ArmCommand(
+            spine_position=0.30,
+            head_positions=(0.0, 0.0),
+            left_arm_positions=(0.0,) * 6,
+            left_gripper_position=0.20,
+            right_arm_positions=(0.0,) * 6,
+            right_gripper_position=0.20,
+        )
+        executor._place_world = (-2.63, 0.778, 0.84)
+        executor._shelf_scan_stand = shelf_observation_stand(
+            executor._held_center_base,
+            shelf_front_x=executor.SHELF_FRONT_X,
+            shelf_y=0.778,
+            center_clearance_m=executor.SHELF_SCAN_CENTER_CLEARANCE_M,
+            shelf_yaw=executor.SHELF_YAW,
+        )
+        executor._phase = "check_place_alignment"
+
+        result = executor._tick_align_for_place(
+            ExecutionContext(
+                now_s=10.0,
+                instruction={"task": 1, "target_color": "yellow"},
+                task_index=1,
+                attempt=1,
+                odometry=_odom(
+                    executor._shelf_scan_stand[0],
+                    executor._shelf_scan_stand[1] - 0.03,
+                    executor.SHELF_YAW,
+                ),
+            )
+        )
+
+        self.assertEqual(result.status, StageStatus.RUNNING)
+        self.assertEqual(executor._phase, "navigate_place_lateral")
+        self.assertIn("aligning laterally", result.message)
+
     def test_task1_transport_keeps_task3_approach_phase_compatibility(self) -> None:
         executor = Task1IntegratedExecutor(CompetitionTaskMemory())
         executor._held_center_base = (0.70, 0.03, 1.10)
@@ -1190,6 +1283,57 @@ class IntegratedExecutorWiringTests(unittest.TestCase):
         )
         self.assertAlmostEqual(forward, 0.285, places=6)
         self.assertAlmostEqual(lateral, 0.0, places=6)
+
+    def test_guided_advance_converges_with_weak_plant_response(self) -> None:
+        motion = TransferMotion()
+        held = HeldObjectGeometry((0.70, 0.02, 0.90), 0.08, source="test")
+        start = (-0.95, 0.85, math.pi + 0.04)
+        gate = (-1.535, 0.805)
+        self.assertTrue(
+            motion.begin_guided_advance(
+                gate, math.pi, _odom(*start), 0.0, held_geometry=held
+            )
+        )
+
+        x, y, yaw = start
+        status = NavigationStatus.NAVIGATING
+        maximum_yaw_offset = 0.0
+        for step in range(700):
+            now_s = step * 0.05
+            status, command, _detail = motion.tick_guided_advance(
+                _odom(x, y, yaw), now_s
+            )
+            if status is NavigationStatus.GOAL_REACHED:
+                break
+            self.assertIs(status, NavigationStatus.NAVIGATING)
+            # Stress the same weak response envelope used by the offline audit.
+            linear = 0.30 * command[0]
+            angular = 0.25 * command[1] + 0.003
+            yaw += angular * 0.05
+            x += linear * math.cos(yaw) * 0.05
+            y += linear * math.sin(yaw) * 0.05
+            maximum_yaw_offset = max(
+                maximum_yaw_offset, abs(_wrap_test_angle(yaw - math.pi))
+            )
+
+        self.assertIs(status, NavigationStatus.GOAL_REACHED)
+        self.assertLess(maximum_yaw_offset, 0.20)
+        self.assertLess(abs(y - gate[1]), motion.GUIDED_POSITION_TOLERANCE_M)
+
+    def test_guided_advance_rejects_out_of_domain_or_shelf_overlap(self) -> None:
+        motion = TransferMotion()
+        held = HeldObjectGeometry((0.70, 0.0, 0.90), 0.08, source="test")
+        start = _odom(-0.95, 0.85, math.pi)
+        self.assertFalse(
+            motion.begin_guided_advance(
+                (-1.50, 0.79), math.pi, start, 0.0, held_geometry=held
+            )
+        )
+        self.assertFalse(
+            motion.begin_guided_advance(
+                (-1.75, 0.82), math.pi, start, 0.0, held_geometry=held
+            )
+        )
 
     def test_transfer_advance_holds_heading_and_finishes_by_odometry(self) -> None:
         motion = TransferMotion()
@@ -1896,6 +2040,10 @@ class _FailingDirectRouteTransfer:
 class _RunningLegacyRouteTransfer(_DirectRouteTransfer):
     def tick_navigation(self, _odometry, _now_s):
         return NavigationStatus.NAVIGATING, (0.05, 0.10), "legacy running"
+
+
+def _wrap_test_angle(value: float) -> float:
+    return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _odom(x: float, y: float, yaw: float):

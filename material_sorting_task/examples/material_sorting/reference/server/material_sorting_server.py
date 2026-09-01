@@ -18,25 +18,33 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-from ros2_runtime import bootstrap_ros2_python
-bootstrap_ros2_python()
+try:
+    from ros2_runtime import bootstrap_ros2_python
+except ModuleNotFoundError:
+    # The helper is optional in a standard ROS 2 Humble environment.
+    pass
+else:
+    bootstrap_ros2_python()
 import rclpy
 from rclpy._rclpy_pybind11 import RCLError
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import Bool, Header, Int32, String
 
-# 可迁移:从脚本自身位置推导示例目录和仓库根目录
-TASK_DIR = Path(__file__).resolve().parent
+# Support running this reference server in place or copied beside the Client.
+SCRIPT_DIR = Path(__file__).resolve().parent
+if (SCRIPT_DIR / "mjcf").is_dir():
+    TASK_DIR = SCRIPT_DIR
+    SERVER_DIR = SCRIPT_DIR
+else:
+    TASK_DIR = SCRIPT_DIR.parents[1]
+    SERVER_DIR = SCRIPT_DIR
 REPO_ROOT = TASK_DIR.parents[1]
 ROS2_EXAMPLES_DIR = REPO_ROOT / "examples" / "ros2"
-if str(ROS2_EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(ROS2_EXAMPLES_DIR))
-if str(TASK_DIR) not in sys.path:
-    sys.path.insert(0, str(TASK_DIR))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for import_dir in (ROS2_EXAMPLES_DIR, SERVER_DIR, TASK_DIR, REPO_ROOT):
+    if str(import_dir) not in sys.path:
+        sys.path.insert(0, str(import_dir))
 
-ASSETS_DIR = TASK_DIR / "models"
+ASSETS_DIR = Path(os.environ.get("MATERIAL_ASSETS_DIR", TASK_DIR / "models"))
 os.environ["DISCOVERSE_ASSETS_DIR"] = str(ASSETS_DIR)
 
 from discoverse.robots_env.mmk2_base import MMK2Cfg

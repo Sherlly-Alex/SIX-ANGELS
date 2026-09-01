@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Mapping, Sequence
 
 from desktop_grasp.pregrasp_core import PregraspInputError, PregraspPlanningError
@@ -143,6 +144,15 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._release_stage_index = 0
         self._release_settle_started_s: float | None = None
         self._legacy_shelf_route_used = False
+        guided_value = os.environ.get(
+            "MATERIAL_TASK1_GUIDED_APPROACH", "1"
+        ).strip().lower()
+        self._guided_place_approach_enabled = guided_value not in {
+            "0", "false", "no", "off"
+        }
+        self._guided_held_geometry: HeldObjectGeometry | None = None
+        self._place_alignment_x: float | None = None
+        self._guided_runtime_fallback = False
         # Remote-only feature gate.  Legacy and shadow must preserve the
         # previously validated physical path until measured-envelope checks
         # have passed staged V2 acceptance.
@@ -194,6 +204,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         self._release_stage_index = 0
         self._release_settle_started_s = None
         self._legacy_shelf_route_used = False
+        self._guided_held_geometry = None
+        self._place_alignment_x = None
+        self._guided_runtime_fallback = False
         self._scheduler_end_stand = None
 
     def enter_stage(self, stage: TaskStage, context: ExecutionContext) -> None:
@@ -217,6 +230,9 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
         elif stage is TaskStage.ALIGN_FOR_PLACE:
             self._slide_hold.reset()
             self._transfer.reset()
+            self._guided_held_geometry = None
+            self._place_alignment_x = None
+            self._guided_runtime_fallback = False
             # Do not reset here.  Frames collected from the moment the shelf
             # enters view remain valid at the observation stand.  If transport
             # already produced a complete stable state, the scan stage can use
@@ -468,6 +484,43 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
     def set_measured_carry_guard(self, enabled: bool) -> None:
         """Enable the remote-calibration-only measured payload guard."""
         self._measured_carry_guard_enabled = bool(enabled)
+
+    def set_guided_place_approach(self, enabled: bool) -> None:
+        """Enable task-1 outside-Gate correction; False restores legacy motion."""
+        self._guided_place_approach_enabled = bool(enabled)
+
+    def _guided_place_geometry(self) -> HeldObjectGeometry | None:
+        """Return only grasp-latched geometry; never infer it during placement."""
+
+        center = self._held_center_base
+        half_width = self._held_grasp_half_width
+        if center is None or half_width is None:
+            return None
+        try:
+            return HeldObjectGeometry(center, half_width, source="task1_guided")
+        except (TypeError, ValueError):
+            return None
+
+    def _guided_gate_stand(self) -> tuple[float, float] | None:
+        """Return the base Gate while the complete payload remains outside."""
+
+        if (
+            self._held_center_base is None
+            or self._place_world is None
+            or self._final_place_stand is None
+        ):
+            return None
+        desired_center = (
+            self.SHELF_FRONT_X
+            + self._transfer.guided_object_center_clearance_m,
+            self._place_world[1],
+            self._place_world[2],
+        )
+        gate = stand_from_held_center(
+            desired_center, self._held_center_base, self.SHELF_YAW
+        )
+        # Preserve the same clamped release Y used by the final stand.
+        return (float(gate[0]), float(self._final_place_stand[1]))
 
     def _shelf_observation_target_y(self) -> float:
         """Return the carried-box Y for the safe shelf pre-place stand.
@@ -850,28 +903,113 @@ class Task1IntegratedExecutor(Task1LiftExecutor):
                 self._motion_started = False
                 self._transfer.reset()
             else:
-                # The direct route normally arrives already aligned.  Preserve
-                # the previous rotate-drive-restore controller only as a
-                # guarded correction/fallback when the final pose is outside
-                # the verified insertion corridor.
+                geometry = self._guided_place_geometry()
+                if (
+                    self._guided_place_approach_enabled
+                    and not self._legacy_shelf_route_used
+                    and geometry is not None
+                    and abs(lateral_error) <= self._transfer.GUIDED_MAX_LATERAL_M
+                    and abs(yaw_error)
+                    <= self._transfer.GUIDED_MAX_INITIAL_YAW_ERROR_RAD
+                ):
+                    self._guided_held_geometry = geometry
+                    self._phase = "approach_place_guided"
+                else:
+                    # Disabled, legacy-route and out-of-domain cases preserve
+                    # the established rotate-drive-restore controller.
+                    self._phase = "navigate_place_lateral"
+                self._motion_started = False
+                self._transfer.reset()
+
+        if self._phase == "approach_place_guided":
+            gate = self._guided_gate_stand()
+            assert self._guided_held_geometry is not None
+            if gate is None:
                 self._phase = "navigate_place_lateral"
                 self._motion_started = False
                 self._transfer.reset()
+            else:
+                if not self._motion_started:
+                    if not self._transfer.begin_guided_advance(
+                        gate,
+                        self.SHELF_YAW,
+                        context.odometry,
+                        context.now_s,
+                        held_geometry=self._guided_held_geometry,
+                    ):
+                        # Preflight rejection occurs before any command, so the
+                        # original outside-shelf alignment remains safe to use.
+                        self._phase = "navigate_place_lateral"
+                        self._motion_started = False
+                        self._transfer.reset()
+                    else:
+                        self._motion_started = True
+                if self._phase == "approach_place_guided":
+                    status, command, detail = self._transfer.tick_guided_advance(
+                        context.odometry, context.now_s
+                    )
+                    if status is NavigationStatus.GOAL_REACHED:
+                        self._phase = "approach_place_final"
+                        self._motion_started = False
+                        self._transfer.reset()
+                    elif status is NavigationStatus.FAILED:
+                        # The live guard has kept the payload outside.  Latch
+                        # current X and hand the remaining Y error to the old
+                        # controller without driving back toward the scan pose.
+                        fallback_pose = odometry_pose(context.odometry)
+                        if fallback_pose is None:
+                            return StageResult.blocked(
+                                "task 1 guided shelf fallback lost odometry",
+                                arm_command=self._held_arm_command,
+                            )
+                        self._place_alignment_x = fallback_pose[0]
+                        self._guided_runtime_fallback = True
+                        self._phase = "navigate_place_lateral"
+                        self._motion_started = False
+                        self._transfer.reset()
+                        return StageResult.running(
+                            f"task 1 guided approach stopped outside the shelf; "
+                            f"switching to guarded lateral fallback; {detail}",
+                            base_command=(0.0, 0.0),
+                            arm_command=self._held_arm_command,
+                        )
+                    elif status is NavigationStatus.EMERGENCY_STOP:
+                        return StageResult.blocked(
+                            f"task 1 guided shelf approach stopped: {detail}",
+                            arm_command=self._held_arm_command,
+                        )
+                    else:
+                        return StageResult.running(
+                            f"task 1 correcting the final approach while moving "
+                            f"forward; {detail}",
+                            base_command=command,
+                            arm_command=self._held_arm_command,
+                        )
 
         if self._phase == "navigate_place_lateral":
             assert self._place_world is not None
             assert self._shelf_scan_stand is not None
             assert self._final_place_stand is not None
             if not self._motion_started:
+                alignment_x = (
+                    self._place_alignment_x
+                    if self._place_alignment_x is not None
+                    else self._shelf_scan_stand[0]
+                )
                 if not self._transfer.begin_lateral_alignment(
-                    # Only align y here; x remains at the safe shelf-front
-                    # scan stand.  The later straight-advance phase is the
-                    # only phase allowed to enter the shelf front.
-                    (self._shelf_scan_stand[0], self._final_place_stand[1]),
+                    # Align only Y at the current safe outside-shelf X. The
+                    # later straight phase remains the only shelf insertion.
+                    (alignment_x, self._final_place_stand[1]),
                     self.SHELF_YAW,
                     context.odometry,
                     context.now_s,
                     position_tolerance_m=self.FINAL_PLACE_LATERAL_TOLERANCE_M,
+                    held_geometry=(
+                        self._guided_held_geometry
+                        if self._guided_runtime_fallback
+                        else None
+                    ),
+                    predictive_guard=self._guided_runtime_fallback,
                 ):
                     return StageResult.blocked(
                         "task 1 could not plan safe lateral shelf placement alignment",

@@ -85,6 +85,18 @@ class TransferMotion:
     LATERAL_X_TOLERANCE_M = 0.18
     LATERAL_YAW_TOLERANCE_RAD = 0.06
     LATERAL_TIMEOUT_S = 30.0
+    # Task-1 guided shelf approach. Limited to the small terminal error left
+    # by direct A*: larger errors keep the established lateral fallback.
+    GUIDED_MAX_LATERAL_M = 0.055
+    GUIDED_MAX_INITIAL_YAW_ERROR_RAD = 0.06
+    GUIDED_POSITION_TOLERANCE_M = 0.015
+    GUIDED_YAW_TOLERANCE_RAD = 0.06
+    GUIDED_TIMEOUT_S = 35.0
+    GUIDED_GATE_BUFFER_M = 0.05
+    GUIDED_MAX_YAW_OFFSET_RAD = 0.20
+    GUIDED_MAX_LINEAR_MPS = 0.085
+    GUIDED_MAX_ANGULAR_RPS = 0.24
+    GUIDED_CROSS_TRACK_GAIN = 4.0
 
     def __init__(self, speed_limits: SpeedLimits | None = None) -> None:
         limits = speed_limits or SpeedLimits(
@@ -111,6 +123,14 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start: tuple[float, float, float] | None = None
         self._advance_distance_m = 0.0
+        self._guided_start: tuple[float, float, float] | None = None
+        self._guided_target: tuple[float, float] | None = None
+        self._guided_final_yaw = 0.0
+        self._guided_forward_m = 0.0
+        self._guided_lateral_m = 0.0
+        self._guided_start_s: float | None = None
+        self._guided_held_geometry: HeldObjectGeometry | None = None
+        self._guided_min_clearance_m: float | None = None
         self._lateral_target: tuple[float, float] | None = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
@@ -164,6 +184,14 @@ class TransferMotion:
         self._retreat_distance_m = 0.0
         self._advance_start = None
         self._advance_distance_m = 0.0
+        self._guided_start = None
+        self._guided_target = None
+        self._guided_final_yaw = 0.0
+        self._guided_forward_m = 0.0
+        self._guided_lateral_m = 0.0
+        self._guided_start_s = None
+        self._guided_held_geometry = None
+        self._guided_min_clearance_m = None
         self._lateral_target = None
         self._lateral_final_yaw = 0.0
         self._lateral_heading = 0.0
@@ -342,6 +370,219 @@ class TransferMotion:
             f"minimum_clearance={clearance:.3f}m; {safety.detail}"
         )
         return safety.safe, detail
+
+    @property
+    def guided_object_center_clearance_m(self) -> float:
+        """Return the payload-safe object-centre clearance for the outside Gate."""
+
+        box_radius = math.hypot(
+            self._carried_checker.BOX_HALF_FORWARD_M,
+            self._carried_checker.BOX_HALF_LATERAL_M,
+        ) + self._carried_checker.BOX_EXTRA_RADIUS_M
+        return (
+            box_radius
+            + self._carried_checker.clearance_m
+            + self.GUIDED_GATE_BUFFER_M
+        )
+
+    def begin_guided_advance(
+        self,
+        target_xy: tuple[float, float],
+        final_yaw: float,
+        odometry: Any,
+        now_s: float,
+        *,
+        held_geometry: HeldObjectGeometry,
+    ) -> bool:
+        """Start a bounded zero-end-slope S-curve to an outside-shelf Gate."""
+
+        pose = odometry_pose(odometry)
+        try:
+            target_x = float(target_xy[0])
+            target_y = float(target_xy[1])
+            yaw_ref = _wrap_to_pi(float(final_yaw))
+            start_s = float(now_s)
+        except (TypeError, ValueError, IndexError):
+            return False
+        if pose is None or not all(
+            math.isfinite(value)
+            for value in (target_x, target_y, yaw_ref, start_s)
+        ):
+            return False
+
+        dx = target_x - pose[0]
+        dy = target_y - pose[1]
+        c = math.cos(yaw_ref)
+        s = math.sin(yaw_ref)
+        forward_m = c * dx + s * dy
+        lateral_m = -s * dx + c * dy
+        initial_yaw_error = _wrap_to_pi(yaw_ref - pose[2])
+        if (
+            forward_m <= 0.10
+            or forward_m > 1.20
+            or abs(lateral_m) > self.GUIDED_MAX_LATERAL_M
+            or abs(initial_yaw_error) > self.GUIDED_MAX_INITIAL_YAW_ERROR_RAD
+        ):
+            return False
+
+        # Sample the exact planned curve with the existing measured payload
+        # envelope. The shelf is still outside the payload at this Gate.
+        start_check = self._carried_checker.check_pose(
+            pose, held_geometry.center_base, held_geometry.half_width_m
+        )
+        if not start_check.safe:
+            return False
+        best_clearance = float(start_check.clearance_m)
+        samples = max(
+            1, int(math.ceil(forward_m / self._carried_checker.PATH_SAMPLE_M))
+        )
+        for sample in range(1, samples + 1):
+            u = sample / samples
+            progress = forward_m * u
+            smooth = 3.0 * u * u - 2.0 * u * u * u
+            lateral = lateral_m * smooth
+            slope = (lateral_m / forward_m) * 6.0 * u * (1.0 - u)
+            sample_pose = (
+                pose[0] + c * progress - s * lateral,
+                pose[1] + s * progress + c * lateral,
+                _wrap_to_pi(yaw_ref + math.atan(slope)),
+            )
+            check = self._carried_checker.check_pose(
+                sample_pose, held_geometry.center_base, held_geometry.half_width_m
+            )
+            if not check.safe:
+                return False
+            best_clearance = min(best_clearance, float(check.clearance_m))
+
+        self._guided_start = pose
+        self._guided_target = (target_x, target_y)
+        self._guided_final_yaw = yaw_ref
+        self._guided_forward_m = forward_m
+        self._guided_lateral_m = lateral_m
+        self._guided_start_s = start_s
+        self._guided_held_geometry = held_geometry
+        self._guided_min_clearance_m = best_clearance
+        return True
+
+    def tick_guided_advance(
+        self,
+        odometry: Any,
+        now_s: float,
+    ) -> tuple[NavigationStatus, tuple[float, float], str]:
+        """Track the outside-shelf S-curve and stop at its transition Gate."""
+
+        pose = odometry_pose(odometry)
+        if pose is None:
+            return NavigationStatus.NAVIGATING, (0.0, 0.0), (
+                "guided shelf approach waiting for valid odometry"
+            )
+        if (
+            self._guided_start is None
+            or self._guided_target is None
+            or self._guided_start_s is None
+            or self._guided_held_geometry is None
+        ):
+            return NavigationStatus.FAILED, (0.0, 0.0), (
+                "guided shelf approach was not started"
+            )
+        elapsed = max(0.0, float(now_s) - self._guided_start_s)
+        if elapsed > self.GUIDED_TIMEOUT_S:
+            return NavigationStatus.FAILED, (0.0, 0.0), (
+                f"guided shelf approach timed out after {elapsed:.1f}s "
+                f"(limit={self.GUIDED_TIMEOUT_S:.1f}s)"
+            )
+
+        start_x, start_y, _start_yaw = self._guided_start
+        c = math.cos(self._guided_final_yaw)
+        s = math.sin(self._guided_final_yaw)
+        dx = pose[0] - start_x
+        dy = pose[1] - start_y
+        progress = c * dx + s * dy
+        lateral = -s * dx + c * dy
+        u = max(0.0, min(1.0, progress / self._guided_forward_m))
+        smooth = 3.0 * u * u - 2.0 * u * u * u
+        reference_lateral = self._guided_lateral_m * smooth
+        slope = (
+            (self._guided_lateral_m / self._guided_forward_m)
+            * 6.0 * u * (1.0 - u)
+        )
+        cross_track_error = reference_lateral - lateral
+        yaw_offset = max(
+            -self.GUIDED_MAX_YAW_OFFSET_RAD,
+            min(
+                self.GUIDED_MAX_YAW_OFFSET_RAD,
+                math.atan(slope + self.GUIDED_CROSS_TRACK_GAIN * cross_track_error),
+            ),
+        )
+        desired_yaw = _wrap_to_pi(self._guided_final_yaw + yaw_offset)
+        yaw_error = _wrap_to_pi(desired_yaw - pose[2])
+
+        target_x, target_y = self._guided_target
+        goal_dx = target_x - pose[0]
+        goal_dy = target_y - pose[1]
+        forward_error = c * goal_dx + s * goal_dy
+        lateral_error = -s * goal_dx + c * goal_dy
+        final_yaw_error = _wrap_to_pi(self._guided_final_yaw - pose[2])
+        if (
+            -self.GUIDED_POSITION_TOLERANCE_M <= forward_error <= 0.020
+            and abs(lateral_error) <= self.GUIDED_POSITION_TOLERANCE_M
+            and abs(final_yaw_error) <= self.GUIDED_YAW_TOLERANCE_RAD
+        ):
+            return NavigationStatus.GOAL_REACHED, (0.0, 0.0), (
+                "guided shelf approach reached outside transition Gate; "
+                f"forward_err={forward_error:.3f}m, "
+                f"lateral_err={lateral_error:.3f}m, "
+                f"yaw_err={final_yaw_error:.3f}rad, "
+                f"minimum_clearance={self._guided_min_clearance_m:.3f}m"
+            )
+        if forward_error < -self.GUIDED_POSITION_TOLERANCE_M:
+            return NavigationStatus.FAILED, (0.0, 0.0), (
+                "guided shelf approach overshot its outside transition Gate; "
+                f"forward_err={forward_error:.3f}m, "
+                f"lateral_err={lateral_error:.3f}m"
+            )
+
+        linear = max(
+            0.0,
+            min(
+                self.GUIDED_MAX_LINEAR_MPS,
+                0.55 * max(0.0, forward_error),
+            ),
+        )
+        if abs(yaw_error) > 0.13:
+            linear = 0.0
+        else:
+            linear *= max(0.20, math.cos(yaw_error))
+        angular = max(
+            -self.GUIDED_MAX_ANGULAR_RPS,
+            min(self.GUIDED_MAX_ANGULAR_RPS, 1.6 * yaw_error),
+        )
+        command = (linear, angular)
+        safety = self._carried_checker.check_command(
+            pose,
+            command,
+            self._guided_held_geometry.center_base,
+            self._guided_held_geometry.half_width_m,
+        )
+        clearance = float(safety.clearance_m)
+        self._guided_min_clearance_m = min(
+            clearance,
+            self._guided_min_clearance_m
+            if self._guided_min_clearance_m is not None
+            else clearance,
+        )
+        if not safety.safe:
+            return NavigationStatus.EMERGENCY_STOP, (0.0, 0.0), (
+                "guided shelf approach carried-envelope guard stopped motion: "
+                f"{safety.detail}"
+            )
+        return NavigationStatus.NAVIGATING, command, (
+            "guided shelf approach following bounded S-curve outside shelf; "
+            f"forward_err={forward_error:.3f}m, "
+            f"lateral_err={lateral_error:.3f}m, "
+            f"yaw_offset={yaw_offset:.3f}rad, "
+            f"minimum_clearance={self._guided_min_clearance_m:.3f}m"
+        )
 
     def begin_lateral_alignment(
         self,

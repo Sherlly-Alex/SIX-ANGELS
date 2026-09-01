@@ -37,7 +37,7 @@ echo "checking Client module consistency..."
 python3 -c \
   'from client_task import CompetitionClient; from control_types import ArmCommand; from desktop_grasp.pregrasp_core import ContactGraspController, OpenPregraspController, SlideLiftController; from executors.base import TargetObservation; from executors.task1 import Task1LiftExecutor; from executors.task1_full import Task1IntegratedExecutor; from executors.task2 import Task2IntegratedExecutor; from shelf.state_tracker import ShelfStateTracker'
 
-python3 perception/box_detect.py \
+python3 -m perception.box_detect \
   --backend "$BACKEND" \
   --checkpoint "$CHECKPOINT" \
   --detection-log-period "$DETECTION_LOG_PERIOD" \

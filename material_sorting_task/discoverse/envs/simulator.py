@@ -241,6 +241,8 @@ class SimulatorBase:
             elif self.config.obs_depth_cam_id is None:
                 self.config.obs_depth_cam_id = []
         
+            # XWayland can expose a monitor without marking it as primary.
+            screen_width, screen_height = 1920, 1080
             try:
                 import screeninfo
                 monitors = screeninfo.get_monitors()
